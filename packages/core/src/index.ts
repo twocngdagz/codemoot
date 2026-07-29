@@ -290,3 +290,4 @@ export type {
 
 // Review-gated workflow domain kernel
 export * as reviewWorkflow from './review-workflow/index.js';
+export * as reviewWorkflowGit from './review-workflow-git/index.js';
