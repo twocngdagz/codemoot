@@ -93,7 +93,8 @@ credentials and configuration.
 Known baseline observed on 2026-07-29 with Node.js 22.23.1 and pnpm 9.15.9:
 
 - `pnpm build` passes for core, CLI, and MCP; web reports its placeholder build.
-- `pnpm test` passes: 47 files and 624 tests.
+- `pnpm test` passes. Avoid hard-coding the suite count here because it changes as coverage
+  grows.
 - `pnpm lint` fails with 147 existing Biome errors, including formatting/import organization
   and analyzer rules such as `noImplicitAnyLet`, `noNonNullAssertion`, and
   `noUnusedTemplateLiteral`.
@@ -104,3 +105,20 @@ Do not fix unrelated baseline failures unless the task explicitly includes them.
 Before declaring work complete, review the actual diff and status for unintended changes, then
 run the relevant focused checks and the full verification commands above. Report every command
 that does not pass.
+
+## Agent skills
+
+### Issue tracker
+
+Issues and PRDs are tracked in GitHub Issues for `twocngdagz/codemoot`. See
+`docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+Triage uses the canonical state labels, with `bug`/`enhancement` as broad categories and
+`tech-debt` for internal quality debt. See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+This is a single-context repository using root-level `CONTEXT.md` and `docs/adr/`. See
+`docs/agents/domain.md`.
