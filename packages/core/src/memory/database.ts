@@ -2,8 +2,9 @@
 
 import Database from 'better-sqlite3';
 import { DatabaseError } from '../utils/errors.js';
+import { REVIEW_WORKFLOW_MIGRATIONS } from './review-workflow-schema.js';
 
-const SCHEMA_VERSION = '8';
+const SCHEMA_VERSION = '9';
 
 const MIGRATIONS = [
   // Sessions
@@ -305,6 +306,7 @@ const MIGRATIONS = [
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
   )`,
+  ...REVIEW_WORKFLOW_MIGRATIONS,
 ];
 
 /**

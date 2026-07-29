@@ -1,3 +1,4 @@
+import Database from 'better-sqlite3';
 import { describe, expect, it } from 'vitest';
 import { getSchemaVersion, openDatabase, runMigrations } from '../../../src/memory/database.js';
 
@@ -16,6 +17,12 @@ describe('openDatabase', () => {
     expect(names).toContain('memories');
     expect(names).toContain('cost_log');
     expect(names).toContain('schema_meta');
+    expect(names).toContain('review_workflows');
+    expect(names).toContain('review_workflow_batches');
+    expect(names).toContain('review_workflow_command_receipts');
+    expect(names).toContain('review_workflow_command_side_effects');
+    expect(names).toContain('review_workflow_events');
+    expect(names).toContain('review_workflow_verification_attestations');
     db.close();
   });
 
@@ -61,7 +68,7 @@ describe('openDatabase', () => {
   it('sets schema version', () => {
     const db = openDatabase(':memory:');
     const version = getSchemaVersion(db);
-    expect(version).toBe('8');
+    expect(version).toBe('9');
     db.close();
   });
 
@@ -70,7 +77,40 @@ describe('openDatabase', () => {
     // Run migrations again -- should be idempotent
     runMigrations(db);
     const version = getSchemaVersion(db);
-    expect(version).toBe('8');
+    expect(version).toBe('9');
+    db.close();
+  });
+
+  it('upgrades a v8 database additively without changing legacy rows', () => {
+    const db = new Database(':memory:');
+    db.pragma('foreign_keys = ON');
+    db.exec(`
+      CREATE TABLE schema_meta (
+        key TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+      );
+      INSERT INTO schema_meta(key, value) VALUES ('version', '8');
+      CREATE TABLE legacy_sentinel (
+        id TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+      );
+      INSERT INTO legacy_sentinel(id, value) VALUES ('legacy-1', 'preserve-me');
+    `);
+
+    runMigrations(db);
+
+    expect(getSchemaVersion(db)).toBe('9');
+    expect(
+      db.prepare('SELECT value FROM legacy_sentinel WHERE id = ?').pluck().get('legacy-1'),
+    ).toBe('preserve-me');
+    expect(
+      db
+        .prepare(
+          "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name LIKE 'review_workflow_%'",
+        )
+        .pluck()
+        .get(),
+    ).toBeGreaterThan(0);
     db.close();
   });
 });

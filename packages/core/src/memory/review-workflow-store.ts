@@ -1,0 +1,1132 @@
+// SQLite persistence for review-gated workflow aggregates and immutable evidence.
+
+import { createHash } from 'node:crypto';
+import type Database from 'better-sqlite3';
+import { z } from 'zod';
+import {
+  acceptanceCriterionSchema,
+  actorExecutionIdentitySchema,
+  agentAssignmentSchema,
+  batchPlanVersionSchema,
+  findingDispositionSchema,
+  findingSchema,
+  generalPlanVersionSchema,
+  implementationAttemptSchema,
+  implementationCommitSchema,
+  implementationReadyEvidenceSchema,
+  invocationIdentitySchema,
+  planRequirementSchema,
+  refinedPlanVersionSchema,
+  repositoryAuditSchema,
+  reviewRangeEvidenceSchema,
+  reviewWorkflowBatchSchema,
+  sessionIdentitySchema,
+  verificationAttestationSchema,
+  verificationRecordSchema,
+  workflowRunSchema,
+} from '../review-workflow/schemas.js';
+import type {
+  AcceptanceCriterion,
+  ActorExecutionIdentity,
+  AgentAssignment,
+  BatchPlanVersion,
+  Finding,
+  FindingDisposition,
+  GeneralPlanVersion,
+  ImplementationAttempt,
+  ImplementationCommit,
+  ImplementationReadyEvidence,
+  InvocationIdentity,
+  PlanRequirement,
+  RefinedPlanVersion,
+  RepositoryAudit,
+  ReviewRangeEvidence,
+  ReviewWorkflowBatch,
+  SessionIdentity,
+  VerificationAttestation,
+  VerificationRecord,
+  WorkflowRun,
+} from '../review-workflow/types.js';
+
+export const REVIEW_WORKFLOW_PERSISTENCE_ERROR_CODES = [
+  'WORKFLOW_NOT_FOUND',
+  'BATCH_NOT_FOUND',
+  'COMMAND_NOT_FOUND',
+  'AGGREGATE_VERSION_CONFLICT',
+  'IDEMPOTENCY_CONFLICT',
+  'COMMAND_STATE_CONFLICT',
+  'SIDE_EFFECT_NOT_RESERVED',
+  'IMMUTABLE_ENTITY_CONFLICT',
+  'PERSISTED_DATA_INVALID',
+] as const;
+
+export type ReviewWorkflowPersistenceErrorCode =
+  (typeof REVIEW_WORKFLOW_PERSISTENCE_ERROR_CODES)[number];
+
+export class ReviewWorkflowPersistenceError extends Error {
+  constructor(
+    readonly code: ReviewWorkflowPersistenceErrorCode,
+    message: string,
+  ) {
+    super(message);
+    this.name = 'ReviewWorkflowPersistenceError';
+  }
+}
+
+export interface ImmutableSaveResult {
+  readonly inserted: boolean;
+}
+
+export interface ReviewWorkflowEvent {
+  readonly eventId: number;
+  readonly workflowId: string;
+  readonly batchId: string;
+  readonly sequence: number;
+  readonly aggregateVersion: number;
+  readonly eventType: string;
+  readonly commandId: string;
+  readonly actorExecutionId: string;
+  readonly payload: Readonly<Record<string, unknown>>;
+  readonly createdAt: string;
+}
+
+export type PersistableReviewWorkflowEntity =
+  | { readonly kind: 'AGENT_ASSIGNMENT'; readonly value: AgentAssignment }
+  | { readonly kind: 'ACTOR_EXECUTION'; readonly value: ActorExecutionIdentity }
+  | { readonly kind: 'INVOCATION_IDENTITY'; readonly value: InvocationIdentity }
+  | { readonly kind: 'SESSION_IDENTITY'; readonly value: SessionIdentity }
+  | { readonly kind: 'GENERAL_PLAN_VERSION'; readonly value: GeneralPlanVersion }
+  | { readonly kind: 'PLAN_REQUIREMENT'; readonly value: PlanRequirement }
+  | { readonly kind: 'REPOSITORY_AUDIT'; readonly value: RepositoryAudit }
+  | { readonly kind: 'REFINED_PLAN_VERSION'; readonly value: RefinedPlanVersion }
+  | { readonly kind: 'BATCH_PLAN_VERSION'; readonly value: BatchPlanVersion }
+  | { readonly kind: 'ACCEPTANCE_CRITERION'; readonly value: AcceptanceCriterion }
+  | { readonly kind: 'IMPLEMENTATION_ATTEMPT'; readonly value: ImplementationAttempt }
+  | {
+      readonly kind: 'IMPLEMENTATION_READY_EVIDENCE';
+      readonly value: ImplementationReadyEvidence;
+    }
+  | { readonly kind: 'IMPLEMENTATION_COMMIT'; readonly value: ImplementationCommit }
+  | { readonly kind: 'FINDING'; readonly value: Finding }
+  | { readonly kind: 'FINDING_DISPOSITION'; readonly value: FindingDisposition }
+  | {
+      readonly kind: 'VERIFICATION_RECORD';
+      readonly workflowId: string;
+      readonly batchId: string;
+      readonly value: VerificationRecord;
+    }
+  | { readonly kind: 'VERIFICATION_ATTESTATION'; readonly value: VerificationAttestation }
+  | {
+      readonly kind: 'REVIEW_RANGE_EVIDENCE';
+      readonly reviewRangeEvidenceId: string;
+      readonly workflowId: string;
+      readonly batchId: string;
+      readonly value: ReviewRangeEvidence;
+    };
+
+export type ReviewWorkflowEntityKind = PersistableReviewWorkflowEntity['kind'];
+
+const recordHashRowSchema = z.object({ record_hash: z.string() });
+const payloadRowSchema = z.object({ payload_json: z.string() });
+const contextualPayloadRowSchema = payloadRowSchema.extend({
+  workflow_id: z.string(),
+  batch_id: z.string(),
+});
+const eventRowSchema = z.object({
+  event_id: z.number().int().positive(),
+  workflow_id: z.string(),
+  batch_id: z.string(),
+  sequence: z.number().int().positive(),
+  aggregate_version: z.number().int().positive(),
+  event_type: z.string(),
+  command_id: z.string(),
+  actor_execution_id: z.string(),
+  payload_json: z.string(),
+  created_at: z.string(),
+});
+
+function serializeJson(value: unknown): string {
+  const serialized = JSON.stringify(value);
+  if (serialized === undefined) {
+    throw new ReviewWorkflowPersistenceError(
+      'PERSISTED_DATA_INVALID',
+      'Review workflow persistence received a non-serializable value',
+    );
+  }
+  return serialized;
+}
+
+function hashRecord(value: unknown): string {
+  return createHash('sha256').update(serializeJson(value)).digest('hex');
+}
+
+function parseJsonObject(serialized: string): Readonly<Record<string, unknown>> {
+  try {
+    return z.record(z.unknown()).parse(JSON.parse(serialized));
+  } catch {
+    throw new ReviewWorkflowPersistenceError(
+      'PERSISTED_DATA_INVALID',
+      'Stored review workflow event payload is invalid JSON',
+    );
+  }
+}
+
+function parseStoredPayload<T>(
+  serialized: string,
+  schema: z.ZodType<T>,
+  entityKind: ReviewWorkflowEntityKind | 'WORKFLOW' | 'BATCH',
+): T {
+  try {
+    return schema.parse(JSON.parse(serialized));
+  } catch {
+    throw new ReviewWorkflowPersistenceError(
+      'PERSISTED_DATA_INVALID',
+      `Stored ${entityKind} payload failed domain validation`,
+    );
+  }
+}
+
+export class ReviewWorkflowStore {
+  constructor(private readonly db: Database.Database) {}
+
+  createWorkflow(workflow: WorkflowRun): ImmutableSaveResult {
+    const parsed = workflowRunSchema.parse(workflow);
+    const payloadJson = serializeJson(parsed);
+    const recordHash = hashRecord({ kind: 'WORKFLOW', value: parsed });
+    return this.insertImmutable({
+      table: 'review_workflows',
+      idColumn: 'workflow_id',
+      id: parsed.workflowId,
+      recordHash,
+      insert: () =>
+        this.db
+          .prepare(
+            `INSERT INTO review_workflows (
+              workflow_id,
+              status,
+              general_plan_version_id,
+              refined_plan_version_id,
+              implementer_assignment_id,
+              reviewer_assignment_id,
+              configuration_hash,
+              aggregate_version,
+              payload_json,
+              record_hash,
+              created_at,
+              updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)`,
+          )
+          .run(
+            parsed.workflowId,
+            parsed.status,
+            parsed.generalPlanVersionId,
+            parsed.refinedPlanVersionId ?? null,
+            parsed.implementerAssignmentId,
+            parsed.reviewerAssignmentId,
+            parsed.configurationHash,
+            payloadJson,
+            recordHash,
+            parsed.createdAt,
+            parsed.updatedAt,
+          ),
+    });
+  }
+
+  getWorkflow(workflowId: string): WorkflowRun | null {
+    const row = this.db
+      .prepare('SELECT payload_json FROM review_workflows WHERE workflow_id = ?')
+      .get(workflowId);
+    if (row === undefined) return null;
+    const parsedRow = payloadRowSchema.parse(row);
+    return parseStoredPayload(parsedRow.payload_json, workflowRunSchema, 'WORKFLOW');
+  }
+
+  createBatch(batch: ReviewWorkflowBatch): ImmutableSaveResult {
+    const parsed = reviewWorkflowBatchSchema.parse(batch);
+    const payloadJson = serializeJson(parsed);
+    const recordHash = hashRecord({ kind: 'BATCH', value: parsed });
+    return this.insertImmutable({
+      table: 'review_workflow_batches',
+      idColumn: 'batch_id',
+      id: parsed.batchId,
+      recordHash,
+      insert: () =>
+        this.db
+          .prepare(
+            `INSERT INTO review_workflow_batches (
+              batch_id,
+              workflow_id,
+              ordinal,
+              persisted_state,
+              aggregate_version,
+              last_event_sequence,
+              current_plan_version_id,
+              implementer_assignment_id,
+              reviewer_assignment_id,
+              original_batch_base_sha,
+              blocked_from_state,
+              blocked_resume_state,
+              payload_json,
+              record_hash,
+              created_at,
+              updated_at
+            ) VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          )
+          .run(
+            parsed.batchId,
+            parsed.workflowId,
+            parsed.ordinal,
+            parsed.persistedState,
+            parsed.aggregateVersion,
+            parsed.currentPlanVersionId,
+            parsed.implementerAssignmentId,
+            parsed.reviewerAssignmentId,
+            parsed.originalBatchBaseSha ?? null,
+            parsed.blockedFromState ?? null,
+            parsed.blockedResumeState ?? null,
+            payloadJson,
+            recordHash,
+            parsed.createdAt,
+            parsed.updatedAt,
+          ),
+    });
+  }
+
+  getBatch(batchId: string): ReviewWorkflowBatch | null {
+    const row = this.db
+      .prepare('SELECT payload_json FROM review_workflow_batches WHERE batch_id = ?')
+      .get(batchId);
+    if (row === undefined) return null;
+    const parsedRow = payloadRowSchema.parse(row);
+    return parseStoredPayload(parsedRow.payload_json, reviewWorkflowBatchSchema, 'BATCH');
+  }
+
+  getEvents(batchId: string, afterSequence = 0): readonly ReviewWorkflowEvent[] {
+    const rows = this.db
+      .prepare(
+        `SELECT
+          event_id,
+          workflow_id,
+          batch_id,
+          sequence,
+          aggregate_version,
+          event_type,
+          command_id,
+          actor_execution_id,
+          payload_json,
+          created_at
+        FROM review_workflow_events
+        WHERE batch_id = ? AND sequence > ?
+        ORDER BY sequence ASC`,
+      )
+      .all(batchId, afterSequence);
+
+    return rows.map((row) => {
+      const parsed = eventRowSchema.parse(row);
+      return {
+        eventId: parsed.event_id,
+        workflowId: parsed.workflow_id,
+        batchId: parsed.batch_id,
+        sequence: parsed.sequence,
+        aggregateVersion: parsed.aggregate_version,
+        eventType: parsed.event_type,
+        commandId: parsed.command_id,
+        actorExecutionId: parsed.actor_execution_id,
+        payload: parseJsonObject(parsed.payload_json),
+        createdAt: parsed.created_at,
+      };
+    });
+  }
+
+  saveEntity(entity: PersistableReviewWorkflowEntity): ImmutableSaveResult {
+    switch (entity.kind) {
+      case 'AGENT_ASSIGNMENT': {
+        const value = agentAssignmentSchema.parse(entity.value);
+        return this.saveRecord({
+          table: 'review_workflow_agent_assignments',
+          idColumn: 'assignment_id',
+          id: value.assignmentId,
+          hashInput: { kind: entity.kind, value },
+          insertSql: `INSERT INTO review_workflow_agent_assignments (
+            assignment_id,
+            workflow_id,
+            batch_id,
+            assigned_role,
+            configured_agent_key,
+            configuration_hash,
+            payload_json,
+            record_hash,
+            created_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          values: [
+            value.assignmentId,
+            value.workflowId,
+            value.batchId ?? null,
+            value.assignedRole,
+            value.configuredAgentKey,
+            value.configurationHash,
+          ],
+          payload: value,
+          createdAt: value.assignedAt,
+        });
+      }
+      case 'ACTOR_EXECUTION': {
+        const value = actorExecutionIdentitySchema.parse(entity.value);
+        return this.saveRecord({
+          table: 'review_workflow_actor_executions',
+          idColumn: 'actor_execution_id',
+          id: value.actorExecutionId,
+          hashInput: { kind: entity.kind, value },
+          insertSql: `INSERT INTO review_workflow_actor_executions (
+            actor_execution_id,
+            assignment_id,
+            actor_type,
+            identity_assurance,
+            payload_json,
+            record_hash,
+            created_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          values: [
+            value.actorExecutionId,
+            value.assignmentId ?? null,
+            value.actorType,
+            value.identityAssurance,
+          ],
+          payload: value,
+          createdAt: value.startedAt,
+        });
+      }
+      case 'INVOCATION_IDENTITY': {
+        const value = invocationIdentitySchema.parse(entity.value);
+        return this.saveRecord({
+          table: 'review_workflow_invocations',
+          idColumn: 'invocation_id',
+          id: value.invocationId,
+          hashInput: { kind: entity.kind, value },
+          insertSql: `INSERT INTO review_workflow_invocations (
+            invocation_id,
+            command_id,
+            result_status,
+            payload_json,
+            record_hash,
+            created_at
+          ) VALUES (?, ?, ?, ?, ?, ?)`,
+          values: [value.invocationId, value.commandId, value.resultStatus],
+          payload: value,
+          createdAt: value.startedAt,
+        });
+      }
+      case 'SESSION_IDENTITY': {
+        const value = sessionIdentitySchema.parse(entity.value);
+        return this.saveRecord({
+          table: 'review_workflow_sessions',
+          idColumn: 'session_identity_id',
+          id: value.sessionIdentityId,
+          hashInput: { kind: entity.kind, value },
+          insertSql: `INSERT INTO review_workflow_sessions (
+            session_identity_id,
+            workflow_id,
+            creating_invocation_id,
+            resumed_from_session_identity_id,
+            assigned_role,
+            provider_or_adapter,
+            vendor_session_id,
+            payload_json,
+            record_hash,
+            created_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          values: [
+            value.sessionIdentityId,
+            value.workflowId,
+            value.creatingInvocationId,
+            value.resumedFromSessionIdentityId ?? null,
+            value.assignedRole,
+            value.providerOrAdapter,
+            value.vendorSessionId,
+          ],
+          payload: value,
+          createdAt: value.createdAt,
+        });
+      }
+      case 'GENERAL_PLAN_VERSION': {
+        const value = generalPlanVersionSchema.parse(entity.value);
+        return this.savePlanDocument(
+          'GENERAL',
+          value.generalPlanVersionId,
+          value.workflowId,
+          null,
+          value.version,
+          value.contentHash,
+          value,
+          value.createdAt,
+        );
+      }
+      case 'PLAN_REQUIREMENT': {
+        const value = planRequirementSchema.parse(entity.value);
+        return this.saveRecord({
+          table: 'review_workflow_plan_requirements',
+          idColumn: 'requirement_id',
+          id: value.requirementId,
+          hashInput: { kind: entity.kind, value },
+          insertSql: `INSERT INTO review_workflow_plan_requirements (
+            requirement_id,
+            general_plan_version_id,
+            required,
+            payload_json,
+            record_hash,
+            created_at
+          ) VALUES (?, ?, ?, ?, ?, ?)`,
+          values: [value.requirementId, value.generalPlanVersionId, value.required ? 1 : 0],
+          payload: value,
+          createdAt: value.createdAt,
+        });
+      }
+      case 'REPOSITORY_AUDIT': {
+        const value = repositoryAuditSchema.parse(entity.value);
+        return this.saveRecord({
+          table: 'review_workflow_repository_audits',
+          idColumn: 'repository_audit_id',
+          id: value.repositoryAuditId,
+          hashInput: { kind: entity.kind, value },
+          insertSql: `INSERT INTO review_workflow_repository_audits (
+            repository_audit_id,
+            workflow_id,
+            head_sha,
+            actor_execution_id,
+            payload_json,
+            record_hash,
+            created_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          values: [
+            value.repositoryAuditId,
+            value.workflowId,
+            value.headSha,
+            value.actorExecutionId,
+          ],
+          payload: value,
+          createdAt: value.observedAt,
+        });
+      }
+      case 'REFINED_PLAN_VERSION': {
+        const value = refinedPlanVersionSchema.parse(entity.value);
+        return this.savePlanDocument(
+          'REFINED',
+          value.refinedPlanVersionId,
+          value.workflowId,
+          null,
+          value.version,
+          value.contentHash,
+          value,
+          value.createdAt,
+        );
+      }
+      case 'BATCH_PLAN_VERSION': {
+        const value = batchPlanVersionSchema.parse(entity.value);
+        return this.savePlanDocument(
+          'BATCH',
+          value.batchPlanVersionId,
+          value.workflowId,
+          value.batchId,
+          value.version,
+          value.contentHash,
+          value,
+          value.createdAt,
+        );
+      }
+      case 'ACCEPTANCE_CRITERION': {
+        const value = acceptanceCriterionSchema.parse(entity.value);
+        return this.saveRecord({
+          table: 'review_workflow_acceptance_criteria',
+          idColumn: 'acceptance_criterion_id',
+          id: value.acceptanceCriterionId,
+          hashInput: { kind: entity.kind, value },
+          insertSql: `INSERT INTO review_workflow_acceptance_criteria (
+            acceptance_criterion_id,
+            batch_plan_version_id,
+            criterion_kind,
+            required,
+            status,
+            payload_json,
+            record_hash,
+            created_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+          values: [
+            value.acceptanceCriterionId,
+            value.batchPlanVersionId,
+            value.kind,
+            value.required ? 1 : 0,
+            value.status,
+          ],
+          payload: value,
+          createdAt: value.createdAt,
+        });
+      }
+      case 'IMPLEMENTATION_ATTEMPT': {
+        const value = implementationAttemptSchema.parse(entity.value);
+        return this.saveRecord({
+          table: 'review_workflow_implementation_attempts',
+          idColumn: 'implementation_attempt_id',
+          id: value.implementationAttemptId,
+          hashInput: { kind: entity.kind, value },
+          insertSql: `INSERT INTO review_workflow_implementation_attempts (
+            implementation_attempt_id,
+            workflow_id,
+            batch_id,
+            attempt_number,
+            implementer_assignment_id,
+            implementer_actor_execution_id,
+            payload_json,
+            record_hash,
+            created_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          values: [
+            value.implementationAttemptId,
+            value.workflowId,
+            value.batchId,
+            value.attemptNumber,
+            value.implementerAssignmentId,
+            value.implementerActorExecutionId,
+          ],
+          payload: value,
+          createdAt: value.startedAt,
+        });
+      }
+      case 'IMPLEMENTATION_READY_EVIDENCE': {
+        const value = implementationReadyEvidenceSchema.parse(entity.value);
+        return this.saveRecord({
+          table: 'review_workflow_implementation_ready_evidence',
+          idColumn: 'implementation_ready_evidence_id',
+          id: value.implementationReadyEvidenceId,
+          hashInput: { kind: entity.kind, value },
+          insertSql: `INSERT INTO review_workflow_implementation_ready_evidence (
+            implementation_ready_evidence_id,
+            implementation_attempt_id,
+            actor_execution_id,
+            payload_json,
+            record_hash,
+            created_at
+          ) VALUES (?, ?, ?, ?, ?, ?)`,
+          values: [
+            value.implementationReadyEvidenceId,
+            value.implementationAttemptId,
+            value.actorExecutionId,
+          ],
+          payload: value,
+          createdAt: value.capturedAt,
+        });
+      }
+      case 'IMPLEMENTATION_COMMIT': {
+        const value = implementationCommitSchema.parse(entity.value);
+        return this.saveRecord({
+          table: 'review_workflow_implementation_commits',
+          idColumn: 'resulting_commit_sha',
+          id: value.resultingCommitSha,
+          hashInput: { kind: entity.kind, value },
+          insertSql: `INSERT INTO review_workflow_implementation_commits (
+            resulting_commit_sha,
+            implementation_attempt_id,
+            implementation_ready_evidence_id,
+            creator_actor_execution_id,
+            creation_mode,
+            payload_json,
+            record_hash,
+            created_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+          values: [
+            value.resultingCommitSha,
+            value.implementationAttemptId,
+            value.implementationReadyEvidenceId,
+            value.creatorActorExecutionId,
+            value.creationMode,
+          ],
+          payload: value,
+          createdAt: value.validatedAt,
+        });
+      }
+      case 'FINDING': {
+        const value = findingSchema.parse(entity.value);
+        return this.saveRecord({
+          table: 'review_workflow_findings',
+          idColumn: 'finding_id',
+          id: value.findingId,
+          hashInput: { kind: entity.kind, value },
+          insertSql: `INSERT INTO review_workflow_findings (
+            finding_id,
+            workflow_id,
+            batch_id,
+            review_round_id,
+            review_round_number,
+            review_kind,
+            severity,
+            category,
+            status,
+            reviewed_commit_sha,
+            payload_json,
+            record_hash,
+            created_at,
+            updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          values: [
+            value.findingId,
+            value.workflowId,
+            value.batchId,
+            value.reviewRoundId,
+            value.reviewRoundNumber,
+            value.reviewKind,
+            value.severity,
+            value.category,
+            value.status,
+            value.reviewedCommitSha ?? null,
+          ],
+          payload: value,
+          createdAt: value.createdAt,
+          trailingValues: [value.updatedAt],
+        });
+      }
+      case 'FINDING_DISPOSITION': {
+        const value = findingDispositionSchema.parse(entity.value);
+        return this.saveRecord({
+          table: 'review_workflow_dispositions',
+          idColumn: 'disposition_id',
+          id: value.dispositionId,
+          hashInput: { kind: entity.kind, value },
+          insertSql: `INSERT INTO review_workflow_dispositions (
+            disposition_id,
+            finding_id,
+            disposition_kind,
+            reviewer_decision,
+            actor_execution_id,
+            payload_json,
+            record_hash,
+            created_at,
+            updated_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          values: [
+            value.dispositionId,
+            value.findingId,
+            value.disposition,
+            value.reviewerDecision.decision,
+            value.actorExecutionId,
+          ],
+          payload: value,
+          createdAt: value.createdAt,
+          trailingValues: [value.updatedAt],
+        });
+      }
+      case 'VERIFICATION_RECORD': {
+        const value = verificationRecordSchema.parse(entity.value);
+        return this.saveRecord({
+          table: 'review_workflow_verification_records',
+          idColumn: 'verification_record_id',
+          id: value.verificationRecordId,
+          hashInput: {
+            kind: entity.kind,
+            workflowId: entity.workflowId,
+            batchId: entity.batchId,
+            value,
+          },
+          insertSql: `INSERT INTO review_workflow_verification_records (
+            verification_record_id,
+            workflow_id,
+            batch_id,
+            executor_actor_execution_id,
+            verification_type,
+            observed_status,
+            commit_sha,
+            payload_json,
+            record_hash,
+            created_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          values: [
+            value.verificationRecordId,
+            entity.workflowId,
+            entity.batchId,
+            value.executorActorExecutionId,
+            value.verificationType,
+            value.observedStatus,
+            value.commitSha,
+          ],
+          payload: value,
+          createdAt: value.startedAt,
+        });
+      }
+      case 'VERIFICATION_ATTESTATION': {
+        const value = verificationAttestationSchema.parse(entity.value);
+        return this.saveRecord({
+          table: 'review_workflow_verification_attestations',
+          idColumn: 'verification_attestation_id',
+          id: value.verificationAttestationId,
+          hashInput: { kind: entity.kind, value },
+          insertSql: `INSERT INTO review_workflow_verification_attestations (
+            verification_attestation_id,
+            verification_record_id,
+            workflow_id,
+            batch_id,
+            decision,
+            acceptance_mode,
+            attestor_actor_execution_id,
+            reviewed_commit_sha,
+            payload_json,
+            record_hash,
+            created_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          values: [
+            value.verificationAttestationId,
+            value.verificationRecordId,
+            value.workflowId,
+            value.batchId,
+            value.decision,
+            value.acceptanceMode,
+            value.attestorActorExecutionId,
+            value.reviewedCommitSha,
+          ],
+          payload: value,
+          createdAt: value.createdAt,
+        });
+      }
+      case 'REVIEW_RANGE_EVIDENCE': {
+        const value = reviewRangeEvidenceSchema.parse(entity.value);
+        return this.saveRecord({
+          table: 'review_workflow_review_range_evidence',
+          idColumn: 'review_range_evidence_id',
+          id: entity.reviewRangeEvidenceId,
+          hashInput: {
+            kind: entity.kind,
+            reviewRangeEvidenceId: entity.reviewRangeEvidenceId,
+            workflowId: entity.workflowId,
+            batchId: entity.batchId,
+            value,
+          },
+          insertSql: `INSERT INTO review_workflow_review_range_evidence (
+            review_range_evidence_id,
+            workflow_id,
+            batch_id,
+            current_implementation_sha,
+            patch_hash,
+            payload_json,
+            record_hash,
+            created_at
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+          values: [
+            entity.reviewRangeEvidenceId,
+            entity.workflowId,
+            entity.batchId,
+            value.vocabulary.currentImplementationSha,
+            value.patchHash,
+          ],
+          payload: value,
+          createdAt: value.capturedAt,
+        });
+      }
+    }
+  }
+
+  getEntity(kind: ReviewWorkflowEntityKind, id: string): PersistableReviewWorkflowEntity | null {
+    switch (kind) {
+      case 'AGENT_ASSIGNMENT':
+        return this.loadSimpleEntity(
+          kind,
+          'review_workflow_agent_assignments',
+          'assignment_id',
+          id,
+          agentAssignmentSchema,
+        );
+      case 'ACTOR_EXECUTION':
+        return this.loadSimpleEntity(
+          kind,
+          'review_workflow_actor_executions',
+          'actor_execution_id',
+          id,
+          actorExecutionIdentitySchema,
+        );
+      case 'INVOCATION_IDENTITY':
+        return this.loadSimpleEntity(
+          kind,
+          'review_workflow_invocations',
+          'invocation_id',
+          id,
+          invocationIdentitySchema,
+        );
+      case 'SESSION_IDENTITY':
+        return this.loadSimpleEntity(
+          kind,
+          'review_workflow_sessions',
+          'session_identity_id',
+          id,
+          sessionIdentitySchema,
+        );
+      case 'GENERAL_PLAN_VERSION':
+        return this.loadPlanDocumentEntity(kind, 'GENERAL', id, generalPlanVersionSchema);
+      case 'PLAN_REQUIREMENT':
+        return this.loadSimpleEntity(
+          kind,
+          'review_workflow_plan_requirements',
+          'requirement_id',
+          id,
+          planRequirementSchema,
+        );
+      case 'REPOSITORY_AUDIT':
+        return this.loadSimpleEntity(
+          kind,
+          'review_workflow_repository_audits',
+          'repository_audit_id',
+          id,
+          repositoryAuditSchema,
+        );
+      case 'REFINED_PLAN_VERSION':
+        return this.loadPlanDocumentEntity(kind, 'REFINED', id, refinedPlanVersionSchema);
+      case 'BATCH_PLAN_VERSION':
+        return this.loadPlanDocumentEntity(kind, 'BATCH', id, batchPlanVersionSchema);
+      case 'ACCEPTANCE_CRITERION':
+        return this.loadSimpleEntity(
+          kind,
+          'review_workflow_acceptance_criteria',
+          'acceptance_criterion_id',
+          id,
+          acceptanceCriterionSchema,
+        );
+      case 'IMPLEMENTATION_ATTEMPT':
+        return this.loadSimpleEntity(
+          kind,
+          'review_workflow_implementation_attempts',
+          'implementation_attempt_id',
+          id,
+          implementationAttemptSchema,
+        );
+      case 'IMPLEMENTATION_READY_EVIDENCE':
+        return this.loadSimpleEntity(
+          kind,
+          'review_workflow_implementation_ready_evidence',
+          'implementation_ready_evidence_id',
+          id,
+          implementationReadyEvidenceSchema,
+        );
+      case 'IMPLEMENTATION_COMMIT':
+        return this.loadSimpleEntity(
+          kind,
+          'review_workflow_implementation_commits',
+          'resulting_commit_sha',
+          id,
+          implementationCommitSchema,
+        );
+      case 'FINDING':
+        return this.loadSimpleEntity(
+          kind,
+          'review_workflow_findings',
+          'finding_id',
+          id,
+          findingSchema,
+        );
+      case 'FINDING_DISPOSITION':
+        return this.loadSimpleEntity(
+          kind,
+          'review_workflow_dispositions',
+          'disposition_id',
+          id,
+          findingDispositionSchema,
+        );
+      case 'VERIFICATION_RECORD': {
+        const row = this.loadContextualPayload(
+          'review_workflow_verification_records',
+          'verification_record_id',
+          id,
+        );
+        if (row === null) return null;
+        return {
+          kind,
+          workflowId: row.workflowId,
+          batchId: row.batchId,
+          value: parseStoredPayload(row.payloadJson, verificationRecordSchema, kind),
+        };
+      }
+      case 'VERIFICATION_ATTESTATION':
+        return this.loadSimpleEntity(
+          kind,
+          'review_workflow_verification_attestations',
+          'verification_attestation_id',
+          id,
+          verificationAttestationSchema,
+        );
+      case 'REVIEW_RANGE_EVIDENCE': {
+        const row = this.loadContextualPayload(
+          'review_workflow_review_range_evidence',
+          'review_range_evidence_id',
+          id,
+        );
+        if (row === null) return null;
+        return {
+          kind,
+          reviewRangeEvidenceId: id,
+          workflowId: row.workflowId,
+          batchId: row.batchId,
+          value: parseStoredPayload(row.payloadJson, reviewRangeEvidenceSchema, kind),
+        };
+      }
+    }
+  }
+
+  private savePlanDocument(
+    kind: 'GENERAL' | 'REFINED' | 'BATCH',
+    documentId: string,
+    workflowId: string,
+    batchId: string | null,
+    version: number,
+    contentHash: string,
+    payload: GeneralPlanVersion | RefinedPlanVersion | BatchPlanVersion,
+    createdAt: string,
+  ): ImmutableSaveResult {
+    return this.saveRecord({
+      table: 'review_workflow_plan_documents',
+      idColumn: 'document_id',
+      id: documentId,
+      hashInput: { kind, value: payload },
+      insertSql: `INSERT INTO review_workflow_plan_documents (
+        document_id,
+        workflow_id,
+        batch_id,
+        document_kind,
+        version,
+        content_hash,
+        payload_json,
+        record_hash,
+        created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      values: [documentId, workflowId, batchId, kind, version, contentHash],
+      payload,
+      createdAt,
+    });
+  }
+
+  private saveRecord(input: {
+    readonly table: string;
+    readonly idColumn: string;
+    readonly id: string;
+    readonly hashInput: unknown;
+    readonly insertSql: string;
+    readonly values: readonly unknown[];
+    readonly payload: unknown;
+    readonly createdAt: string;
+    readonly trailingValues?: readonly unknown[];
+  }): ImmutableSaveResult {
+    const payloadJson = serializeJson(input.payload);
+    const recordHash = hashRecord(input.hashInput);
+    return this.insertImmutable({
+      table: input.table,
+      idColumn: input.idColumn,
+      id: input.id,
+      recordHash,
+      insert: () =>
+        this.db
+          .prepare(input.insertSql)
+          .run(
+            ...input.values,
+            payloadJson,
+            recordHash,
+            input.createdAt,
+            ...(input.trailingValues ?? []),
+          ),
+    });
+  }
+
+  private insertImmutable(input: {
+    readonly table: string;
+    readonly idColumn: string;
+    readonly id: string;
+    readonly recordHash: string;
+    readonly insert: () => Database.RunResult;
+  }): ImmutableSaveResult {
+    const existingHash = this.getRecordHash(input.table, input.idColumn, input.id);
+    if (existingHash !== null) {
+      if (existingHash === input.recordHash) return { inserted: false };
+      throw new ReviewWorkflowPersistenceError(
+        'IMMUTABLE_ENTITY_CONFLICT',
+        `Stored ${input.table} record ${input.id} differs from the supplied immutable record`,
+      );
+    }
+
+    try {
+      input.insert();
+      return { inserted: true };
+    } catch (error) {
+      const racedHash = this.getRecordHash(input.table, input.idColumn, input.id);
+      if (racedHash === input.recordHash) return { inserted: false };
+      if (racedHash !== null) {
+        throw new ReviewWorkflowPersistenceError(
+          'IMMUTABLE_ENTITY_CONFLICT',
+          `Stored ${input.table} record ${input.id} differs from the supplied immutable record`,
+        );
+      }
+      throw error;
+    }
+  }
+
+  private getRecordHash(table: string, idColumn: string, id: string): string | null {
+    const row = this.db.prepare(`SELECT record_hash FROM ${table} WHERE ${idColumn} = ?`).get(id);
+    if (row === undefined) return null;
+    return recordHashRowSchema.parse(row).record_hash;
+  }
+
+  private loadSimpleEntity<
+    Kind extends Exclude<ReviewWorkflowEntityKind, 'VERIFICATION_RECORD' | 'REVIEW_RANGE_EVIDENCE'>,
+    Value,
+  >(
+    kind: Kind,
+    table: string,
+    idColumn: string,
+    id: string,
+    schema: z.ZodType<Value>,
+  ): { readonly kind: Kind; readonly value: Value } | null {
+    const row = this.db.prepare(`SELECT payload_json FROM ${table} WHERE ${idColumn} = ?`).get(id);
+    if (row === undefined) return null;
+    const parsedRow = payloadRowSchema.parse(row);
+    return {
+      kind,
+      value: parseStoredPayload(parsedRow.payload_json, schema, kind),
+    };
+  }
+
+  private loadPlanDocumentEntity<
+    Kind extends 'GENERAL_PLAN_VERSION' | 'REFINED_PLAN_VERSION' | 'BATCH_PLAN_VERSION',
+    Value,
+  >(
+    kind: Kind,
+    documentKind: 'GENERAL' | 'REFINED' | 'BATCH',
+    id: string,
+    schema: z.ZodType<Value>,
+  ): { readonly kind: Kind; readonly value: Value } | null {
+    const row = this.db
+      .prepare(
+        `SELECT payload_json
+         FROM review_workflow_plan_documents
+         WHERE document_id = ? AND document_kind = ?`,
+      )
+      .get(id, documentKind);
+    if (row === undefined) return null;
+    const parsedRow = payloadRowSchema.parse(row);
+    return {
+      kind,
+      value: parseStoredPayload(parsedRow.payload_json, schema, kind),
+    };
+  }
+
+  private loadContextualPayload(
+    table: string,
+    idColumn: string,
+    id: string,
+  ): {
+    readonly workflowId: string;
+    readonly batchId: string;
+    readonly payloadJson: string;
+  } | null {
+    const row = this.db
+      .prepare(`SELECT workflow_id, batch_id, payload_json FROM ${table} WHERE ${idColumn} = ?`)
+      .get(id);
+    if (row === undefined) return null;
+    const parsed = contextualPayloadRowSchema.parse(row);
+    return {
+      workflowId: parsed.workflow_id,
+      batchId: parsed.batch_id,
+      payloadJson: parsed.payload_json,
+    };
+  }
+}

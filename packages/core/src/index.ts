@@ -178,6 +178,7 @@ export {
   CacheStore,
   hashContent,
   hashConfig,
+  reviewWorkflowPersistence,
 } from './memory/index.js';
 export type { CostSummary, DebateTurnRow, DebateTurnStatus, DebateMessageRow, MessageStatus, ParsedVerdict, UnifiedSession, SessionEvent, CacheEntry } from './memory/index.js';
 
