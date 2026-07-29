@@ -1,0 +1,78 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "initial-review.schema.json",
+  "title": "Review-gated batch initial review",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "workflowId",
+    "batchId",
+    "reviewType",
+    "reviewRound",
+    "baseSha",
+    "reviewedHeadSha",
+    "filesReviewed",
+    "acceptanceCriteriaReviewed",
+    "verification",
+    "scopeCompliant",
+    "reviewComplete",
+    "findings",
+    "blockingFindingCount",
+    "deferredFindingCount",
+    "verdict"
+  ],
+  "$defs": {
+    "finding": {
+      "type": "object",
+      "required": [
+        "findingId",
+        "severity",
+        "category",
+        "file",
+        "location",
+        "requirementOrInvariant",
+        "observedImplementation",
+        "impact",
+        "requiredCorrection",
+        "verificationRequired",
+        "blocking"
+      ],
+      "properties": {
+        "findingId": { "type": "string", "minLength": 1 },
+        "severity": { "enum": ["CRITICAL", "HIGH", "MEDIUM", "LOW", "SUGGESTION"] },
+        "category": { "type": "string", "minLength": 1 },
+        "file": { "type": "string", "minLength": 1 },
+        "location": { "type": "string", "minLength": 1 },
+        "requirementOrInvariant": { "type": "string", "minLength": 1 },
+        "observedImplementation": { "type": "string", "minLength": 1 },
+        "impact": { "type": "string", "minLength": 1 },
+        "requiredCorrection": { "type": "string", "minLength": 1 },
+        "verificationRequired": { "type": "string", "minLength": 1 },
+        "blocking": { "type": "boolean" },
+        "mergeBlockingCriterion": { "type": "string", "minLength": 1 }
+      }
+    }
+  },
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "workflowId": { "type": "string", "minLength": 1 },
+    "batchId": { "type": "integer", "minimum": 1 },
+    "reviewType": { "const": "INITIAL" },
+    "reviewRound": { "const": 1 },
+    "baseSha": { "type": "string", "minLength": 1 },
+    "reviewedHeadSha": { "type": "string", "minLength": 1 },
+    "filesReviewed": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+    "acceptanceCriteriaReviewed": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "verification": { "oneOf": [{ "type": "array" }, { "type": "object" }] },
+    "scopeCompliant": { "type": "boolean" },
+    "reviewComplete": { "const": true },
+    "findings": { "type": "array", "items": { "$ref": "#/$defs/finding" } },
+    "blockingFindingCount": { "type": "integer", "minimum": 0 },
+    "deferredFindingCount": { "type": "integer", "minimum": 0 },
+    "verdict": { "enum": ["APPROVED", "NEEDS_REVISION", "BLOCKED"] }
+  }
+}

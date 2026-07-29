@@ -11,7 +11,12 @@
     "lint": "biome check .",
     "lint:fix": "biome check --fix .",
     "typecheck": "pnpm -r typecheck",
-    "clean": "pnpm -r clean"
+    "clean": "pnpm -r clean",
+    "workflow:controller": "node tools/review-controller/controller.mjs",
+    "workflow:status": "node tools/review-controller/controller.mjs status",
+    "workflow:run-once": "node tools/review-controller/controller.mjs run-once",
+    "workflow:run": "node tools/review-controller/controller.mjs run-until-stop",
+    "workflow:test": "node --test tools/review-controller/tests/*.test.mjs"
   },
   "devDependencies": {
     "@biomejs/biome": "^1.9.0",

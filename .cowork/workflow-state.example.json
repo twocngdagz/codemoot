@@ -1,0 +1,37 @@
+{
+  "schemaVersion": 1,
+  "workflowId": "codemoot-review-gated-redesign",
+  "status": "ACTIVE",
+  "activeBatch": 3,
+  "phase": "IMPLEMENT",
+  "authorisedRole": "IMPLEMENTER",
+  "authorisedAgent": "codex",
+  "implementer": "codex",
+  "reviewer": "claude",
+  "batchPlanPath": "docs/plans/batch-03.md",
+  "baseSha": "60ce775",
+  "reviewedHeadSha": null,
+  "reviewRound": 0,
+  "correctionRound": 0,
+  "limits": {
+    "initialReviewPasses": 1,
+    "correctionPasses": 1,
+    "finalReviewPasses": 1,
+    "maximumControllerActions": 20
+  },
+  "automation": {
+    "autoCommit": false,
+    "autoPush": false,
+    "autoAdvance": true
+  },
+  "openBlockingFindingIds": [],
+  "deferredFindingIds": [],
+  "artifacts": {
+    "implementationReport": null,
+    "initialReview": null,
+    "correctionReport": null,
+    "finalReview": null
+  },
+  "lastAction": null,
+  "nextAction": "RUN_IMPLEMENTER"
+}

@@ -1,0 +1,83 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "final-review.schema.json",
+  "title": "Review-gated batch final review",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "workflowId",
+    "batchId",
+    "reviewType",
+    "reviewRound",
+    "sourceInitialReview",
+    "sourceCorrectionReport",
+    "baseSha",
+    "previousReviewedHeadSha",
+    "reviewedHeadSha",
+    "reviewComplete",
+    "findingResults",
+    "newRegressionFindings",
+    "verification",
+    "verdict"
+  ],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "workflowId": { "type": "string", "minLength": 1 },
+    "batchId": { "type": "integer", "minimum": 1 },
+    "reviewType": { "const": "FINAL" },
+    "reviewRound": { "const": 2 },
+    "sourceInitialReview": { "type": "string", "minLength": 1 },
+    "sourceCorrectionReport": { "type": "string", "minLength": 1 },
+    "baseSha": { "type": "string", "minLength": 1 },
+    "previousReviewedHeadSha": { "type": "string", "minLength": 1 },
+    "reviewedHeadSha": { "type": "string", "minLength": 1 },
+    "reviewComplete": { "const": true },
+    "findingResults": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["findingId", "status", "explanation", "verificationPerformed", "evidence"],
+        "properties": {
+          "findingId": { "type": "string", "minLength": 1 },
+          "status": {
+            "enum": [
+              "FIXED_AND_VERIFIED",
+              "ACCEPTED_NO_CHANGE",
+              "NOT_FIXED",
+              "REGRESSION_INTRODUCED",
+              "CANNOT_VERIFY"
+            ]
+          },
+          "explanation": { "type": "string", "minLength": 1 },
+          "verificationPerformed": {
+            "oneOf": [{ "type": "array" }, { "type": "object" }]
+          },
+          "evidence": {}
+        }
+      }
+    },
+    "newRegressionFindings": {
+      "type": "array",
+      "items": {
+        "allOf": [
+          { "$ref": "initial-review.schema.json#/$defs/finding" },
+          {
+            "type": "object",
+            "required": ["introducedByCorrection", "evidence"],
+            "properties": {
+              "severity": { "enum": ["CRITICAL", "HIGH"] },
+              "introducedByCorrection": { "const": true },
+              "evidence": {
+                "oneOf": [{ "type": "string", "minLength": 1 }, { "type": "object" }]
+              }
+            }
+          }
+        ]
+      }
+    },
+    "verification": { "oneOf": [{ "type": "array" }, { "type": "object" }] },
+    "verdict": { "enum": ["APPROVED", "HUMAN_DECISION_REQUIRED", "BLOCKED"] }
+  }
+}

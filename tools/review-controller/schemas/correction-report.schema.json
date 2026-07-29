@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "correction-report.schema.json",
+  "title": "Review-gated batch correction report",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "workflowId",
+    "batchId",
+    "correctionRound",
+    "sourceReviewArtifact",
+    "baseSha",
+    "resultingHeadSha",
+    "reviewComplete",
+    "dispositions",
+    "verification"
+  ],
+  "properties": {
+    "schemaVersion": { "const": 1 },
+    "workflowId": { "type": "string", "minLength": 1 },
+    "batchId": { "type": "integer", "minimum": 1 },
+    "correctionRound": { "const": 1 },
+    "sourceReviewArtifact": { "type": "string", "minLength": 1 },
+    "baseSha": { "type": "string", "minLength": 1 },
+    "resultingHeadSha": { "type": "string", "minLength": 1 },
+    "reviewComplete": { "const": true },
+    "dispositions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "findingId",
+          "disposition",
+          "explanation",
+          "filesChanged",
+          "verificationPerformed",
+          "evidence"
+        ],
+        "properties": {
+          "findingId": { "type": "string", "minLength": 1 },
+          "disposition": {
+            "enum": ["FIXED", "NO_CHANGE_WITH_EVIDENCE", "BLOCKED", "SUPERSEDED"]
+          },
+          "explanation": { "type": "string", "minLength": 1 },
+          "filesChanged": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+          "verificationPerformed": {
+            "oneOf": [{ "type": "array" }, { "type": "object" }]
+          },
+          "evidence": { "oneOf": [{ "type": "string", "minLength": 1 }, { "type": "object" }] }
+        }
+      }
+    },
+    "verification": { "oneOf": [{ "type": "array" }, { "type": "object" }] }
+  }
+}

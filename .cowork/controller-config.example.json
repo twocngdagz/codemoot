@@ -1,0 +1,35 @@
+{
+  "schemaVersion": 1,
+  "repositoryRoot": ".",
+  "stateFile": ".cowork/workflow-state.json",
+  "artifactDirectory": ".cowork/reviews",
+  "reportDirectory": ".cowork/reports",
+  "rawOutputDirectory": ".cowork/raw",
+  "runtimeDirectory": ".cowork/runtime",
+  "lockFile": ".cowork/controller.lock",
+  "implementer": {
+    "agent": "codex",
+    "command": "codex",
+    "args": ["exec", "-"],
+    "promptDelivery": "stdin",
+    "timeoutMs": 1800000
+  },
+  "reviewer": {
+    "agent": "claude",
+    "command": "claude",
+    "args": ["--print", "--output-format", "text"],
+    "promptDelivery": "stdin",
+    "timeoutMs": 1800000
+  },
+  "invalidOutputRetryCount": 1,
+  "autoCommit": false,
+  "autoPush": false,
+  "autoAdvance": true,
+  "pushRequired": true,
+  "branch": "master",
+  "remote": "origin",
+  "environmentVariableAllowlist": ["PATH", "HOME", "CODEX_HOME"],
+  "maximumControllerActions": 20,
+  "commitMessage": null,
+  "approvedBatches": []
+}
