@@ -1,28 +1,67 @@
 // packages/core/src/config/schema.ts
 
 import { z } from 'zod';
-import { CONTEXT_ACTIVE, CONTEXT_BUFFER, CONTEXT_RETRIEVED, DEFAULT_MAX_TOKENS, DEFAULT_TIMEOUT_SEC } from '../utils/constants.js';
+import { resolveConfiguredAdapterKind } from '../review-workflow-identity/service.js';
+import {
+  CONTEXT_ACTIVE,
+  CONTEXT_BUFFER,
+  CONTEXT_RETRIEVED,
+  DEFAULT_MAX_TOKENS,
+  DEFAULT_TIMEOUT_SEC,
+} from '../utils/constants.js';
 import { ConfigError } from '../utils/errors.js';
+import { COMPATIBILITY_REVIEW_GATED_CONFIG } from './review-gated.js';
 
-const modelProviderSchema = z.literal('openai');
+export const modelProviderSchema = z.enum(['openai', 'anthropic']);
+export const cliAdapterKindSchema = z.enum(['codex', 'claude']);
 
-const cliAdapterConfigSchema = z.object({
+export const cliAdapterConfigSchema = z.object({
+  kind: cliAdapterKindSchema.optional(),
   command: z.string().min(1),
   args: z.array(z.string()),
   timeout: z.number().positive(),
+  versionConstraint: z.string().min(1).optional(),
   outputFile: z.string().optional(),
   maxOutputBytes: z.number().int().positive().optional(),
   envAllowlist: z.array(z.string()).optional(),
 });
 
-const modelConfigSchema = z.object({
-  provider: modelProviderSchema,
-  model: z.string().min(1),
-  maxTokens: z.number().int().positive().default(DEFAULT_MAX_TOKENS),
-  temperature: z.number().min(0).max(2).default(0.7),
-  timeout: z.number().positive().default(DEFAULT_TIMEOUT_SEC),
-  cliAdapter: cliAdapterConfigSchema.optional(),
-});
+export const modelConfigSchema = z
+  .object({
+    provider: modelProviderSchema,
+    model: z.string().min(1),
+    maxTokens: z.number().int().positive().default(DEFAULT_MAX_TOKENS),
+    temperature: z.number().min(0).max(2).default(0.7),
+    timeout: z.number().positive().default(DEFAULT_TIMEOUT_SEC),
+    cliAdapter: cliAdapterConfigSchema.optional(),
+  })
+  .superRefine((value, context) => {
+    if (value.cliAdapter?.kind === 'claude' && value.provider !== 'anthropic') {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['cliAdapter', 'kind'],
+        message: 'Claude CLI adapters require provider "anthropic"',
+      });
+    }
+    if (value.cliAdapter?.kind === 'codex' && value.provider !== 'openai') {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['cliAdapter', 'kind'],
+        message: 'Codex CLI adapters require provider "openai"',
+      });
+    }
+  })
+  .transform((value) => ({
+    ...value,
+    ...(value.cliAdapter === undefined
+      ? {}
+      : {
+          cliAdapter: {
+            ...value.cliAdapter,
+            kind: value.cliAdapter.kind ?? (value.provider === 'anthropic' ? 'claude' : 'codex'),
+          },
+        }),
+  }));
 
 const roleConfigSchema = z.object({
   model: z.string().min(1),
@@ -39,9 +78,66 @@ const debatePatternSchema = z.enum([
 ]);
 
 const debateConfigSchema = z.object({
+  enabled: z.boolean().default(true),
   defaultPattern: debatePatternSchema.default('proposal-critique'),
   maxRounds: z.number().int().positive().max(10).default(3),
   consensusThreshold: z.number().min(0).max(1).default(0.7),
+});
+
+export const reviewGatedIdentityConfigSchema = z.object({
+  minimumAssurance: z
+    .enum(['authenticated_subject', 'cli_asserted', 'process_attested', 'config_only'])
+    .default('config_only'),
+  requireDifferentAdapterKinds: z.boolean().default(false),
+  prohibitSharedSessions: z.boolean().default(true),
+});
+
+export const reviewGatedCommitConfigSchema = z
+  .object({
+    mode: z.enum(['human_required', 'agent_authorized', 'either']).default('human_required'),
+    agentMayCommit: z.boolean().default(false),
+  })
+  .superRefine((value, context) => {
+    const modeAllowsAgent = value.mode !== 'human_required';
+    if (value.agentMayCommit !== modeAllowsAgent) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['agentMayCommit'],
+        message:
+          value.mode === 'human_required'
+            ? 'agentMayCommit must be false when commit mode is human_required'
+            : `agentMayCommit must be true when commit mode is ${value.mode}`,
+      });
+    }
+  });
+
+export const reviewGatedGateConfigSchema = z
+  .object({
+    planReview: z.literal('required').default('required'),
+    codeReview: z.literal('required').default('required'),
+    verification: z.literal('required').default('required'),
+    humanMerge: z.literal('required').default('required'),
+    blockingSeverities: z
+      .array(z.enum(['critical', 'high', 'medium', 'low']))
+      .min(1)
+      .default(['critical', 'high']),
+    requireAllFindingResponses: z.boolean().default(true),
+    requireAcceptedAttestations: z.boolean().default(true),
+  })
+  .superRefine((value, context) => {
+    if (new Set(value.blockingSeverities).size !== value.blockingSeverities.length) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['blockingSeverities'],
+        message: 'Blocking severities must be unique',
+      });
+    }
+  });
+
+export const reviewGatedConfigSchema = z.object({
+  identity: reviewGatedIdentityConfigSchema.default(COMPATIBILITY_REVIEW_GATED_CONFIG.identity),
+  commit: reviewGatedCommitConfigSchema.default(COMPATIBILITY_REVIEW_GATED_CONFIG.commit),
+  gates: reviewGatedGateConfigSchema.default(COMPATIBILITY_REVIEW_GATED_CONFIG.gates),
 });
 
 const memoryConfigSchema = z.object({
@@ -80,7 +176,7 @@ const advancedConfigSchema = z.object({
 
 export const projectConfigSchema = z
   .object({
-    configVersion: z.number().int().positive().optional(),
+    configVersion: z.literal(3).default(3),
     project: z
       .object({
         name: z.string().default(''),
@@ -92,6 +188,7 @@ export const projectConfigSchema = z
     workflow: z.string().default('plan-review-implement'),
     mode: executionModeSchema.default('autonomous'),
     debate: debateConfigSchema.default({}),
+    reviewGated: reviewGatedConfigSchema.default(COMPATIBILITY_REVIEW_GATED_CONFIG),
     memory: memoryConfigSchema.default({}),
     budget: budgetConfigSchema.default({}),
     output: outputConfigSchema.default({}),
@@ -107,6 +204,68 @@ export const projectConfigSchema = z
           message: `Role "${roleName}" references model "${roleConfig.model}" which is not defined in models. Available: ${modelAliases.join(', ')}`,
         });
       }
+    }
+    if (data.workflow !== 'review-gated-batches') return;
+
+    const implementerRole = data.roles.implementer;
+    const reviewerRole = data.roles.reviewer;
+    if (implementerRole === undefined) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['roles', 'implementer'],
+        message: 'Review-gated workflow requires an implementer role',
+      });
+    }
+    if (reviewerRole === undefined) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['roles', 'reviewer'],
+        message: 'Review-gated workflow requires a reviewer role',
+      });
+    }
+    if (implementerRole === undefined || reviewerRole === undefined) return;
+
+    if (implementerRole.model === reviewerRole.model) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['roles', 'reviewer', 'model'],
+        message: 'Implementer and reviewer must use different configured agent keys',
+      });
+    }
+    if (!data.reviewGated.identity.prohibitSharedSessions) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['reviewGated', 'identity', 'prohibitSharedSessions'],
+        message: 'Review-gated workflows must prohibit shared implementer/reviewer sessions',
+      });
+    }
+    if (!data.reviewGated.identity.requireDifferentAdapterKinds) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['reviewGated', 'identity', 'requireDifferentAdapterKinds'],
+        message: 'Review-gated workflows must require different adapter kinds',
+      });
+    }
+    if (data.reviewGated.identity.minimumAssurance === 'config_only') {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['reviewGated', 'identity', 'minimumAssurance'],
+        message: 'Review-gated workflows require process_attested identity assurance or stronger',
+      });
+    }
+
+    const implementerModel = data.models[implementerRole.model];
+    const reviewerModel = data.models[reviewerRole.model];
+    if (
+      implementerModel !== undefined &&
+      reviewerModel !== undefined &&
+      resolveConfiguredAdapterKind(implementerModel) === resolveConfiguredAdapterKind(reviewerModel)
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['roles', 'reviewer', 'model'],
+        message: 'Implementer and reviewer must resolve to different adapter kinds',
+      });
     }
   });
 

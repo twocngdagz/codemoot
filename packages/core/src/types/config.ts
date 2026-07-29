@@ -1,11 +1,15 @@
 // packages/core/src/types/config.ts
 
-export type ModelProvider = 'openai';
+export type ModelProvider = 'openai' | 'anthropic';
+
+export type CliAdapterKind = 'codex' | 'claude';
 
 export interface CliAdapterConfig {
+  kind?: CliAdapterKind;
   command: string;
   args: string[];
   timeout: number;
+  versionConstraint?: string;
   outputFile?: string;
   maxOutputBytes?: number;
   envAllowlist?: string[];
@@ -28,6 +32,7 @@ export interface RoleConfig {
 }
 
 export interface DebateConfig {
+  enabled?: boolean;
   defaultPattern: DebatePattern;
   maxRounds: number;
   consensusThreshold: number;
@@ -63,6 +68,43 @@ export interface OutputConfig {
   transcriptDir: string;
 }
 
+export type ReviewGatedIdentityAssurance =
+  | 'authenticated_subject'
+  | 'cli_asserted'
+  | 'process_attested'
+  | 'config_only';
+
+export interface ReviewGatedIdentityConfig {
+  minimumAssurance: ReviewGatedIdentityAssurance;
+  requireDifferentAdapterKinds: boolean;
+  prohibitSharedSessions: boolean;
+}
+
+export type ReviewGatedCommitMode = 'human_required' | 'agent_authorized' | 'either';
+
+export interface ReviewGatedCommitConfig {
+  mode: ReviewGatedCommitMode;
+  agentMayCommit: boolean;
+}
+
+export type ReviewGatedBlockingSeverity = 'critical' | 'high' | 'medium' | 'low';
+
+export interface ReviewGatedGateConfig {
+  planReview: 'required';
+  codeReview: 'required';
+  verification: 'required';
+  humanMerge: 'required';
+  blockingSeverities: ReviewGatedBlockingSeverity[];
+  requireAllFindingResponses: boolean;
+  requireAcceptedAttestations: boolean;
+}
+
+export interface ReviewGatedConfig {
+  identity: ReviewGatedIdentityConfig;
+  commit: ReviewGatedCommitConfig;
+  gates: ReviewGatedGateConfig;
+}
+
 export interface ProjectConfig {
   configVersion?: number;
   project: {
@@ -74,6 +116,7 @@ export interface ProjectConfig {
   workflow: string;
   mode: ExecutionMode;
   debate: DebateConfig;
+  reviewGated?: ReviewGatedConfig;
   memory: MemoryConfig;
   budget: BudgetConfig;
   output: OutputConfig;

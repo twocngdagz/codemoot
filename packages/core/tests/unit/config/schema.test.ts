@@ -27,6 +27,73 @@ describe('projectConfigSchema', () => {
       expect(result.data.advanced.logLevel).toBe('info');
       expect(result.data.budget.perSession).toBe(5.0);
       expect(result.data.debate.maxRounds).toBe(3);
+      expect(result.data.configVersion).toBe(3);
+      expect(result.data.reviewGated.commit.mode).toBe('human_required');
+    }
+  });
+
+  it('accepts a review-gated Claude/Codex identity configuration', () => {
+    const result = projectConfigSchema.safeParse({
+      ...DEFAULT_CONFIG,
+      workflow: 'review-gated-batches',
+      models: {
+        implementer: {
+          provider: 'anthropic',
+          model: 'claude-supported',
+          cliAdapter: {
+            kind: 'claude',
+            command: 'claude',
+            args: [],
+            timeout: 600,
+          },
+        },
+        reviewer: {
+          provider: 'openai',
+          model: 'codex-supported',
+          cliAdapter: {
+            kind: 'codex',
+            command: 'codex',
+            args: ['exec'],
+            timeout: 600,
+          },
+        },
+      },
+      roles: {
+        implementer: { model: 'implementer' },
+        reviewer: { model: 'reviewer' },
+      },
+      reviewGated: {
+        ...DEFAULT_CONFIG.reviewGated,
+        identity: {
+          minimumAssurance: 'process_attested',
+          requireDifferentAdapterKinds: true,
+          prohibitSharedSessions: true,
+        },
+      },
+    });
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.models.implementer.cliAdapter?.kind).toBe('claude');
+      expect(result.data.models.reviewer.cliAdapter?.kind).toBe('codex');
+    }
+  });
+
+  it('infers an adapter kind when a v3 adapter omits it', () => {
+    const result = projectConfigSchema.safeParse({
+      models: {
+        test: {
+          provider: 'anthropic',
+          model: 'claude-supported',
+          cliAdapter: { command: 'claude', args: [], timeout: 600 },
+        },
+      },
+      roles: { architect: { model: 'test' } },
+    });
+
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.data.models.test.cliAdapter?.kind).toBe('claude');
     }
   });
 
@@ -42,6 +109,139 @@ describe('projectConfigSchema', () => {
     };
     const result = projectConfigSchema.safeParse(bad);
     expect(result.success).toBe(false);
+  });
+
+  it('rejects provider and adapter-kind mismatches', () => {
+    const result = projectConfigSchema.safeParse({
+      ...DEFAULT_CONFIG,
+      models: {
+        test: {
+          provider: 'openai',
+          model: 'test',
+          cliAdapter: { kind: 'claude', command: 'claude', args: [], timeout: 600 },
+        },
+      },
+      roles: { architect: { model: 'test' } },
+    });
+
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues[0]?.message).toContain(
+        'Claude CLI adapters require provider "anthropic"',
+      );
+    }
+  });
+
+  it.each([
+    {
+      name: 'the same configured agent',
+      mutate: {
+        roles: {
+          implementer: { model: 'claude-agent' },
+          reviewer: { model: 'claude-agent' },
+        },
+      },
+      expected: 'different configured agent keys',
+    },
+    {
+      name: 'the same adapter kind',
+      mutate: {
+        models: {
+          'claude-agent': {
+            provider: 'anthropic',
+            model: 'claude-implementer',
+            cliAdapter: { kind: 'claude', command: 'claude', args: [], timeout: 600 },
+          },
+          'codex-agent': {
+            provider: 'anthropic',
+            model: 'claude-reviewer',
+            cliAdapter: { kind: 'claude', command: 'claude', args: [], timeout: 600 },
+          },
+        },
+      },
+      expected: 'different adapter kinds',
+    },
+    {
+      name: 'a shared-session policy',
+      mutate: {
+        reviewGated: {
+          identity: {
+            minimumAssurance: 'process_attested',
+            requireDifferentAdapterKinds: true,
+            prohibitSharedSessions: false,
+          },
+          commit: { mode: 'human_required', agentMayCommit: false },
+          gates: DEFAULT_CONFIG.reviewGated?.gates,
+        },
+      },
+      expected: 'must prohibit shared implementer/reviewer sessions',
+    },
+    {
+      name: 'config-only assurance',
+      mutate: {
+        reviewGated: {
+          identity: {
+            minimumAssurance: 'config_only',
+            requireDifferentAdapterKinds: true,
+            prohibitSharedSessions: true,
+          },
+          commit: { mode: 'human_required', agentMayCommit: false },
+          gates: DEFAULT_CONFIG.reviewGated?.gates,
+        },
+      },
+      expected: 'process_attested identity assurance or stronger',
+    },
+  ])('rejects review-gated configuration with $name', ({ mutate, expected }) => {
+    const base = {
+      ...DEFAULT_CONFIG,
+      workflow: 'review-gated-batches',
+      models: {
+        'claude-agent': {
+          provider: 'anthropic',
+          model: 'claude-supported',
+          cliAdapter: { kind: 'claude', command: 'claude', args: [], timeout: 600 },
+        },
+        'codex-agent': {
+          provider: 'openai',
+          model: 'codex-supported',
+          cliAdapter: { kind: 'codex', command: 'codex', args: ['exec'], timeout: 600 },
+        },
+      },
+      roles: {
+        implementer: { model: 'claude-agent' },
+        reviewer: { model: 'codex-agent' },
+      },
+      reviewGated: {
+        identity: {
+          minimumAssurance: 'process_attested',
+          requireDifferentAdapterKinds: true,
+          prohibitSharedSessions: true,
+        },
+        commit: { mode: 'human_required', agentMayCommit: false },
+        gates: DEFAULT_CONFIG.reviewGated?.gates,
+      },
+    };
+    const result = projectConfigSchema.safeParse({ ...base, ...mutate });
+
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues.some((issue) => issue.message.includes(expected))).toBe(true);
+    }
+  });
+
+  it('rejects commit mode and agent permission disagreement', () => {
+    const result = projectConfigSchema.safeParse({
+      ...DEFAULT_CONFIG,
+      reviewGated: {
+        ...DEFAULT_CONFIG.reviewGated,
+        commit: { mode: 'human_required', agentMayCommit: true },
+      },
+    });
+
+    expect(result.success).toBe(false);
+    if (!result.success) {
+      expect(result.error.issues[0]?.message).toContain('agentMayCommit must be false');
+    }
   });
 
   it('rejects temperature out of range', () => {

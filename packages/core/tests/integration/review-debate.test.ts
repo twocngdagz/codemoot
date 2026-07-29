@@ -280,8 +280,8 @@ describe('Integration: review and debate flows', () => {
     });
   });
 
-  describe('config migration v1 to v2', () => {
-    it('produces valid config with configVersion 2', () => {
+  describe('config migration to v3', () => {
+    it('produces valid config with configVersion 3', () => {
       const v1Config: ProjectConfig = {
         ...testConfig,
         configVersion: undefined,
@@ -289,7 +289,7 @@ describe('Integration: review and debate flows', () => {
 
       const migrated = migrateConfig(v1Config);
 
-      expect(migrated.configVersion).toBe(2);
+      expect(migrated.configVersion).toBe(3);
       // Original fields should be preserved
       expect(migrated.project.name).toBe('ReviewDebateIntegration');
     });

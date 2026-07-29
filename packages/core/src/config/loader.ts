@@ -6,6 +6,7 @@ import { parse as parseYaml, stringify as stringifyYaml } from 'yaml';
 import type { PresetName, ProjectConfig } from '../types/config.js';
 import { ConfigError } from '../utils/errors.js';
 import { DEFAULT_CONFIG } from './defaults.js';
+import { migrateConfig } from './migration.js';
 import { loadPreset } from './presets.js';
 import { validateConfig } from './schema.js';
 
@@ -44,7 +45,7 @@ function deepMerge<T extends Record<string, unknown>>(
  *
  * 1. Start with hardcoded defaults
  * 2. If a preset name is found (in file or overrides), merge preset on top
- * 3. Merge .cowork.yml from projectDir on top
+ * 3. Migrate and merge .cowork.yml from projectDir on top
  * 4. Merge programmatic overrides on top
  * 5. Validate the final result
  */
@@ -59,6 +60,8 @@ export function loadConfig(options?: {
     string,
     unknown
   >;
+  let pendingFileMigration: Record<string, unknown> | undefined;
+  let pendingConfigPath: string | undefined;
 
   // Layer 2: Preset
   if (options?.preset) {
@@ -71,10 +74,17 @@ export function loadConfig(options?: {
   if (!options?.skipFile && existsSync(configPath)) {
     try {
       const content = readFileSync(configPath, 'utf-8');
-      const fileConfig = parseYaml(content) as Record<string, unknown>;
-      if (fileConfig && typeof fileConfig === 'object') {
-        merged = deepMerge(merged, fileConfig);
+      const fileConfig: unknown = parseYaml(content);
+      if (fileConfig === null || typeof fileConfig !== 'object' || Array.isArray(fileConfig)) {
+        throw new ConfigError(`${CONFIG_FILENAME} must contain a YAML object`);
       }
+      const fileDocument = Object.fromEntries(Object.entries(fileConfig));
+      const migratedFileConfig = migrateConfig(fileDocument);
+      if (migratedFileConfig !== fileDocument) {
+        pendingFileMigration = fileDocument;
+        pendingConfigPath = configPath;
+      }
+      merged = deepMerge(merged, migratedFileConfig);
     } catch (err) {
       throw new ConfigError(
         `Failed to parse ${CONFIG_FILENAME}: ${err instanceof Error ? err.message : String(err)}`,
@@ -87,7 +97,11 @@ export function loadConfig(options?: {
     merged = deepMerge(merged, options.overrides as Record<string, unknown>);
   }
 
-  return validateConfig(merged);
+  const validated = validateConfig(merged);
+  if (pendingFileMigration !== undefined && pendingConfigPath !== undefined) {
+    migrateConfig(pendingFileMigration, pendingConfigPath);
+  }
+  return validated;
 }
 
 /**

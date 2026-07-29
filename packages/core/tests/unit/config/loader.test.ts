@@ -18,9 +18,11 @@ afterEach(() => {
 describe('loadConfig', () => {
   it('returns defaults when no config file exists', () => {
     const config = loadConfig({ projectDir: TEST_DIR });
+    expect(config.configVersion).toBe(3);
     expect(config.mode).toBe('autonomous');
     expect(config.workflow).toBe('plan-review-implement');
     expect(config.advanced.logLevel).toBe('info');
+    expect(config.reviewGated?.identity.minimumAssurance).toBe('config_only');
   });
 
   it('merges .cowork.yml over defaults', () => {
@@ -69,6 +71,54 @@ describe('loadConfig', () => {
   it('validates the merged config', () => {
     writeFileSync(join(TEST_DIR, '.cowork.yml'), 'mode: turbo_invalid\n', 'utf-8');
     expect(() => loadConfig({ projectDir: TEST_DIR })).toThrow('Invalid configuration');
+  });
+
+  it('migrates a v2 project file before merging and writes a backup', () => {
+    const configPath = join(TEST_DIR, '.cowork.yml');
+    writeFileSync(
+      configPath,
+      [
+        'configVersion: 2',
+        'mode: interactive',
+        'debate:',
+        '  defaultPattern: proposal-critique',
+        '  maxRounds: 3',
+        '  consensusThreshold: 0.7',
+      ].join('\n'),
+      'utf-8',
+    );
+
+    const config = loadConfig({ projectDir: TEST_DIR });
+
+    expect(config.configVersion).toBe(3);
+    expect(config.mode).toBe('interactive');
+    expect(config.debate.enabled).toBe(true);
+    expect(config.reviewGated?.commit).toEqual({
+      mode: 'human_required',
+      agentMayCommit: false,
+    });
+    expect(existsSync(`${configPath}.bak`)).toBe(true);
+    expect(readFileSync(configPath, 'utf-8')).toContain('configVersion: 3');
+  });
+
+  it('does not rewrite an already-current v3 project file', () => {
+    const configPath = join(TEST_DIR, '.cowork.yml');
+    const content = 'configVersion: 3\nmode: interactive\n';
+    writeFileSync(configPath, content, 'utf-8');
+
+    const config = loadConfig({ projectDir: TEST_DIR });
+
+    expect(config.configVersion).toBe(3);
+    expect(readFileSync(configPath, 'utf-8')).toBe(content);
+    expect(existsSync(`${configPath}.bak`)).toBe(false);
+  });
+
+  it('reports a precise error for a future config version', () => {
+    writeFileSync(join(TEST_DIR, '.cowork.yml'), 'configVersion: 99\n', 'utf-8');
+
+    expect(() => loadConfig({ projectDir: TEST_DIR })).toThrow(
+      'Config version 99 requires a newer version of CodeMoot',
+    );
   });
 });
 

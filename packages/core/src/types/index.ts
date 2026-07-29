@@ -2,6 +2,7 @@
 
 export type {
   ModelProvider,
+  CliAdapterKind,
   ModelConfig,
   RoleConfig,
   DebateConfig,
@@ -13,6 +14,13 @@ export type {
   ExecutionMode,
   PresetName,
   CliAdapterConfig,
+  ReviewGatedIdentityAssurance,
+  ReviewGatedIdentityConfig,
+  ReviewGatedCommitMode,
+  ReviewGatedCommitConfig,
+  ReviewGatedBlockingSeverity,
+  ReviewGatedGateConfig,
+  ReviewGatedConfig,
 } from './config.js';
 
 export {

@@ -1,8 +1,20 @@
 // packages/core/src/config/index.ts -- barrel re-export
 
 export { DEFAULT_CONFIG } from './defaults.js';
-export { projectConfigSchema, validateConfig } from './schema.js';
+export {
+  cliAdapterConfigSchema,
+  cliAdapterKindSchema,
+  modelConfigSchema,
+  modelProviderSchema,
+  projectConfigSchema,
+  reviewGatedCommitConfigSchema,
+  reviewGatedConfigSchema,
+  reviewGatedGateConfigSchema,
+  reviewGatedIdentityConfigSchema,
+  validateConfig,
+} from './schema.js';
 export type { ProjectConfigInput } from './schema.js';
+export { COMPATIBILITY_REVIEW_GATED_CONFIG } from './review-gated.js';
 export { loadPreset, listPresets } from './presets.js';
 export { loadConfig, writeConfig } from './loader.js';
 export { migrateConfig, CURRENT_VERSION } from './migration.js';

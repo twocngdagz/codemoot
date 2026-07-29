@@ -1,9 +1,18 @@
 // packages/core/src/config/defaults.ts
 
 import type { ProjectConfig } from '../types/config.js';
-import { CONTEXT_ACTIVE, CONTEXT_BUFFER, CONTEXT_RETRIEVED, DEFAULT_MAX_TOKENS, DEFAULT_TIMEOUT_SEC, IMPLEMENTER_MAX_TOKENS } from '../utils/constants.js';
+import {
+  CONTEXT_ACTIVE,
+  CONTEXT_BUFFER,
+  CONTEXT_RETRIEVED,
+  DEFAULT_MAX_TOKENS,
+  DEFAULT_TIMEOUT_SEC,
+  IMPLEMENTER_MAX_TOKENS,
+} from '../utils/constants.js';
+import { COMPATIBILITY_REVIEW_GATED_CONFIG } from './review-gated.js';
 
 export const DEFAULT_CONFIG: ProjectConfig = {
+  configVersion: 3,
   project: {
     name: '',
     description: '',
@@ -44,10 +53,12 @@ export const DEFAULT_CONFIG: ProjectConfig = {
   workflow: 'plan-review-implement',
   mode: 'autonomous',
   debate: {
+    enabled: true,
     defaultPattern: 'proposal-critique',
     maxRounds: 3,
     consensusThreshold: 0.7,
   },
+  reviewGated: structuredClone(COMPATIBILITY_REVIEW_GATED_CONFIG),
   memory: {
     autoExtractFacts: true,
     contextBudget: {

@@ -8,6 +8,7 @@ export const VERSION = '0.2.14';
 export type {
   // Config
   ModelProvider,
+  CliAdapterKind,
   ModelConfig,
   RoleConfig,
   DebateConfig,
@@ -19,6 +20,13 @@ export type {
   ExecutionMode,
   PresetName,
   CliAdapterConfig,
+  ReviewGatedIdentityAssurance,
+  ReviewGatedIdentityConfig,
+  ReviewGatedCommitMode,
+  ReviewGatedCommitConfig,
+  ReviewGatedBlockingSeverity,
+  ReviewGatedGateConfig,
+  ReviewGatedConfig,
   // Workflow
   WorkflowDefinition,
   StepDefinition,
@@ -138,7 +146,16 @@ export {
 // Configuration
 export {
   DEFAULT_CONFIG,
+  COMPATIBILITY_REVIEW_GATED_CONFIG,
+  cliAdapterConfigSchema,
+  cliAdapterKindSchema,
+  modelConfigSchema,
+  modelProviderSchema,
   projectConfigSchema,
+  reviewGatedCommitConfigSchema,
+  reviewGatedConfigSchema,
+  reviewGatedGateConfigSchema,
+  reviewGatedIdentityConfigSchema,
   validateConfig,
   loadPreset,
   listPresets,
@@ -291,3 +308,4 @@ export type {
 // Review-gated workflow domain kernel
 export * as reviewWorkflow from './review-workflow/index.js';
 export * as reviewWorkflowGit from './review-workflow-git/index.js';
+export * as reviewWorkflowIdentity from './review-workflow-identity/index.js';
