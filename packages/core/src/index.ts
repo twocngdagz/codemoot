@@ -286,3 +286,6 @@ export type {
   DlpAuditEntry,
   DlpConfig,
 } from './security/index.js';
+
+// Review-gated workflow domain kernel
+export * as reviewWorkflow from './review-workflow/index.js';
