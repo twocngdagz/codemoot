@@ -111,7 +111,8 @@ export async function planReviewCommand(planFile: string, options: ReviewOptions
     const buildContext = options.build ? `\nBuild ID: ${options.build}` : '';
 
     const prompt = buildHandoffEnvelope({
-      command: 'plan-review',
+      // The plan task defines its own ISSUE/SUGGEST contract below.
+      command: 'custom',
       task: `Review the following execution plan for completeness, correctness, and feasibility. Read relevant codebase files to verify the plan's assumptions.${phaseContext}${buildContext}
 
 PLAN:

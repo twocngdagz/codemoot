@@ -4,8 +4,8 @@ Thanks for your interest in contributing! CodeMoot is an open-source multi-model
 
 ## Prerequisites
 
-- **Node.js >= 22**
-- **pnpm >= 9** (`npm install -g pnpm`)
+- **Node.js 22** (22.23.1 is pinned in `.nvmrc` and `.node-version`)
+- **pnpm 9.15.9** (pinned in `package.json` and managed through Corepack)
 - **[Claude Code](https://docs.anthropic.com/en/docs/build-with-claude/claude-code)** (for testing end-to-end)
 - **[Codex CLI](https://github.com/openai/codex)** (for testing end-to-end)
 
@@ -15,12 +15,13 @@ Thanks for your interest in contributing! CodeMoot is an open-source multi-model
 # Clone and install
 git clone https://github.com/katarmal-ram/codemoot.git
 cd codemoot
-pnpm install
+corepack enable
+pnpm install --frozen-lockfile
 
 # Build all packages
 pnpm build
 
-# Run the full test suite (628 tests across 47 files)
+# Run the full Vitest workspace suite
 pnpm test
 
 # Type checking
@@ -51,6 +52,7 @@ packages/
       commands/   # All command handlers (review, debate, build, cleanup, etc.)
       watch/      # File watcher + coalescing debouncer
   mcp-server/     # MCP server for IDE integration (experimental)
+  web/            # Placeholder for a future web UI
 presets/          # Built-in configuration presets
 workflows/        # Workflow YAML definitions
 ```
@@ -97,10 +99,10 @@ pnpm test
 # Run tests in watch mode
 pnpm test:watch
 
-# Run specific package tests
-pnpm --filter @codemoot/core test
-pnpm --filter @codemoot/cli test
-pnpm --filter @codemoot/mcp-server test
+# Run a specific Vitest project
+pnpm exec vitest run --project @codemoot/core
+pnpm exec vitest run --project @codemoot/cli
+pnpm exec vitest run --project @codemoot/mcp-server
 
 # Run a specific test file
 pnpm test -- packages/core/tests/unit/memory/session.test.ts

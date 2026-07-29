@@ -1,6 +1,7 @@
 {
   "name": "codemoot",
   "private": true,
+  "packageManager": "pnpm@9.15.9",
   "workspaces": ["packages/*"],
   "scripts": {
     "build": "pnpm -r build",
@@ -19,7 +20,7 @@
     "@vitest/coverage-v8": "^3.0.0"
   },
   "engines": {
-    "node": ">=22.0.0",
-    "pnpm": ">=9.0.0"
+    "node": ">=22.0.0 <23.0.0",
+    "pnpm": "9.15.9"
   }
 }

@@ -31,7 +31,8 @@ codemoot shipit --profile safe
 
 ## Prerequisites
 
-- Node.js >= 20
+- Node.js 22 (22.23.1 is pinned for source development)
+- pnpm 9.15.9 for source development (managed through Corepack)
 - [Codex CLI](https://github.com/openai/codex) installed (`npm install -g @openai/codex`)
 - ChatGPT subscription (Codex CLI uses your existing subscription — $0 API cost)
 
@@ -133,13 +134,14 @@ CodeMoot includes a built-in policy engine that gates actions:
 
 ## Architecture
 
-TypeScript monorepo with 3 packages:
+TypeScript monorepo with 4 packages:
 
 | Package | Description | Status |
 |---------|-------------|--------|
 | `@codemoot/core` | Orchestration engine, memory, policy, caching | Stable |
-| `@codemoot/cli` | Command-line interface (15 commands) | Stable |
+| `@codemoot/cli` | Command-line interface | Stable |
 | `@codemoot/mcp-server` | MCP server (5 tools for IDE integration) | Experimental |
+| `@codemoot/web` | Placeholder for a future web UI | Planned |
 
 ### How It Works
 
@@ -210,9 +212,10 @@ Tools: `codemoot_review`, `codemoot_plan`, `codemoot_debate`, `codemoot_memory`,
 ```bash
 git clone https://github.com/katarmal-ram/codemoot.git
 cd codemoot
-pnpm install
+corepack enable
+pnpm install --frozen-lockfile
 pnpm build
-pnpm test         # 624 tests across 47 files
+pnpm test         # Vitest workspace suite
 pnpm lint         # Biome linter
 pnpm typecheck    # TypeScript strict checks
 ```
