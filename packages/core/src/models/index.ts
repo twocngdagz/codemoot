@@ -16,6 +16,28 @@ export {
   parseCodexJsonl,
 } from './cli-adapter.js';
 export type { CliCallOptions, ResumeCallOptions, ProgressCallbacks } from './cli-adapter.js';
+export {
+  ClaudeCliAdapter,
+  buildClaudeEnvironment,
+} from './claude-cli-adapter.js';
+export type {
+  ClaudeCallOptions,
+  ClaudeCallResult,
+  ClaudeInvocationEvidence,
+  ClaudeSessionEvidence,
+} from './claude-cli-adapter.js';
+export {
+  ClaudeCliProtocolError,
+  SUPPORTED_CLAUDE_CLI_VERSION_RANGE,
+  isSupportedClaudeCliVersion,
+  parseClaudeCliStream,
+} from './claude-cli-protocol.js';
+export type { ParsedClaudeCliOutput } from './claude-cli-protocol.js';
 export { detectCli, clearDetectionCache } from './cli-detector.js';
 export type { CliDetectionResult } from './cli-detector.js';
-export type { CliBridge, BridgeCapabilities, BridgeOptions, BridgeResumeOptions } from './bridge.js';
+export type {
+  CliBridge,
+  BridgeCapabilities,
+  BridgeOptions,
+  BridgeResumeOptions,
+} from './bridge.js';

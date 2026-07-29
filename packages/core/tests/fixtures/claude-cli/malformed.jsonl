@@ -1,0 +1,3 @@
+{"type":"system","subtype":"init","uuid":"init-3","session_id":"550e8400-e29b-41d4-a716-446655440002","apiKeySource":"none","claude_code_version":"2.1.218","cwd":"/fixture/repository","tools":[],"mcp_servers":[],"model":"claude-sonnet-4-6","permissionMode":"default"}
+this is not json
+{"type":"result","subtype":"success","is_error":false,"duration_ms":50,"result":"This must not be accepted","session_id":"550e8400-e29b-41d4-a716-446655440002","total_cost_usd":0}

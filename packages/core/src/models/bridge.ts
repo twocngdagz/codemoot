@@ -22,6 +22,7 @@ export interface BridgeOptions extends ProgressCallbacks {
   timeout?: number;
   maxOutputBytes?: number;
   idleTimeout?: number;
+  signal?: AbortSignal;
 }
 
 /** Options for a bridge resume call. */
