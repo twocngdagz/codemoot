@@ -1,15 +1,16 @@
 // packages/cli/src/commands/fix.ts — Autofix loop: GPT reviews → CLI applies fixes → GPT re-reviews
 
-import { execFileSync, execSync } from 'node:child_process';
+import { execFileSync } from 'node:child_process';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import {
-  type CliAdapter,
+  type BridgeCallResult,
   DEFAULT_RULES,
   ModelRegistry,
   type PolicyContext,
   SessionManager,
   buildHandoffEnvelope,
+  callBridge,
   evaluatePolicy,
   loadConfig,
   openDatabase,
@@ -143,19 +144,11 @@ export async function fixCommand(fileOrGlob: string, options: FixOptions): Promi
   const db = openDatabase(getDbPath());
   const config = loadConfig();
   const registry = ModelRegistry.fromConfig(config, projectDir);
-  const adapter =
-    registry.tryGetAdapter('codex-reviewer') ?? registry.tryGetAdapter('codex-architect');
+  const reviewerAlias = config.roles.reviewer?.model;
+  const adapter = reviewerAlias === undefined ? null : registry.tryGetAdapter(reviewerAlias);
 
   if (!adapter) {
-    try {
-      execSync('codex --version', { stdio: 'pipe', encoding: 'utf-8' });
-    } catch {
-      console.error(chalk.red('Codex CLI is not installed or not in PATH.'));
-      console.error(chalk.yellow('Install it: npm install -g @openai/codex'));
-      db.close();
-      process.exit(1);
-    }
-    console.error(chalk.red('No codex adapter found in config. Run: codemoot init'));
+    console.error(chalk.red('No reviewer adapter found in config. Run: codemoot init'));
     db.close();
     process.exit(1);
   }
@@ -244,9 +237,9 @@ export async function fixCommand(fileOrGlob: string, options: FixOptions): Promi
     const progress = createProgressCallbacks('fix-review');
 
     console.error(chalk.dim('  GPT reviewing...'));
-    let reviewResult;
+    let reviewResult: BridgeCallResult;
     try {
-      reviewResult = await (adapter as CliAdapter).callWithResume(reviewPrompt, {
+      reviewResult = await callBridge(adapter, reviewPrompt, {
         sessionId: threadId,
         timeout: timeoutMs,
         ...progress,

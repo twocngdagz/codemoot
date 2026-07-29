@@ -24,6 +24,7 @@ export {
 export type {
   ImmutableSaveResult,
   PersistableReviewWorkflowEntity,
+  RoleInvocationPersistenceInput,
   ReviewWorkflowEntityKind,
   ReviewWorkflowEvent,
   ReviewWorkflowPersistenceErrorCode,

@@ -1,12 +1,16 @@
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { constants, createReadStream } from 'node:fs';
-import { access, realpath } from 'node:fs/promises';
-import { delimiter, isAbsolute, join, resolve, sep } from 'node:path';
+import { resolve } from 'node:path';
 import type { TokenUsage } from '../types/events.js';
 import type { ModelCallResult } from '../types/models.js';
 import { ModelError } from '../utils/errors.js';
-import type { BridgeCapabilities, BridgeOptions, CliBridge } from './bridge.js';
+import type {
+  BridgeCapabilities,
+  BridgeInvocationEvidence,
+  BridgeOptions,
+  BridgeSessionEvidence,
+  CliBridge,
+} from './bridge.js';
 import { ClaudeCliProtocolError, parseClaudeCliStream } from './claude-cli-protocol.js';
 import type { ParsedClaudeCliOutput } from './claude-cli-protocol.js';
 import {
@@ -15,6 +19,7 @@ import {
   estimateTokenUsage,
   killProcessTree,
 } from './cli-adapter.js';
+import { collectCliRuntimeEvidence } from './cli-runtime-evidence.js';
 
 const RAW_OUTPUT_MULTIPLIER = 4;
 const DEFAULT_TIMEOUT_MS = 600_000;
@@ -87,11 +92,6 @@ const CLAUDE_CAPABILITIES: BridgeCapabilities = {
   supportsCwd: true,
 };
 
-interface ExecutableEvidence {
-  readonly path: string;
-  readonly hash?: string;
-}
-
 interface ProcessResult {
   readonly stdout: string;
   readonly processId: number;
@@ -104,28 +104,13 @@ export interface ClaudeCallOptions extends BridgeOptions {
   readonly envAllowlist?: readonly string[];
 }
 
-export interface ClaudeInvocationEvidence {
+export interface ClaudeInvocationEvidence extends BridgeInvocationEvidence {
   readonly adapterKind: 'CLAUDE';
-  readonly executablePath: string;
-  readonly executableHash?: string;
-  readonly cliVersion: string;
-  readonly configuredModel: string;
-  readonly reportedModel: string;
-  readonly workingDirectory: string;
-  readonly processId: number;
-  readonly processInstanceFingerprint: string;
-  readonly identityAssurance: 'PROCESS_ATTESTED';
-  readonly authenticationSource?: string;
   readonly permissionMode: string;
-  readonly startedAt: string;
-  readonly finishedAt: string;
-  readonly resultStatus: 'SUCCEEDED';
 }
 
-export interface ClaudeSessionEvidence {
+export interface ClaudeSessionEvidence extends BridgeSessionEvidence {
   readonly providerOrAdapter: 'claude';
-  readonly vendorSessionId: string;
-  readonly resumedFromSessionId?: string;
 }
 
 export interface ClaudeCallResult extends ModelCallResult {
@@ -185,11 +170,11 @@ export class ClaudeCliAdapter implements CliBridge {
     options: ClaudeCallOptions | undefined,
   ): Promise<ClaudeCallResult> {
     const env = buildClaudeEnvironment([...this.envAllowlist, ...(options?.envAllowlist ?? [])]);
-    const executable = await resolveExecutableEvidence(this.command, this.projectDir, env);
+    const executable = await collectCliRuntimeEvidence(this.command, this.projectDir, env);
     const args = this.buildArgs(resumeSessionId);
     const maxOutputBytes = options?.maxOutputBytes ?? MAX_OUTPUT_BYTES;
     const processResult = await runClaudeProcess({
-      command: executable.path,
+      command: executable.executablePath,
       args,
       cwd: this.projectDir,
       env,
@@ -223,7 +208,7 @@ export class ClaudeCliAdapter implements CliBridge {
     const usage: TokenUsage = parsed.usage ?? estimateTokenUsage(prompt, output);
     const processInstanceFingerprint = createHash('sha256')
       .update(
-        `${executable.path}\0${processResult.processId}\0${processResult.startedAt}\0${parsed.sessionId}`,
+        `${executable.executablePath}\0${processResult.processId}\0${processResult.startedAt}\0${parsed.sessionId}`,
       )
       .digest('hex');
 
@@ -238,8 +223,10 @@ export class ClaudeCliAdapter implements CliBridge {
       sessionId: parsed.sessionId,
       invocationEvidence: {
         adapterKind: 'CLAUDE',
-        executablePath: executable.path,
-        ...(executable.hash === undefined ? {} : { executableHash: executable.hash }),
+        executablePath: executable.executablePath,
+        ...(executable.executableHash === undefined
+          ? {}
+          : { executableHash: executable.executableHash }),
         cliVersion: parsed.cliVersion,
         configuredModel: this.model,
         reportedModel: parsed.reportedModel,
@@ -479,61 +466,6 @@ async function runClaudeProcess(input: {
       return;
     }
     child.stdin.end(input.prompt);
-  });
-}
-
-async function resolveExecutableEvidence(
-  command: string,
-  cwd: string,
-  env: Record<string, string>,
-): Promise<ExecutableEvidence> {
-  const path = await findExecutable(command, cwd, env);
-  const hash = await hashFile(path).catch(() => undefined);
-  return { path, ...(hash === undefined ? {} : { hash }) };
-}
-
-async function findExecutable(
-  command: string,
-  cwd: string,
-  env: Record<string, string>,
-): Promise<string> {
-  const containsSeparator =
-    command.includes(sep) || command.includes('/') || command.includes('\\');
-  if (isAbsolute(command) || containsSeparator) {
-    return resolveExistingExecutable(isAbsolute(command) ? command : resolve(cwd, command));
-  }
-
-  const extensions =
-    process.platform === 'win32'
-      ? (env.PATHEXT ?? '.EXE;.CMD;.BAT;.COM').split(';').filter(Boolean)
-      : [''];
-  for (const directory of (env.PATH ?? '').split(delimiter).filter(Boolean)) {
-    for (const extension of extensions) {
-      const candidate = join(directory, `${command}${extension}`);
-      try {
-        return await resolveExistingExecutable(candidate);
-      } catch {
-        // Continue through PATH candidates.
-      }
-    }
-  }
-  return command;
-}
-
-async function resolveExistingExecutable(path: string): Promise<string> {
-  await access(path, constants.X_OK);
-  return realpath(path);
-}
-
-function hashFile(path: string): Promise<string> {
-  return new Promise((resolveHash, rejectHash) => {
-    const hash = createHash('sha256');
-    const stream = createReadStream(path);
-    stream.on('data', (chunk) => {
-      hash.update(chunk);
-    });
-    stream.on('error', rejectHash);
-    stream.on('end', () => resolveHash(hash.digest('hex')));
   });
 }
 

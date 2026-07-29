@@ -1,8 +1,20 @@
 // packages/cli/src/commands/review.ts — unified review via codex: files, prompts, diffs + session continuity
 
-import { loadConfig, ModelRegistry, BINARY_SNIFF_BYTES, REVIEW_DIFF_MAX_CHARS, SessionManager, JobStore, openDatabase, buildHandoffEnvelope, getReviewPreset, type CliAdapter } from '@codemoot/core';
+import {
+  BINARY_SNIFF_BYTES,
+  type BridgeCallResult,
+  JobStore,
+  ModelRegistry,
+  REVIEW_DIFF_MAX_CHARS,
+  SessionManager,
+  buildHandoffEnvelope,
+  callBridge,
+  getReviewPreset,
+  loadConfig,
+  openDatabase,
+} from '@codemoot/core';
 import chalk from 'chalk';
-import { execFileSync, execSync } from 'node:child_process';
+import { execFileSync } from 'node:child_process';
 import { closeSync, globSync, openSync, readFileSync, readSync, statSync, existsSync } from 'node:fs';
 import { resolve } from 'node:path';
 
@@ -52,19 +64,11 @@ export async function reviewCommand(fileOrGlob: string | undefined, options: Rev
 
     const config = loadConfig();
     const registry = ModelRegistry.fromConfig(config, projectDir);
-    const adapter = registry.tryGetAdapter('codex-reviewer') ?? registry.tryGetAdapter('codex-architect');
+    const reviewerAlias = config.roles.reviewer?.model;
+    const adapter = reviewerAlias === undefined ? null : registry.tryGetAdapter(reviewerAlias);
 
     if (!adapter) {
-      // Check if codex CLI is actually installed
-      try {
-        execSync('codex --version', { stdio: 'pipe', encoding: 'utf-8' });
-      } catch {
-        console.error(chalk.red('Codex CLI is not installed or not in PATH.'));
-        console.error(chalk.yellow('Install it: npm install -g @openai/codex'));
-        console.error(chalk.yellow('Then run: codemoot init'));
-        process.exit(1);
-      }
-      console.error(chalk.red('No codex adapter found in config. Run: codemoot init'));
+      console.error(chalk.red('No reviewer adapter found in config. Run: codemoot init'));
       console.error(chalk.dim('Diagnose: codemoot doctor'));
       process.exit(1);
     }
@@ -259,9 +263,9 @@ export async function reviewCommand(fileOrGlob: string | undefined, options: Rev
     const timeoutMs = (options.timeout ?? 600) * 1000;
     const progress = createProgressCallbacks('review');
 
-    let result;
+    let result: BridgeCallResult;
     try {
-      result = await (adapter as CliAdapter).callWithResume(prompt, {
+      result = await callBridge(adapter, prompt, {
         sessionId: sessionThreadId,
         timeout: timeoutMs,
         ...progress,

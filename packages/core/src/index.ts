@@ -202,6 +202,7 @@ export type { CostSummary, DebateTurnRow, DebateTurnStatus, DebateMessageRow, Me
 // Model Abstraction (CLI-only)
 export {
   ModelRegistry,
+  callBridge,
   callModel,
   streamModel,
   withFallback,
@@ -217,12 +218,24 @@ export {
   parseClaudeCliStream,
   detectCli,
   clearDetectionCache,
+  createCliAdapter,
+  createModelAdapter,
+  probeCliCommand,
+  resolveModelAdapterKind,
 } from './models/index.js';
 export type {
+  BridgeAdapterKind,
+  BridgeCallResult,
+  BridgeInvocationEvidence,
+  BridgeSessionEvidence,
   TextDeltaEmitter,
   ModelPricing,
   ModelAdapter,
+  ModelAdapterHealth,
   CliCallOptions,
+  CodexCallResult,
+  CodexInvocationEvidence,
+  CodexSessionEvidence,
   ClaudeCallOptions,
   ClaudeCallResult,
   ClaudeInvocationEvidence,
@@ -234,11 +247,27 @@ export type {
   BridgeCapabilities,
   BridgeOptions,
   BridgeResumeOptions,
+  CliProbeResult,
+  CliRuntimeEvidence,
 } from './models/index.js';
 
 // Roles
-export { RoleManager, renderPrompt } from './roles/index.js';
-export type { PromptType, PromptVariables } from './roles/index.js';
+export {
+  ROLE_INVOCATION_ERROR_CODES,
+  RoleInvocationError,
+  RoleInvocationService,
+  RoleManager,
+  renderPrompt,
+} from './roles/index.js';
+export type {
+  PromptType,
+  PromptVariables,
+  ResolvedRoleAdapter,
+  ReviewWorkflowRoleResolution,
+  RoleInvocationErrorCode,
+  RoleInvocationInput,
+  RoleInvocationResult,
+} from './roles/index.js';
 
 // Engine (Workflow + Execution)
 export {

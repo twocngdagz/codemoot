@@ -3,11 +3,12 @@
 import { readFileSync, writeFileSync } from 'node:fs';
 
 import {
-  type CliAdapter,
+  type BridgeCallResult,
   ModelRegistry,
   Orchestrator,
   SessionManager,
   buildHandoffEnvelope,
+  callBridge,
   loadConfig,
   openDatabase,
 } from '@codemoot/core';
@@ -90,11 +91,11 @@ export async function planReviewCommand(planFile: string, options: ReviewOptions
     const config = loadConfig();
     const projectDir = process.cwd();
     const registry = ModelRegistry.fromConfig(config, projectDir);
-    const adapter =
-      registry.tryGetAdapter('codex-reviewer') ?? registry.tryGetAdapter('codex-architect');
+    const reviewerAlias = config.roles.reviewer?.model;
+    const adapter = reviewerAlias === undefined ? null : registry.tryGetAdapter(reviewerAlias);
 
     if (!adapter) {
-      console.error(chalk.red('No codex adapter found in config. Run: codemoot init'));
+      console.error(chalk.red('No reviewer adapter found in config. Run: codemoot init'));
       process.exit(1);
     }
 
@@ -142,9 +143,9 @@ Output format:
     const progress = createProgressCallbacks('plan-review');
 
     console.error(chalk.cyan('Sending plan to codex for review...'));
-    let result;
+    let result: BridgeCallResult;
     try {
-      result = await (adapter as CliAdapter).callWithResume(prompt, {
+      result = await callBridge(adapter, prompt, {
         sessionId: threadId,
         timeout: timeoutMs,
         ...progress,

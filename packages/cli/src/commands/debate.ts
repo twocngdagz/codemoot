@@ -1,13 +1,13 @@
 // packages/cli/src/commands/debate.ts — CLI debate commands wired to core backend
 
-import type { DebateEngineState, DebateTurnRow } from '@codemoot/core';
+import type { BridgeCallResult, DebateEngineState, DebateTurnRow } from '@codemoot/core';
 import {
-  CliAdapter,
   DebateStore,
   MessageStore,
   ModelRegistry,
   SessionManager,
   buildReconstructionPrompt,
+  callBridge,
   generateId,
   getTokenBudgetStatus,
   loadConfig,
@@ -165,11 +165,11 @@ export async function debateTurnCommand(
       process.exit(1);
     }
 
-    // Get the codex adapter (try reviewer first, fallback to architect)
-    const adapter = registry.tryGetAdapter('codex-reviewer') ?? registry.tryGetAdapter('codex-architect');
+    const reviewerAlias = config.roles.reviewer?.model;
+    const adapter = reviewerAlias === undefined ? null : registry.tryGetAdapter(reviewerAlias);
     if (!adapter) {
       db.close();
-      console.error(chalk.red('No codex adapter found in config. Available: codex-reviewer or codex-architect'));
+      console.error(chalk.red('No reviewer adapter found in config'));
       process.exit(1);
     }
 
@@ -252,8 +252,8 @@ export async function debateTurnCommand(
         debateId,
         round: newRound,
         role: 'critic',
-        bridge: 'codex',
-        model: (adapter as CliAdapter).modelId ?? 'codex',
+        bridge: adapter.name,
+        model: adapter.model,
         promptText: prompt,
       });
     }
@@ -289,12 +289,12 @@ export async function debateTurnCommand(
     // Resolve unified session (source of truth for thread_id)
     const sessionMgr = new SessionManager(db);
     const unifiedSession = sessionMgr.resolveActive('debate');
-    let existingSessionId = unifiedSession.codexThreadId ?? criticRow.codexSessionId ?? undefined;
+    const existingSessionId = unifiedSession.codexThreadId ?? criticRow.codexSessionId ?? undefined;
     const attemptedResume = existingSessionId != null;
 
     // Token budget preflight check (only completed rows = real conversation context)
     const completedHistory = msgStore.getHistory(debateId).filter(m => m.status === 'completed');
-    const maxContext = (adapter as CliAdapter).capabilities.maxContextTokens;
+    const maxContext = adapter.capabilities.maxContextTokens;
     const preflight = preflightTokenCheck(completedHistory, prompt, maxContext);
     if (preflight.shouldStop && !options.force) {
       console.error(chalk.red(`Token budget at ${Math.round(preflight.utilizationRatio * 100)}% (${preflight.totalTokensUsed}/${maxContext}). Debate blocked — use --force to override.`));
@@ -309,9 +309,9 @@ export async function debateTurnCommand(
     try {
       // Call GPT via codex with session resume + progress feedback
       const progress = createProgressCallbacks('debate');
-      let result;
+      let result: BridgeCallResult;
       try {
-        result = await (adapter as CliAdapter).callWithResume(prompt, {
+        result = await callBridge(adapter, prompt, {
           sessionId: existingSessionId,
           timeout,
           ...progress,
@@ -338,7 +338,7 @@ export async function debateTurnCommand(
         if (!quiet) console.error(chalk.yellow('  Resume failed with minimal response. Reconstructing from ledger...'));
         const history = msgStore.getHistory(debateId);
         const reconstructed = buildReconstructionPrompt(history, prompt);
-        result = await (adapter as CliAdapter).callWithResume(reconstructed, {
+        result = await callBridge(adapter, reconstructed, {
           timeout,
           ...progress,
         });
@@ -684,4 +684,3 @@ export async function debateCompleteCommand(debateId: string): Promise<void> {
     process.exit(1);
   }
 }
-

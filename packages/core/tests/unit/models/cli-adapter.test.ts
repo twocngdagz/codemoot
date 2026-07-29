@@ -348,7 +348,9 @@ describe('CliAdapter', () => {
     vi.mocked(readFile).mockResolvedValue('output');
     vi.mocked(unlink).mockResolvedValue();
 
-    const onSpawn = vi.fn(() => { throw new Error('callback boom'); });
+    const onSpawn = vi.fn(() => {
+      throw new Error('callback boom');
+    });
     const result = await adapter.call('prompt', { onSpawn });
 
     expect(result.text).toBe('output');
@@ -359,7 +361,9 @@ describe('CliAdapter', () => {
     vi.mocked(readFile).mockResolvedValue('output');
     vi.mocked(unlink).mockResolvedValue();
 
-    const onStderr = vi.fn(() => { throw new Error('callback boom'); });
+    const onStderr = vi.fn(() => {
+      throw new Error('callback boom');
+    });
     const result = await adapter.call('prompt', { onStderr });
 
     expect(result.text).toBe('output');
@@ -439,7 +443,9 @@ describe('CliAdapter', () => {
     vi.mocked(unlink).mockResolvedValue();
 
     // Catch the promise immediately so the rejection is handled
-    const promise = adapter.call('prompt', { timeout: 100, idleTimeout: 50 }).catch((e: Error) => e);
+    const promise = adapter
+      .call('prompt', { timeout: 100, idleTimeout: 50 })
+      .catch((e: Error) => e);
     await vi.advanceTimersByTimeAsync(200);
 
     const err = await promise;
@@ -701,6 +707,52 @@ describe('callWithResume', () => {
     expect(result.text).toBe('Hello');
   });
 
+  it('exposes process-attested evidence through the common bridge wrapper', async () => {
+    const bridge = new CliAdapter({
+      command: 'codex',
+      args: ['exec'],
+      provider: 'openai',
+      model: 'gpt-5.3-codex',
+      cliName: 'codex',
+      projectDir: '/repository',
+      runtimeEvidence: {
+        executablePath: '/usr/local/bin/codex',
+        executableHash: 'a'.repeat(64),
+        cliVersion: 'codex-cli 1.2.3',
+      },
+    });
+    vi.spyOn(bridge, 'callWithResume').mockImplementation(async (_prompt, options) => {
+      options?.onSpawn?.(12345, '/usr/local/bin/codex');
+      return {
+        text: 'Bridge response',
+        model: 'gpt-5.3-codex',
+        provider: 'openai',
+        usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15, costUsd: 0 },
+        finishReason: 'stop',
+        durationMs: 25,
+        sessionId: 'thread-bridge',
+      };
+    });
+
+    const result = await bridge.send('prompt');
+
+    expect(result.invocationEvidence).toMatchObject({
+      adapterKind: 'CODEX',
+      executablePath: '/usr/local/bin/codex',
+      executableHash: 'a'.repeat(64),
+      cliVersion: 'codex-cli 1.2.3',
+      configuredModel: 'gpt-5.3-codex',
+      workingDirectory: '/repository',
+      processId: 12345,
+      identityAssurance: 'PROCESS_ATTESTED',
+    });
+    expect(result.invocationEvidence.processInstanceFingerprint).toMatch(/^[0-9a-f]{64}$/);
+    expect(result.sessionEvidence).toEqual({
+      providerOrAdapter: 'codex',
+      vendorSessionId: 'thread-bridge',
+    });
+  });
+
   it('concatenates text from multiple agent_message items', async () => {
     setupJsonlSpawn([
       '{"type":"thread.started","thread_id":"t1"}',
@@ -793,7 +845,8 @@ describe('callWithResume', () => {
         });
       } else {
         // Second call (fresh) — succeed
-        const jsonl = '{"type":"thread.started","thread_id":"new_thread"}\n{"type":"item.completed","item":{"type":"agent_message","text":"Fresh response"}}';
+        const jsonl =
+          '{"type":"thread.started","thread_id":"new_thread"}\n{"type":"item.completed","item":{"type":"agent_message","text":"Fresh response"}}';
         stdoutOn.mockImplementation((event: string, cb: (data: Buffer) => void) => {
           if (event === 'data') setTimeout(() => cb(Buffer.from(jsonl)), 1);
         });

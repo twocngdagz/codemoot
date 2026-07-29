@@ -1,6 +1,6 @@
 // packages/cli/src/commands/build.ts — CLI build commands
 
-import type { BuildRun, BuildSummary } from '@codemoot/core';
+import type { BridgeCallResult, BuildRun, BuildSummary } from '@codemoot/core';
 import { BuildStore, DebateStore, REVIEW_DIFF_MAX_CHARS, REVIEW_TEXT_MAX_CHARS, SessionManager, buildHandoffEnvelope, generateId, loadConfig, openDatabase } from '@codemoot/core';
 import chalk from 'chalk';
 import { execFileSync, execSync } from 'node:child_process';
@@ -344,12 +344,13 @@ export async function buildReviewCommand(buildId: string): Promise<void> {
     }
 
     // Call codex for review with codebase access
-    const { ModelRegistry, CliAdapter: CliAdapterClass } = await import('@codemoot/core');
+    const { ModelRegistry, callBridge } = await import('@codemoot/core');
     const registry = ModelRegistry.fromConfig(config, projectDir);
-    const adapter = registry.getAdapter('codex-reviewer') ?? registry.getAdapter('codex-architect');
+    const reviewerAlias = config.roles.reviewer?.model;
+    const adapter = reviewerAlias === undefined ? null : registry.tryGetAdapter(reviewerAlias);
     if (!adapter) {
       db.close();
-      console.error(chalk.red('No codex adapter found in config'));
+      console.error(chalk.red('No reviewer adapter found in config'));
       process.exit(1);
     }
 
@@ -367,9 +368,9 @@ export async function buildReviewCommand(buildId: string): Promise<void> {
     });
 
     const progress = createProgressCallbacks('build-review');
-    let result;
+    let result: BridgeCallResult;
     try {
-      result = await (adapter as InstanceType<typeof CliAdapterClass>).callWithResume(prompt, {
+      result = await callBridge(adapter, prompt, {
         sessionId: existingSession,
         timeout: 600_000,
         ...progress,

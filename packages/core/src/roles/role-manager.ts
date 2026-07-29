@@ -1,5 +1,10 @@
 // packages/core/src/roles/role-manager.ts
 
+import type { ModelAdapter, ModelRegistry } from '../models/registry.js';
+import { resolveModelAdapterKind } from '../models/registry.js';
+import { hashReviewWorkflowConfiguration } from '../review-workflow-identity/service.js';
+import type { ReviewWorkflowConfigurationSnapshot } from '../review-workflow-identity/types.js';
+import type { AgentAssignment, AssignedRole } from '../review-workflow/types.js';
 import type { ProjectConfig, RoleConfig } from '../types/config.js';
 import type { ChatMessage } from '../types/models.js';
 import type { BuiltInRole, Role } from '../types/roles.js';
@@ -16,6 +21,17 @@ const BUILT_IN_ROLES: Record<BuiltInRole, { description: string }> = {
   reviewer: { description: 'Reviews plans and code for correctness, quality, and risks' },
   implementer: { description: 'Writes production code based on approved plans' },
 };
+
+export interface ResolvedRoleAdapter {
+  readonly role: 'implementer' | 'reviewer';
+  readonly assignment: AgentAssignment;
+  readonly adapter: ModelAdapter;
+}
+
+export interface ReviewWorkflowRoleResolution {
+  readonly implementer: ResolvedRoleAdapter;
+  readonly reviewer: ResolvedRoleAdapter;
+}
 
 /**
  * Resolves roles from config, provides prompt rendering and message assembly.
@@ -72,6 +88,68 @@ export class RoleManager {
       throw new ModelError(`Unknown role: "${roleName}"`);
     }
     return roleConfig;
+  }
+
+  /**
+   * Resolve the immutable review-workflow assignments to their concrete runtime bridges.
+   * Configuration aliases are checked again here because the assignment snapshot, not the
+   * caller's requested alias, is the authority for an invocation.
+   */
+  resolveReviewWorkflowRoles(
+    snapshot: ReviewWorkflowConfigurationSnapshot,
+    registry: ModelRegistry,
+  ): ReviewWorkflowRoleResolution {
+    const configurationHash = hashReviewWorkflowConfiguration(this.config);
+    if (
+      snapshot.configurationHash !== configurationHash ||
+      snapshot.assignments.implementer.configurationHash !== configurationHash ||
+      snapshot.assignments.reviewer.configurationHash !== configurationHash
+    ) {
+      throw new ModelError('Review workflow assignments do not match the active configuration');
+    }
+    const implementer = this.resolveAssignedRole(
+      'implementer',
+      snapshot.assignments.implementer,
+      registry,
+    );
+    const reviewer = this.resolveAssignedRole('reviewer', snapshot.assignments.reviewer, registry);
+    if (
+      implementer.assignment.assignmentId === reviewer.assignment.assignmentId ||
+      implementer.assignment.configuredAgentKey === reviewer.assignment.configuredAgentKey
+    ) {
+      throw new ModelError('Review workflow roles must resolve to different agent assignments');
+    }
+    if (
+      snapshot.identityPolicy.requireDifferentAdapterKinds &&
+      implementer.assignment.expectedAdapterKind === reviewer.assignment.expectedAdapterKind
+    ) {
+      throw new ModelError('Review workflow roles must resolve to different adapter kinds');
+    }
+    return { implementer, reviewer };
+  }
+
+  private resolveAssignedRole(
+    roleName: 'implementer' | 'reviewer',
+    assignment: AgentAssignment,
+    registry: ModelRegistry,
+  ): ResolvedRoleAdapter {
+    const roleConfig = this.getRoleConfig(roleName);
+    const modelConfig = registry.getModelConfig(roleConfig.model);
+    const adapter = registry.getAdapter(roleConfig.model);
+    const assignedRole: AssignedRole = roleName === 'implementer' ? 'IMPLEMENTER' : 'REVIEWER';
+    const adapterKind = resolveModelAdapterKind(modelConfig).toUpperCase();
+    if (
+      assignment.assignedRole !== assignedRole ||
+      assignment.configuredAgentKey !== roleConfig.model ||
+      assignment.configuredModelAlias !== roleConfig.model ||
+      assignment.expectedAdapterKind !== adapterKind ||
+      assignment.configuredModel !== modelConfig.model ||
+      adapter.model !== modelConfig.model ||
+      adapter.name.toUpperCase() !== adapterKind
+    ) {
+      throw new ModelError(`Runtime adapter does not match the ${roleName} assignment snapshot`);
+    }
+    return { role: roleName, assignment, adapter };
   }
 }
 

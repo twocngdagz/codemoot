@@ -1,13 +1,19 @@
 // packages/cli/src/commands/cleanup.ts — AI slop scanner with 3-way merge (deterministic + codex + host)
 
-import type { CleanupFinding, CleanupReport, CleanupScope } from '@codemoot/core';
+import type {
+  BridgeCallResult,
+  CleanupFinding,
+  CleanupReport,
+  CleanupScope,
+  ModelAdapter,
+} from '@codemoot/core';
 import {
   BuildStore,
-  CliAdapter,
   JobStore,
   ModelRegistry,
   SessionManager,
   buildHandoffEnvelope,
+  callBridge,
   computeThreeWayStats,
   createIgnoreFilter,
   generateId,
@@ -108,18 +114,13 @@ export async function cleanupCommand(path: string, options: CleanupOptions): Pro
     // ── Phase 1: Parallel scan ──
     console.error(chalk.yellow('\nPhase 1: Scanning (parallel)...'));
 
-    // Resolve codex adapter
-    let codexAdapter: CliAdapter | null = null;
+    // Resolve the configured reviewer adapter.
+    let codexAdapter: ModelAdapter | null = null;
     try {
       const config = loadConfig();
       const registry = ModelRegistry.fromConfig(config, projectDir);
-      try {
-        codexAdapter = registry.getAdapter('codex-reviewer') as CliAdapter;
-      } catch {
-        try {
-          codexAdapter = registry.getAdapter('codex-architect') as CliAdapter;
-        } catch { /* no adapter */ }
-      }
+      const reviewerAlias = config.roles.reviewer?.model;
+      codexAdapter = reviewerAlias === undefined ? null : registry.tryGetAdapter(reviewerAlias);
     } catch { /* config not found */ }
 
     // Resolve unified session
@@ -300,7 +301,7 @@ export async function cleanupCommand(path: string, options: CleanupOptions): Pro
 // ── Codex semantic scan ──
 
 async function runCodexScan(
-  adapter: CliAdapter | null,
+  adapter: ModelAdapter | null,
   _projectDir: string,
   scopes: CleanupScope[],
   timeoutSec: number,
@@ -355,9 +356,13 @@ IMPORTANT KEY FORMAT: The key will be built as scope:file:symbol — use the SAM
 
   try {
     const progress = createProgressCallbacks('cleanup-scan');
-    let result;
+    let result: BridgeCallResult;
     try {
-      result = await adapter.callWithResume(prompt, { sessionId: sessionThreadId, timeout: timeoutSec * 1000, ...progress });
+      result = await callBridge(adapter, prompt, {
+        sessionId: sessionThreadId,
+        timeout: timeoutSec * 1000,
+        ...progress,
+      });
     } catch (err) {
       // Clear stale thread ID so subsequent runs don't keep hitting a dead thread
       if (sessionThreadId && sessionMgr && sessionId) {
@@ -426,7 +431,7 @@ IMPORTANT KEY FORMAT: The key will be built as scope:file:symbol — use the SAM
 // ── Adjudication ──
 
 async function adjudicateFindings(
-  adapter: CliAdapter,
+  adapter: ModelAdapter,
   findings: CleanupFinding[],
   maxDisputes: number,
   stats: CleanupReport['stats'],
@@ -446,7 +451,10 @@ async function adjudicateFindings(
       });
 
       const adjProgress = createProgressCallbacks('adjudicate');
-      const result = await adapter.callWithResume(prompt, { timeout: 60_000, ...adjProgress });
+      const result = await callBridge(adapter, prompt, {
+        timeout: 60_000,
+        ...adjProgress,
+      });
 
       const match = result.text.match(/ADJUDICATE:\s*(CONFIRMED|DISMISSED|UNCERTAIN)\s+(.*)/);
       if (match) {

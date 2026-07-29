@@ -1,12 +1,20 @@
-// packages/core/src/models/registry.ts — CLI-only model registry
+// packages/core/src/models/registry.ts — Role-capable CLI bridge registry
 
-import type { ModelConfig, ProjectConfig } from '../types/config.js';
+import type { CliAdapterKind, ModelConfig, ProjectConfig } from '../types/config.js';
 import { ModelError } from '../utils/errors.js';
+import type { CliBridge } from './bridge.js';
+import { ClaudeCliAdapter } from './claude-cli-adapter.js';
 import { CliAdapter } from './cli-adapter.js';
-import { detectCli } from './cli-detector.js';
+import { type CliProbeResult, probeCliCommand } from './cli-runtime-evidence.js';
 
-/** All models are CLI adapters now. */
-export type ModelAdapter = CliAdapter;
+/** All registered models implement the common CLI bridge contract. */
+export type ModelAdapter = CliBridge;
+
+export interface ModelAdapterHealth extends CliProbeResult {
+  readonly alias: string;
+  readonly adapterKind: CliAdapterKind;
+  readonly model: string;
+}
 
 export class ModelRegistry {
   private models = new Map<string, ModelAdapter>();
@@ -15,12 +23,12 @@ export class ModelRegistry {
 
   /**
    * Build a registry from a ProjectConfig.
-   * All models are CLI adapters (codex).
+   * Model provider and cliAdapter.kind select the concrete bridge.
    */
   static fromConfig(config: ProjectConfig, projectDir?: string): ModelRegistry {
     const registry = new ModelRegistry();
     for (const [alias, modelConfig] of Object.entries(config.models)) {
-      registry.models.set(alias, createCliAdapter(modelConfig, projectDir));
+      registry.models.set(alias, createModelAdapter(modelConfig, projectDir));
       registry.configs.set(alias, modelConfig);
     }
     return registry;
@@ -90,20 +98,41 @@ export class ModelRegistry {
   }
 
   /**
-   * Health check: verify codex CLI is available and authenticated.
+   * Health check every configured adapter independently.
    */
   async healthCheckAll(): Promise<Map<string, boolean>> {
+    const details = await this.healthCheckDetails();
     const results = new Map<string, boolean>();
-    // All models use codex CLI — only check availability (no API key needed)
-    const detection = await detectCli('codex');
-    for (const alias of this.configs.keys()) {
-      results.set(alias, detection.available);
+    for (const [alias, detail] of details) {
+      results.set(alias, detail.available);
     }
     return results;
   }
+
+  async healthCheckDetails(projectDir = process.cwd()): Promise<Map<string, ModelAdapterHealth>> {
+    const checks = await Promise.all(
+      [...this.configs].map(async ([alias, config]) => {
+        const adapterKind = resolveModelAdapterKind(config);
+        const command =
+          config.cliAdapter?.command ??
+          (adapterKind === 'claude' ? defaultClaudeCommand() : defaultCodexCommand());
+        const probe = await probeCliCommand(command, projectDir, cliProbeEnvironment());
+        return [
+          alias,
+          {
+            ...probe,
+            alias,
+            adapterKind,
+            model: config.model,
+          },
+        ] as const;
+      }),
+    );
+    return new Map(checks);
+  }
 }
 
-/** Create a CliAdapter from model config. */
+/** Compatibility factory for callers that explicitly require the legacy Codex adapter. */
 function createCliAdapter(config: ModelConfig, projectDir?: string): CliAdapter {
   const adapterConfig = config.cliAdapter ?? getDefaultCliConfig(projectDir);
   return new CliAdapter({
@@ -114,6 +143,25 @@ function createCliAdapter(config: ModelConfig, projectDir?: string): CliAdapter 
     cliName: 'codex',
     projectDir,
   });
+}
+
+function createModelAdapter(config: ModelConfig, projectDir?: string): ModelAdapter {
+  if (resolveModelAdapterKind(config) === 'claude') {
+    const adapterConfig = config.cliAdapter;
+    return new ClaudeCliAdapter({
+      command: adapterConfig?.command ?? defaultClaudeCommand(),
+      args: adapterConfig?.args ?? [],
+      model: config.model,
+      projectDir,
+      timeout: (adapterConfig?.timeout ?? config.timeout) * 1000,
+      envAllowlist: adapterConfig?.envAllowlist,
+    });
+  }
+  return createCliAdapter(config, projectDir);
+}
+
+export function resolveModelAdapterKind(config: ModelConfig): CliAdapterKind {
+  return config.cliAdapter?.kind ?? (config.provider === 'anthropic' ? 'claude' : 'codex');
 }
 
 /** Default codex CLI adapter config. */
@@ -131,4 +179,21 @@ function getDefaultCliConfig(projectDir?: string): {
   };
 }
 
-export { createCliAdapter };
+function defaultCodexCommand(): string {
+  return process.platform === 'win32' ? 'codex.cmd' : 'codex';
+}
+
+function defaultClaudeCommand(): string {
+  return process.platform === 'win32' ? 'claude.exe' : 'claude';
+}
+
+function cliProbeEnvironment(): Record<string, string> {
+  return Object.fromEntries(
+    ['PATH', 'PATHEXT', 'HOME', 'USERPROFILE', 'SystemRoot'].flatMap((key) => {
+      const value = process.env[key];
+      return value === undefined ? [] : [[key, value]];
+    }),
+  );
+}
+
+export { createCliAdapter, createModelAdapter };

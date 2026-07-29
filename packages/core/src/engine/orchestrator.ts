@@ -10,7 +10,6 @@ import { CostStore } from '../memory/cost-store.js';
 import { MemoryStore } from '../memory/memory-store.js';
 import { SessionStore } from '../memory/session-store.js';
 import { callModel } from '../models/caller.js';
-import { CliAdapter } from '../models/cli-adapter.js';
 import { CostTracker } from '../models/cost-tracker.js';
 import type { ModelRegistry } from '../models/registry.js';
 import { RoleManager } from '../roles/role-manager.js';
@@ -195,8 +194,7 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
     // Resolve model
     const alias = options?.model ?? this.resolveReviewerAlias();
     const adapter = this.registry.getAdapter(alias);
-    const isCli = adapter instanceof CliAdapter;
-    const meteringSource: MeteringSource = isCli ? 'estimated' : 'billed';
+    const isCli = this.registry.isCliMode(alias);
 
     // Build review prompt
     const criteriaText = options?.criteria?.length
@@ -220,6 +218,8 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
 
     // Call model
     const result = await callModel(adapter, messages);
+    const meteringSource: MeteringSource =
+      result.meteringSource ?? (isCli ? 'estimated' : 'billed');
 
     // Parse verdict — wrap in try/catch so LLM output variance doesn't crash
     let verdict: { verdict: 'approved' | 'needs_revision'; feedback: string };
@@ -306,15 +306,13 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
       options?.maxConcurrency ??
       Number(process.env.CODEMOOT_MAX_CLI_CONCURRENCY ?? DEFAULT_MAX_CLI_CONCURRENCY);
     const maxApiConcurrency = DEFAULT_MAX_API_CONCURRENCY;
-
     // Async semaphores for concurrency control
     const cliSemaphore = new AsyncSemaphore(maxCliConcurrency);
     const apiSemaphore = new AsyncSemaphore(maxApiConcurrency);
 
     const callWithSemaphore = async (alias: string): Promise<DebateResponse> => {
       const adapter = this.registry.getAdapter(alias);
-      const isCli = adapter instanceof CliAdapter;
-      const meteringSource: MeteringSource = isCli ? 'estimated' : 'billed';
+      const isCli = this.registry.isCliMode(alias);
       const config = this.registry.getModelConfig(alias);
       const semaphore = isCli ? cliSemaphore : apiSemaphore;
 
@@ -327,6 +325,8 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
 
         const messages = [{ role: 'user' as const, content: enrichedQuestion }];
         const result = await callModel(adapter, messages);
+        const meteringSource: MeteringSource =
+          result.meteringSource ?? (isCli ? 'estimated' : 'billed');
 
         return {
           model: config.model,
@@ -343,7 +343,7 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
           text: '',
           tokenUsage: { inputTokens: 0, outputTokens: 0, totalTokens: 0, costUsd: 0 },
           latencyMs: Date.now() - callStart,
-          meteringSource,
+          meteringSource: 'estimated',
           error: err instanceof Error ? err.message : String(err),
         };
       } finally {

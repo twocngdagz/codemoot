@@ -96,9 +96,9 @@ debate:
 ```
 
 Provider and adapter kind must agree: `anthropic` uses `claude`, and `openai` uses `codex`.
-Configuration v3 only defines and validates the Claude adapter contract. Batch 4 does not invoke
-Claude or integrate it into the legacy model registry; those capabilities belong to the
-subsequent adapter and role-resolution batches.
+Configuration v3 selects the concrete role bridge from `cliAdapter.kind`. Commands resolve the
+configured role alias rather than assuming a `codex-*` model name, so implementer and reviewer
+direction can be swapped without changing the role vocabulary.
 
 ## Identity assurance
 
@@ -121,6 +121,11 @@ Configuration aliases are not proof of independent execution. Workflow start res
 implementer and reviewer assignment snapshots, configuration hash, commit policy, gate policy,
 and independent authority grants. Runtime identity evaluation additionally requires distinct
 execution and invocation identities and rejects shared session identity.
+
+Role invocation persists the assignment, actual process invocation, actor execution, and vendor
+session linkage. A session may only be resumed by its assigned role in the workflow that created
+it and through the same adapter. The runtime also rejects a vendor session observed for the
+opposite role. See `review-workflow-role-adapters.md` for the resolution and persistence boundary.
 
 When authenticated-subject evidence is absent, CodeMoot reports that independent accounts cannot
 be proven. It never stores authentication tokens or un-hashed subject identifiers.

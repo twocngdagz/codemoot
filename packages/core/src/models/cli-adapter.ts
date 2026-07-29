@@ -1,15 +1,22 @@
 // packages/core/src/models/cli-adapter.ts — CLI subprocess adapter for free model access
 
 import { spawn } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { readFile, unlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import type { ModelProvider } from '../types/config.js';
 import type { TokenUsage } from '../types/events.js';
 import type { ModelCallResult } from '../types/models.js';
 import { ModelError } from '../utils/errors.js';
-import type { BridgeCapabilities, CliBridge } from './bridge.js';
+import type {
+  BridgeCallResult,
+  BridgeCapabilities,
+  BridgeInvocationEvidence,
+  BridgeSessionEvidence,
+  CliBridge,
+} from './bridge.js';
+import { type CliRuntimeEvidence, collectCliRuntimeEvidence } from './cli-runtime-evidence.js';
 
 const MAX_OUTPUT_BYTES = 512 * 1024; // 512KB
 const TRUNCATION_MARKER = '\n[TRUNCATED: output exceeded 512KB]';
@@ -59,6 +66,19 @@ export interface ResumeCallOptions extends CliCallOptions {
   sessionId?: string;
 }
 
+export interface CodexInvocationEvidence extends BridgeInvocationEvidence {
+  readonly adapterKind: 'CODEX';
+}
+
+export interface CodexSessionEvidence extends BridgeSessionEvidence {
+  readonly providerOrAdapter: 'codex';
+}
+
+export interface CodexCallResult extends BridgeCallResult {
+  readonly invocationEvidence: CodexInvocationEvidence;
+  readonly sessionEvidence: CodexSessionEvidence;
+}
+
 /** Known context windows by model family. GPT-5 codex models have 400K. */
 const MODEL_CONTEXT_WINDOWS: Record<string, number> = {
   'gpt-5-codex': 400_000,
@@ -85,10 +105,15 @@ export class CliAdapter implements CliBridge {
   readonly modelId: string;
   private cliName: string;
   private projectDir: string | undefined;
+  private readonly runtimeEvidence?: CliRuntimeEvidence;
   readonly capabilities: BridgeCapabilities;
 
-  get name(): string { return this.cliName; }
-  get model(): string { return this.modelId; }
+  get name(): string {
+    return this.cliName;
+  }
+  get model(): string {
+    return this.modelId;
+  }
 
   constructor(config: {
     command: string;
@@ -97,6 +122,7 @@ export class CliAdapter implements CliBridge {
     model: string;
     cliName: string;
     projectDir?: string;
+    runtimeEvidence?: CliRuntimeEvidence;
   }) {
     this.command = config.command;
     this.baseArgs = config.args;
@@ -104,6 +130,7 @@ export class CliAdapter implements CliBridge {
     this.modelId = config.model;
     this.cliName = config.cliName;
     this.projectDir = config.projectDir;
+    this.runtimeEvidence = config.runtimeEvidence;
     this.capabilities = {
       ...CODEX_CAPABILITIES,
       maxContextTokens: MODEL_CONTEXT_WINDOWS[config.model] ?? DEFAULT_CONTEXT_WINDOW,
@@ -111,16 +138,20 @@ export class CliAdapter implements CliBridge {
   }
 
   /** CliBridge.send — send a prompt without session resume. */
-  async send(prompt: string, options?: CliCallOptions): Promise<ModelCallResult> {
-    return this.call(prompt, options);
+  async send(prompt: string, options?: CliCallOptions): Promise<CodexCallResult> {
+    return this.callWithEvidence(prompt, undefined, options);
   }
 
   /** CliBridge.resume — resume a session or fall back to send. */
-  async resume(sessionId: string, prompt: string, options?: CliCallOptions): Promise<ModelCallResult> {
+  async resume(
+    sessionId: string,
+    prompt: string,
+    options?: CliCallOptions,
+  ): Promise<CodexCallResult> {
     if (!this.capabilities.supportsResume) {
       return this.send(prompt, options);
     }
-    return this.callWithResume(prompt, { ...options, sessionId });
+    return this.callWithEvidence(prompt, sessionId, options);
   }
 
   async call(prompt: string, options?: CliCallOptions): Promise<ModelCallResult> {
@@ -192,20 +223,15 @@ export class CliAdapter implements CliBridge {
     const env = buildFilteredEnv(allowlist);
 
     const doCall = async (resumeId?: string): Promise<ModelCallResult> => {
-      const ext = process.platform === 'win32' ? '.cmd' : '';
-
       // Always use stdin ("-") for prompt delivery:
       // - Fresh exec: stdin is the default prompt source
       // - Resume: positional arg breaks on Windows shell:true (spaces split into multiple args)
       //   Using "-" tells codex to read the prompt from stdin instead
       // Build args: if we have a project dir, tell codex about it via --cd
-      const cdArgs = this.projectDir ? ['-C', this.projectDir] : [];
-      const args = resumeId
-        ? ['exec', '--skip-git-repo-check', ...cdArgs, 'resume', resumeId, '-', '--json']
-        : ['exec', '--skip-git-repo-check', ...cdArgs, '--json'];
+      const args = this.buildJsonArgs(resumeId);
 
       const start = Date.now();
-      const stdout = await this.runProcess(`codex${ext}`, args, env, timeout, prompt, {
+      const stdout = await this.runProcess(this.command, args, env, timeout, prompt, {
         idleTimeout: options?.idleTimeout,
         onProgress: options?.onProgress,
         onSpawn: options?.onSpawn,
@@ -241,15 +267,108 @@ export class CliAdapter implements CliBridge {
         return await doCall(options.sessionId);
       } catch {
         // Resume failed — fall back to fresh exec
-        console.error(`[codemoot] Resume failed for session ${options.sessionId}, falling back to fresh exec`);
+        console.error(
+          `[codemoot] Resume failed for session ${options.sessionId}, falling back to fresh exec`,
+        );
       }
     }
 
     return doCall();
   }
 
+  private async callWithEvidence(
+    prompt: string,
+    sessionId: string | undefined,
+    options: CliCallOptions | undefined,
+  ): Promise<CodexCallResult> {
+    const env = buildFilteredEnv([
+      ...BASE_ENV_ALLOWLIST,
+      ...(CLI_AUTH_VARS[this.cliName] ?? []),
+      ...(options?.envAllowlist ?? []),
+    ]);
+    const workingDirectory = resolve(this.projectDir ?? tmpdir());
+    const runtimeEvidence =
+      this.runtimeEvidence ??
+      (await collectCliRuntimeEvidence(this.command, workingDirectory, env).catch((error) => {
+        throw new ModelError(
+          `Could not attest Codex CLI executable: ${error instanceof Error ? error.message : String(error)}`,
+          this.provider,
+          this.modelId,
+        );
+      }));
+    const startedAt = new Date().toISOString();
+    let processId: number | undefined;
+    const result = await this.callWithResume(prompt, {
+      ...options,
+      ...(sessionId === undefined ? {} : { sessionId }),
+      onSpawn: (pid, command) => {
+        processId = pid;
+        options?.onSpawn?.(pid, command);
+      },
+    });
+    const finishedAt = new Date().toISOString();
+    if (processId === undefined || processId <= 0) {
+      throw new ModelError(
+        'Codex CLI closed without process identity evidence',
+        this.provider,
+        this.modelId,
+      );
+    }
+    if (result.sessionId === undefined) {
+      throw new ModelError(
+        'Codex CLI output did not include a thread identity',
+        this.provider,
+        this.modelId,
+      );
+    }
+    const processInstanceFingerprint = createHash('sha256')
+      .update(`${runtimeEvidence.executablePath}\0${processId}\0${startedAt}\0${result.sessionId}`)
+      .digest('hex');
+
+    return {
+      ...result,
+      meteringSource: result.meteringSource ?? 'estimated',
+      invocationEvidence: {
+        adapterKind: 'CODEX',
+        executablePath: runtimeEvidence.executablePath,
+        ...(runtimeEvidence.executableHash === undefined
+          ? {}
+          : { executableHash: runtimeEvidence.executableHash }),
+        cliVersion: runtimeEvidence.cliVersion,
+        configuredModel: this.modelId,
+        workingDirectory,
+        processId,
+        processInstanceFingerprint,
+        identityAssurance: 'PROCESS_ATTESTED',
+        startedAt,
+        finishedAt,
+        resultStatus: 'SUCCEEDED',
+      },
+      sessionEvidence: {
+        providerOrAdapter: 'codex',
+        vendorSessionId: result.sessionId,
+        ...(sessionId === undefined || result.sessionId !== sessionId
+          ? {}
+          : { resumedFromSessionId: sessionId }),
+      },
+    };
+  }
+
   private buildArgs(outputFile: string): string[] {
     return [...this.baseArgs, '-o', outputFile];
+  }
+
+  private buildJsonArgs(resumeId?: string): string[] {
+    const configuredArgs =
+      this.baseArgs[0] === 'exec' ? [...this.baseArgs] : ['exec', ...this.baseArgs];
+    const safetyArgs = configuredArgs.includes('--skip-git-repo-check')
+      ? []
+      : ['--skip-git-repo-check'];
+    const cdArgs =
+      this.projectDir === undefined || configuredArgs.includes('-C') ? [] : ['-C', this.projectDir];
+    return resumeId === undefined
+      ? [...configuredArgs, ...safetyArgs, ...cdArgs, '--json']
+      : [...configuredArgs, ...safetyArgs, ...cdArgs, 'resume', resumeId, '-', '--json'];
   }
 
   private runProcess(
@@ -281,7 +400,11 @@ export class CliAdapter implements CliBridge {
       // Heartbeat interval — fires every 15s with elapsed time
       const heartbeatInterval = options?.onHeartbeat
         ? setInterval(() => {
-            try { options.onHeartbeat?.(Math.round((Date.now() - startTime) / 1000)); } catch { /* callback error isolation */ }
+            try {
+              options.onHeartbeat?.(Math.round((Date.now() - startTime) / 1000));
+            } catch {
+              /* callback error isolation */
+            }
           }, 15_000)
         : undefined;
 
@@ -300,11 +423,16 @@ export class CliAdapter implements CliBridge {
 
       // Notify caller when process successfully spawns
       child.on('spawn', () => {
-        try { options?.onSpawn?.(child.pid ?? 0, command); } catch { /* callback error isolation */ }
+        try {
+          options?.onSpawn?.(child.pid ?? 0, command);
+        } catch {
+          /* callback error isolation */
+        }
       });
 
       // Absolute timeout — hard ceiling, kills no matter what
-      const elapsedMsg = () => `elapsed ${Date.now() - startTime}ms, last activity ${Date.now() - lastActivityAt}ms ago`;
+      const elapsedMsg = () =>
+        `elapsed ${Date.now() - startTime}ms, last activity ${Date.now() - lastActivityAt}ms ago`;
       const absoluteTimer = setTimeout(() => {
         killProcessTree(child.pid);
         fail(
@@ -351,13 +479,21 @@ export class CliAdapter implements CliBridge {
           stdout += chunk;
         }
         resetIdleTimer();
-        try { options?.onProgress?.(chunk); } catch { /* callback error isolation */ }
+        try {
+          options?.onProgress?.(chunk);
+        } catch {
+          /* callback error isolation */
+        }
       });
       child.stderr.on('data', (data: Buffer) => {
         const chunk = data.toString();
         if (stderr.length < 10_000) stderr += chunk;
         resetIdleTimer();
-        try { options?.onStderr?.(chunk); } catch { /* callback error isolation */ }
+        try {
+          options?.onStderr?.(chunk);
+        } catch {
+          /* callback error isolation */
+        }
       });
 
       if (stdinData) {
@@ -368,16 +504,18 @@ export class CliAdapter implements CliBridge {
       }
 
       child.on('error', (err) => {
-        fail(
-          new ModelError(`CLI subprocess failed: ${err.message}`, this.provider, this.modelId),
-        );
+        fail(new ModelError(`CLI subprocess failed: ${err.message}`, this.provider, this.modelId));
       });
 
       child.on('close', (code) => {
         if (settled) return;
         settled = true;
         cleanup();
-        try { options?.onClose?.(); } catch { /* callback error isolation */ }
+        try {
+          options?.onClose?.();
+        } catch {
+          /* callback error isolation */
+        }
         if (code !== 0) {
           reject(
             new ModelError(

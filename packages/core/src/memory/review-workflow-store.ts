@@ -77,6 +77,14 @@ export interface ImmutableSaveResult {
   readonly inserted: boolean;
 }
 
+export interface RoleInvocationPersistenceInput {
+  readonly assignment: AgentAssignment;
+  readonly invocation: InvocationIdentity;
+  readonly session?: SessionIdentity;
+  readonly reusedSessionIdentityId?: string;
+  readonly execution: ActorExecutionIdentity;
+}
+
 export interface ReviewWorkflowEvent {
   readonly eventId: number;
   readonly workflowId: string;
@@ -189,6 +197,60 @@ function parseStoredPayload<T>(
 export class ReviewWorkflowStore {
   constructor(private readonly db: Database.Database) {}
 
+  saveRoleInvocation(input: RoleInvocationPersistenceInput): void {
+    const hasNewSession = input.session !== undefined;
+    const reusesSession = input.reusedSessionIdentityId !== undefined;
+    if (hasNewSession === reusesSession) {
+      throw new ReviewWorkflowPersistenceError(
+        'PERSISTED_DATA_INVALID',
+        'A role invocation must create one session identity or reuse one existing session',
+      );
+    }
+
+    this.db.transaction(() => {
+      this.saveEntity({ kind: 'AGENT_ASSIGNMENT', value: input.assignment });
+      this.saveEntity({ kind: 'INVOCATION_IDENTITY', value: input.invocation });
+      if (input.session !== undefined) {
+        this.saveEntity({ kind: 'SESSION_IDENTITY', value: input.session });
+      } else if (input.reusedSessionIdentityId !== undefined) {
+        this.touchSessionIdentity(
+          input.reusedSessionIdentityId,
+          input.invocation.finishedAt ?? input.invocation.startedAt,
+        );
+      }
+      this.saveEntity({ kind: 'ACTOR_EXECUTION', value: input.execution });
+    })();
+  }
+
+  touchSessionIdentity(sessionIdentityId: string, lastUsedAt: string): SessionIdentity {
+    const current = this.getEntity('SESSION_IDENTITY', sessionIdentityId);
+    if (current === null || current.kind !== 'SESSION_IDENTITY') {
+      throw new ReviewWorkflowPersistenceError(
+        'PERSISTED_DATA_INVALID',
+        `Session identity ${sessionIdentityId} does not exist`,
+      );
+    }
+    const updated = sessionIdentitySchema.parse({ ...current.value, lastUsedAt });
+    if (Date.parse(updated.lastUsedAt) < Date.parse(current.value.lastUsedAt)) {
+      throw new ReviewWorkflowPersistenceError(
+        'PERSISTED_DATA_INVALID',
+        `Session identity ${sessionIdentityId} cannot move lastUsedAt backwards`,
+      );
+    }
+    if (updated.lastUsedAt === current.value.lastUsedAt) return current.value;
+
+    const payloadJson = serializeJson(updated);
+    const recordHash = hashRecord({ kind: 'SESSION_IDENTITY', value: updated });
+    this.db
+      .prepare(
+        `UPDATE review_workflow_sessions
+         SET payload_json = ?, record_hash = ?
+         WHERE session_identity_id = ?`,
+      )
+      .run(payloadJson, recordHash, sessionIdentityId);
+    return updated;
+  }
+
   createWorkflow(workflow: WorkflowRun): ImmutableSaveResult {
     const parsed = workflowRunSchema.parse(workflow);
     const payloadJson = serializeJson(parsed);
@@ -299,6 +361,23 @@ export class ReviewWorkflowStore {
     if (row === undefined) return null;
     const parsedRow = payloadRowSchema.parse(row);
     return parseStoredPayload(parsedRow.payload_json, reviewWorkflowBatchSchema, 'BATCH');
+  }
+
+  findSessionIdentity(
+    workflowId: string,
+    providerOrAdapter: string,
+    vendorSessionId: string,
+  ): SessionIdentity | null {
+    const row = this.db
+      .prepare(
+        `SELECT payload_json
+         FROM review_workflow_sessions
+         WHERE workflow_id = ? AND provider_or_adapter = ? AND vendor_session_id = ?`,
+      )
+      .get(workflowId, providerOrAdapter, vendorSessionId);
+    if (row === undefined) return null;
+    const parsedRow = payloadRowSchema.parse(row);
+    return parseStoredPayload(parsedRow.payload_json, sessionIdentitySchema, 'SESSION_IDENTITY');
   }
 
   getEvents(batchId: string, afterSequence = 0): readonly ReviewWorkflowEvent[] {

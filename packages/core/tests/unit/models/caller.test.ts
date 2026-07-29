@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
+import type { CliBridge } from '../../../src/models/bridge.js';
 import { callModel, streamModel } from '../../../src/models/caller.js';
 import { CliAdapter } from '../../../src/models/cli-adapter.js';
 import type { ChatMessage } from '../../../src/types/models.js';
@@ -20,8 +21,7 @@ function createMockAdapter(): CliAdapter {
     model: 'gpt-5.3-codex',
     cliName: 'codex',
   });
-  // Mock the call method
-  vi.spyOn(adapter, 'call').mockResolvedValue({
+  vi.spyOn(adapter, 'send').mockResolvedValue({
     text: 'CLI response text',
     model: 'gpt-5.3-codex',
     provider: 'openai',
@@ -55,11 +55,11 @@ describe('callModel', () => {
     ];
     await callModel(adapter, messages);
 
-    expect(adapter.call).toHaveBeenCalledWith(
+    expect(adapter.send).toHaveBeenCalledWith(
       expect.stringContaining('You are helpful'),
       expect.any(Object),
     );
-    expect(adapter.call).toHaveBeenCalledWith(
+    expect(adapter.send).toHaveBeenCalledWith(
       expect.stringContaining('USER: Hello'),
       expect.any(Object),
     );
@@ -70,10 +70,40 @@ describe('callModel', () => {
     const messages: ChatMessage[] = [{ role: 'user', content: 'Hi' }];
     await callModel(adapter, messages, { systemPrompt: 'Base system prompt' });
 
-    expect(adapter.call).toHaveBeenCalledWith(
+    expect(adapter.send).toHaveBeenCalledWith(
       expect.stringContaining('Base system prompt'),
       expect.any(Object),
     );
+  });
+
+  it('calls any common bridge and preserves authoritative metering', async () => {
+    const send = vi.fn().mockResolvedValue({
+      text: 'Claude response',
+      model: 'claude-sonnet-4-6',
+      provider: 'anthropic',
+      usage: { inputTokens: 12, outputTokens: 8, totalTokens: 20, costUsd: 0.01 },
+      finishReason: 'stop',
+      durationMs: 25,
+      meteringSource: 'sdk',
+    });
+    const bridge: CliBridge = {
+      name: 'claude',
+      model: 'claude-sonnet-4-6',
+      capabilities: {
+        supportsResume: true,
+        supportsStream: true,
+        maxContextTokens: 200_000,
+        supportsTools: true,
+        supportsCwd: true,
+      },
+      send,
+      resume: vi.fn(),
+    };
+
+    const result = await callModel(bridge, [{ role: 'user', content: 'Hello' }]);
+
+    expect(send).toHaveBeenCalledOnce();
+    expect(result.meteringSource).toBe('sdk');
   });
 });
 
@@ -81,7 +111,7 @@ describe('streamModel', () => {
   it('emits text deltas via callback (chunked pseudo-streaming)', async () => {
     const adapter = createMockAdapter();
     // Mock response with paragraph breaks for chunking
-    vi.spyOn(adapter, 'call').mockResolvedValue({
+    vi.spyOn(adapter, 'send').mockResolvedValue({
       text: 'First paragraph\n\nSecond paragraph',
       model: 'gpt-5.3-codex',
       provider: 'openai',

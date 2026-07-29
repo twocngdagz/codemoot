@@ -1,7 +1,12 @@
 // packages/core/src/models -- Model abstraction layer (Vercel AI SDK 6)
 
-export { ModelRegistry } from './registry.js';
-export type { ModelAdapter } from './registry.js';
+export {
+  ModelRegistry,
+  createCliAdapter,
+  createModelAdapter,
+  resolveModelAdapterKind,
+} from './registry.js';
+export type { ModelAdapter, ModelAdapterHealth } from './registry.js';
 export { callModel, streamModel } from './caller.js';
 export type { TextDeltaEmitter } from './caller.js';
 export { withFallback } from './fallback.js';
@@ -15,7 +20,14 @@ export {
   killProcessTree,
   parseCodexJsonl,
 } from './cli-adapter.js';
-export type { CliCallOptions, ResumeCallOptions, ProgressCallbacks } from './cli-adapter.js';
+export type {
+  CliCallOptions,
+  CodexCallResult,
+  CodexInvocationEvidence,
+  CodexSessionEvidence,
+  ResumeCallOptions,
+  ProgressCallbacks,
+} from './cli-adapter.js';
 export {
   ClaudeCliAdapter,
   buildClaudeEnvironment,
@@ -36,8 +48,15 @@ export type { ParsedClaudeCliOutput } from './claude-cli-protocol.js';
 export { detectCli, clearDetectionCache } from './cli-detector.js';
 export type { CliDetectionResult } from './cli-detector.js';
 export type {
+  BridgeAdapterKind,
+  BridgeCallResult,
   CliBridge,
   BridgeCapabilities,
+  BridgeInvocationEvidence,
   BridgeOptions,
   BridgeResumeOptions,
+  BridgeSessionEvidence,
 } from './bridge.js';
+export { callBridge } from './bridge.js';
+export { probeCliCommand } from './cli-runtime-evidence.js';
+export type { CliProbeResult, CliRuntimeEvidence } from './cli-runtime-evidence.js';

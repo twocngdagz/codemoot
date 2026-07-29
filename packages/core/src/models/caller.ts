@@ -3,7 +3,6 @@
 import { withCanonicalRetry } from '../security/retry.js';
 import type { CallModelOptions, ChatMessage, ModelCallResult } from '../types/models.js';
 import { sleep } from '../utils/sleep.js';
-import { CliAdapter } from './cli-adapter.js';
 import type { ModelAdapter } from './registry.js';
 
 /**
@@ -19,7 +18,7 @@ export async function callModel(
   messages: ChatMessage[],
   options?: CallModelOptions,
 ): Promise<ModelCallResult> {
-  return callCliAdapter(model, messages, options);
+  return callBridgeAdapter(model, messages, options);
 }
 
 /**
@@ -34,18 +33,18 @@ export async function streamModel(
   _role: string,
   options?: CallModelOptions,
 ): Promise<ModelCallResult> {
-  return streamCliAdapter(model, messages, onDelta, options);
+  return streamBridgeAdapter(model, messages, onDelta, options);
 }
 
-async function callCliAdapter(
-  adapter: CliAdapter,
+async function callBridgeAdapter(
+  adapter: ModelAdapter,
   messages: ChatMessage[],
   options?: CallModelOptions,
 ): Promise<ModelCallResult> {
   const prompt = messagesToPrompt(messages, options?.systemPrompt);
   const timeoutMs = (options?.timeout ?? 600) * 1000;
 
-  const attempt = await withCanonicalRetry(() => adapter.call(prompt, { timeout: timeoutMs }), {
+  const attempt = await withCanonicalRetry(() => adapter.send(prompt, { timeout: timeoutMs }), {
     maxRetries: 2,
     totalAttempts: 3,
     toolTimeoutMs: timeoutMs,
@@ -54,16 +53,19 @@ async function callCliAdapter(
   if (attempt.error || !attempt.result) {
     throw attempt.error ?? new Error('CLI adapter call failed after retries');
   }
-  return { ...attempt.result, meteringSource: 'estimated' };
+  return {
+    ...attempt.result,
+    meteringSource: attempt.result.meteringSource ?? 'estimated',
+  };
 }
 
-async function streamCliAdapter(
-  adapter: CliAdapter,
+async function streamBridgeAdapter(
+  adapter: ModelAdapter,
   messages: ChatMessage[],
   onDelta: TextDeltaEmitter,
   options?: CallModelOptions,
 ): Promise<ModelCallResult> {
-  const result = await callCliAdapter(adapter, messages, options);
+  const result = await callBridgeAdapter(adapter, messages, options);
 
   const chunks = result.text.split(/\n\n+/).filter(Boolean);
   for (const chunk of chunks) {
@@ -86,4 +88,3 @@ function messagesToPrompt(messages: ChatMessage[], systemPrompt?: string): strin
   }
   return parts.join('\n\n');
 }
-

@@ -1,16 +1,15 @@
 // packages/cli/src/commands/worker.ts — Background job worker that processes queued jobs
 
 import {
-  type CliAdapter,
   JobStore,
   ModelRegistry,
   REVIEW_DIFF_MAX_CHARS,
   buildHandoffEnvelope,
+  callBridge,
   loadConfig,
   openDatabase,
 } from '@codemoot/core';
 import chalk from 'chalk';
-import { execSync } from 'node:child_process';
 
 import { createProgressCallbacks } from '../progress.js';
 import { getDbPath } from '../utils.js';
@@ -27,18 +26,10 @@ export async function workerCommand(options: WorkerOptions): Promise<void> {
   const jobStore = new JobStore(db);
   const config = loadConfig();
   const registry = ModelRegistry.fromConfig(config, projectDir);
-  const adapter =
-    registry.tryGetAdapter('codex-reviewer') ?? registry.tryGetAdapter('codex-architect');
+  const reviewerAlias = config.roles.reviewer?.model;
+  const adapter = reviewerAlias === undefined ? null : registry.tryGetAdapter(reviewerAlias);
   if (!adapter) {
-    try {
-      execSync('codex --version', { stdio: 'pipe', encoding: 'utf-8' });
-    } catch {
-      console.error(chalk.red('Codex CLI is not installed or not in PATH.'));
-      console.error(chalk.yellow('Install it: npm install -g @openai/codex'));
-      db.close();
-      process.exit(1);
-    }
-    console.error(chalk.red('No codex adapter found in config. Run: codemoot init'));
+    console.error(chalk.red('No reviewer adapter found in config. Run: codemoot init'));
     db.close();
     process.exit(1);
   }
@@ -149,7 +140,7 @@ export async function workerCommand(options: WorkerOptions): Promise<void> {
       jobStore.appendLog(job.id, 'info', 'codex_started', 'Sending to codex...');
       const progress = createProgressCallbacks('worker');
 
-      const result = await (adapter as CliAdapter).callWithResume(prompt, {
+      const result = await callBridge(adapter, prompt, {
         timeout,
         ...progress,
       });

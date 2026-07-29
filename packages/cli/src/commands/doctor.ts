@@ -1,10 +1,9 @@
 // packages/cli/src/commands/doctor.ts — Preflight diagnostics for CodeMoot
 
-import { existsSync, accessSync, constants } from 'node:fs';
-import { execSync } from 'node:child_process';
+import { constants, accessSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
+import { ModelRegistry, VERSION, loadConfig } from '@codemoot/core';
 import chalk from 'chalk';
-import { VERSION } from '@codemoot/core';
 
 interface Check {
   name: string;
@@ -19,23 +18,39 @@ export async function doctorCommand(): Promise<void> {
 
   console.error(chalk.cyan(`\n  CodeMoot Doctor v${VERSION}\n`));
 
-  // 1. Codex CLI
-  try {
-    const version = execSync('codex --version', { stdio: 'pipe', encoding: 'utf-8' }).trim();
-    checks.push({ name: 'codex-cli', status: 'pass', message: `Codex CLI ${version}` });
-  } catch {
-    checks.push({
-      name: 'codex-cli',
-      status: 'fail',
-      message: 'Codex CLI not found in PATH',
-      fix: 'npm install -g @openai/codex',
-    });
-  }
-
-  // 2. Config file
+  // 1. Config file and independently configured adapters.
   const configPath = join(cwd, '.cowork.yml');
   if (existsSync(configPath)) {
-    checks.push({ name: 'config', status: 'pass', message: '.cowork.yml found' });
+    try {
+      const config = loadConfig({ projectDir: cwd });
+      checks.push({ name: 'config', status: 'pass', message: '.cowork.yml found' });
+      const registry = ModelRegistry.fromConfig(config, cwd);
+      const adapterHealth = await registry.healthCheckDetails(cwd);
+      for (const [alias, health] of adapterHealth) {
+        checks.push({
+          name: `adapter:${alias}`,
+          status: health.available ? 'pass' : 'fail',
+          message: health.available
+            ? `${health.adapterKind} ${health.version ?? 'version unknown'} (${health.model})`
+            : `${health.adapterKind} unavailable: ${health.error ?? health.command}`,
+          ...(health.available
+            ? {}
+            : {
+                fix:
+                  health.adapterKind === 'claude'
+                    ? 'Install or correct the configured Claude CLI command'
+                    : 'Install or correct the configured Codex CLI command',
+              }),
+        });
+      }
+    } catch (error) {
+      checks.push({
+        name: 'config',
+        status: 'fail',
+        message: `.cowork.yml is invalid: ${error instanceof Error ? error.message : String(error)}`,
+        fix: 'Correct the configuration and run codemoot doctor again',
+      });
+    }
   } else {
     checks.push({
       name: 'config',
@@ -45,7 +60,7 @@ export async function doctorCommand(): Promise<void> {
     });
   }
 
-  // 3. Database writable
+  // 2. Database writable
   const dbDir = join(cwd, '.cowork', 'db');
   const dbPath = join(dbDir, 'cowork.db');
   if (existsSync(dbDir)) {
@@ -54,7 +69,9 @@ export async function doctorCommand(): Promise<void> {
       checks.push({
         name: 'database',
         status: existsSync(dbPath) ? 'pass' : 'warn',
-        message: existsSync(dbPath) ? 'Database exists and writable' : 'Database directory exists, DB will be created on first use',
+        message: existsSync(dbPath)
+          ? 'Database exists and writable'
+          : 'Database directory exists, DB will be created on first use',
       });
     } catch {
       checks.push({
@@ -73,7 +90,7 @@ export async function doctorCommand(): Promise<void> {
     });
   }
 
-  // 4. Git repo — traverse up to find .git
+  // 3. Git repo — traverse up to find .git
   let gitFound = false;
   let searchDir = cwd;
   while (searchDir) {
@@ -95,21 +112,21 @@ export async function doctorCommand(): Promise<void> {
     });
   }
 
-  // 5. Node version
+  // 4. Node version
   const nodeVersion = process.version;
   const major = Number.parseInt(nodeVersion.slice(1).split('.')[0], 10);
-  if (major >= 18) {
+  if (major >= 22) {
     checks.push({ name: 'node', status: 'pass', message: `Node.js ${nodeVersion}` });
   } else {
     checks.push({
       name: 'node',
       status: 'fail',
-      message: `Node.js ${nodeVersion} — requires >= 18`,
-      fix: 'Install Node.js 18+',
+      message: `Node.js ${nodeVersion} — requires 22`,
+      fix: 'Install Node.js 22',
     });
   }
 
-  // 6. Schema version check
+  // 5. Schema version check
   if (existsSync(dbPath)) {
     try {
       const { openDatabase } = await import('@codemoot/core');
@@ -134,11 +151,12 @@ export async function doctorCommand(): Promise<void> {
   // Print results
   let hasFailure = false;
   for (const check of checks) {
-    const icon = check.status === 'pass'
-      ? chalk.green('PASS')
-      : check.status === 'warn'
-        ? chalk.yellow('WARN')
-        : chalk.red('FAIL');
+    const icon =
+      check.status === 'pass'
+        ? chalk.green('PASS')
+        : check.status === 'warn'
+          ? chalk.yellow('WARN')
+          : chalk.red('FAIL');
     console.error(`  ${icon} ${check.name}: ${check.message}`);
     if (check.fix) {
       console.error(chalk.dim(`       → ${check.fix}`));

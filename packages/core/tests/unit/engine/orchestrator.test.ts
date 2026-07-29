@@ -598,6 +598,7 @@ describe('Orchestrator', () => {
 
     it('returns estimated metering for CLI mode', async () => {
       mockRegistry.getAdapter.mockReturnValue(mockCliAdapter);
+      mockRegistry.isCliMode.mockReturnValue(true);
 
       (callModel as ReturnType<typeof vi.fn>).mockResolvedValue({
         text: 'VERDICT: APPROVED',
@@ -622,6 +623,7 @@ describe('Orchestrator', () => {
 
     it('returns billed metering for API mode', async () => {
       mockRegistry.getAdapter.mockReturnValue(mockModel);
+      mockRegistry.isCliMode.mockReturnValue(false);
 
       (callModel as ReturnType<typeof vi.fn>).mockResolvedValue({
         text: 'VERDICT: APPROVED',

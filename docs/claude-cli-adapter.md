@@ -1,7 +1,7 @@
 # Claude CLI Adapter Contract
 
-Batch 5 adds a direct Claude Code adapter behind `CliBridge`. It is not selected by the legacy
-model registry yet; role resolution and registry integration belong to Batch 6.
+The Claude Code adapter implements `CliBridge` and is selected by `ModelRegistry` when a model
+uses `cliAdapter.kind: claude`.
 
 ## Supported CLI
 
@@ -83,10 +83,9 @@ so an invocation cannot change the installed Claude Code version during a run.
 
 ## Current boundary
 
-Batch 5 does not:
+The role-invocation service now persists process and session evidence for review-gated work.
+The adapter still does not:
 
-- change `ModelRegistry`, `caller.ts`, role resolution, legacy commands, or MCP
-- persist invocation/session evidence
 - invoke `claude auth status` or infer authenticated account identity
 - run a credentialed smoke test automatically
 
