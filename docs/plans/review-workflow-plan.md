@@ -240,6 +240,50 @@ baselines `2e1dae6`, plan lifecycle `d8d7fa4`). Remaining:
 - **Out of scope:** Removing legacy build/debate or fixing the lint backlog.
 - **Rollback:** Revert adoption/defaults without removing workflow functionality.
 
+# 6a. Pacing amendment (owner-directed, 2026-07-30)
+
+Applies to Batches 11–12 and the `reviewGated` configuration. Purpose: prevent unbounded
+review loops. The kernel's `CODE_REVIEW → NEEDS_REVISION → IMPLEMENTING → CODE_REVIEW` cycle
+must be bounded by the coordinator.
+
+## Hard pacing rules
+
+1. One implementation pass, one complete initial code review, at most one correction pass,
+   at most one bounded final review. **No third automatic review round.**
+2. After the final review: no CRITICAL/HIGH blockers → approve and advance; unresolved
+   CRITICAL/HIGH → the coordinator blocks the batch with reason
+   `REVIEW_ROUNDS_EXHAUSTED_HUMAN_DECISION_REQUIRED` (kernel `BLOCK_BATCH`; only the human
+   `WORKFLOW_OWNER` may resume). Only MEDIUM/LOW remaining → defer them and advance.
+3. The corrected implementation goes only to the bounded final review (round 2), never to a
+   fresh general review. The final review verifies original blockers and the incremental
+   diff; new findings are limited to CRITICAL/HIGH regressions introduced by the correction.
+4. No partial handoffs, per-finding reviews, per-commit reviews, or informal sub-batches.
+   Reviews return every finding in one complete contract artifact (already enforced by the
+   Batch 7 contracts; the coordinator must not create intermediate review milestones).
+5. Finding policy in the correction loop: all CRITICAL/HIGH must be addressed; MEDIUM blocks
+   only via an explicit merge-blocking acceptance criterion; LOW/SUGGESTION never enters the
+   correction loop — recorded for backlog triage only. No numeric cap on findings (a cap
+   could hide real criticals).
+6. Implementer stopping rule: the implementer does not stop for failing tests, fixture
+   updates, type errors, missing tests, local design decisions, individual findings, or
+   intermediate commits. It stops only for contradictory requirements, missing
+   credentials/systems, destructive actions requiring approval, material scope expansion, or
+   genuine external blockage.
+
+## Configuration (additive, Batch 11)
+
+```yaml
+reviewGated:
+  pacing:
+    maxCodeReviewRounds: 2        # initial + one final; hard ceiling
+    maxCorrectionPasses: 1
+    deferNonBlockingFindings: true
+    unresolvedAfterFinalReview: human_decision_required
+```
+
+Defaults encode the hard rules; the schema rejects values that would permit a third
+automatic round.
+
 # 7. Testing strategy
 
 Exhaustive transitions including `AWAITING_COMMIT`; both commit paths plus unauthorized
