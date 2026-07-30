@@ -28,6 +28,7 @@ import {
   TRANSITION_REJECTION_CODES,
   VERIFICATION_ACCEPTANCE_MODES,
   VERIFICATION_ATTESTATION_DECISIONS,
+  VERIFICATION_EVIDENCE_SOURCES,
   VERIFICATION_OBSERVED_STATUSES,
   VERIFICATION_TYPES,
   WORKFLOW_STATUSES,
@@ -524,6 +525,7 @@ export const verificationRecordSchema = z
     executorActorExecutionId: idSchema,
     executorActorType: actorTypeSchema,
     executorAssignmentId: idSchema.optional(),
+    evidenceSource: z.enum(VERIFICATION_EVIDENCE_SOURCES).optional(),
     verificationType: z.enum(VERIFICATION_TYPES),
     toolVersion: z.string().min(1).optional(),
     configurationHash: contentHashSchema,
@@ -544,6 +546,13 @@ export const verificationRecordSchema = z
         code: z.ZodIssueCode.custom,
         path: ['observedStatus'],
         message: `Observed status must be ${expectedStatus} for the supplied outcome`,
+      });
+    }
+    if (Date.parse(value.finishedAt) < Date.parse(value.startedAt)) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['finishedAt'],
+        message: 'Verification cannot finish before it starts',
       });
     }
     if (value.executorActorType === 'AGENT' && value.executorAssignmentId === undefined) {

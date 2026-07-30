@@ -173,6 +173,7 @@ function makeVerificationRecord(type: 'test' | 'manual' | 'browser' = 'test') {
     executorActorExecutionId: 'actor-implementer',
     executorActorType: 'AGENT',
     executorAssignmentId: IMPLEMENTER_ASSIGNMENT.assignmentId,
+    evidenceSource: 'CODEMOOT_EXECUTED',
     verificationType: type,
     toolVersion: '1.0.0',
     configurationHash: 'verification-config-hash',
@@ -512,6 +513,15 @@ describe('verification schemas', () => {
     const result = verificationRecordSchema.safeParse({
       ...makeVerificationRecord(),
       observedStatus: 'FAILED',
+    });
+    expect(result.success).toBe(false);
+  });
+
+  it('rejects a verification record that finishes before it starts', () => {
+    const result = verificationRecordSchema.safeParse({
+      ...makeVerificationRecord(),
+      startedAt: '2026-07-29T00:01:00.000Z',
+      finishedAt: '2026-07-29T00:00:00.000Z',
     });
     expect(result.success).toBe(false);
   });

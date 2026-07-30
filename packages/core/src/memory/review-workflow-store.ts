@@ -8,6 +8,7 @@ import {
   structuredReviewSchema,
 } from '../review-workflow-contracts/schemas.js';
 import type { HandoffTranscript, StructuredReview } from '../review-workflow-contracts/types.js';
+import { hashVerificationRecord } from '../review-workflow-verification/hash.js';
 import {
   acceptanceCriterionSchema,
   actorExecutionIdentitySchema,
@@ -1058,6 +1059,30 @@ export class ReviewWorkflowStore {
       }
       case 'VERIFICATION_ATTESTATION': {
         const value = verificationAttestationSchema.parse(entity.value);
+        const recordEntity = this.getEntity('VERIFICATION_RECORD', value.verificationRecordId);
+        if (recordEntity === null || recordEntity.kind !== 'VERIFICATION_RECORD') {
+          throw new ReviewWorkflowPersistenceError(
+            'PERSISTED_DATA_INVALID',
+            `Verification attestation ${value.verificationAttestationId} references a missing record`,
+          );
+        }
+        const record = recordEntity.value;
+        if (
+          recordEntity.workflowId !== value.workflowId ||
+          recordEntity.batchId !== value.batchId ||
+          hashVerificationRecord(record) !== value.evidenceHash ||
+          !sameStringSet(record.relatedCriterionIds, value.relatedCriterionIds) ||
+          !sameStringSet(record.relatedFindingIds, value.relatedFindingIds) ||
+          record.verificationType !== value.recordVerificationType ||
+          record.executorActorExecutionId !== value.recordExecutorActorExecutionId ||
+          record.executorActorType !== value.recordExecutorActorType ||
+          record.executorAssignmentId !== value.recordExecutorAssignmentId
+        ) {
+          throw new ReviewWorkflowPersistenceError(
+            'PERSISTED_DATA_INVALID',
+            `Verification attestation ${value.verificationAttestationId} does not match its record`,
+          );
+        }
         return this.saveRecord({
           table: 'review_workflow_verification_attestations',
           idColumn: 'verification_attestation_id',
@@ -1527,4 +1552,11 @@ export class ReviewWorkflowStore {
       payloadJson: parsed.payload_json,
     };
   }
+}
+
+function sameStringSet(left: readonly string[], right: readonly string[]): boolean {
+  if (left.length !== right.length) return false;
+  const sortedLeft = [...left].sort();
+  const sortedRight = [...right].sort();
+  return sortedLeft.every((value, index) => value === sortedRight[index]);
 }

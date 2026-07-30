@@ -280,6 +280,14 @@ export const VERIFICATION_OBSERVED_STATUSES = [
 
 export type VerificationObservedStatus = (typeof VERIFICATION_OBSERVED_STATUSES)[number];
 
+export const VERIFICATION_EVIDENCE_SOURCES = [
+  'CODEMOOT_EXECUTED',
+  'TRUSTED_CI',
+  'EXTERNAL',
+] as const;
+
+export type VerificationEvidenceSource = (typeof VERIFICATION_EVIDENCE_SOURCES)[number];
+
 export type VerificationExecutionOutcome = DeepReadonly<
   z.infer<typeof schemas.verificationExecutionOutcomeSchema>
 >;

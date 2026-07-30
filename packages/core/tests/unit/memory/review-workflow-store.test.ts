@@ -7,6 +7,7 @@ import {
   ReviewWorkflowPersistenceError,
   ReviewWorkflowStore,
 } from '../../../src/memory/review-workflow-store.js';
+import { hashVerificationRecord } from '../../../src/review-workflow-verification/hash.js';
 import type {
   AcceptanceCriterion,
   ActorExecutionIdentity,
@@ -411,7 +412,7 @@ describe('ReviewWorkflowStore', () => {
     const attestation: VerificationAttestation = {
       verificationAttestationId: 'attestation-1',
       verificationRecordId: verificationRecord.verificationRecordId,
-      evidenceHash: 'verification-evidence-hash',
+      evidenceHash: hashVerificationRecord(verificationRecord),
       workflowId: WORKFLOW.workflowId,
       batchId: BATCH.batchId,
       relatedCriterionIds: verificationRecord.relatedCriterionIds,
