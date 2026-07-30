@@ -7,12 +7,15 @@ import {
   generateId,
   loadConfig,
   type openDatabase,
+  type reviewWorkflow,
   reviewWorkflowContracts,
+  reviewWorkflowGate,
   reviewWorkflowGit,
   reviewWorkflowIdentity,
   reviewWorkflowImplementation,
   reviewWorkflowPersistence,
   reviewWorkflowPlan,
+  reviewWorkflowVerification,
 } from '@codemoot/core';
 import { withDatabase } from '../utils.js';
 
@@ -140,10 +143,16 @@ export async function reviewWorkflowStatusCommand(workflowId: string): Promise<v
           latestReview === undefined
             ? null
             : runtime.implementationStore.getActorExecution(latestReview.reviewerActorExecutionId);
+        const effective = runtime.gateService.effectiveState(batch.batchId);
         return {
           batchId: batch.batchId,
           ordinal: batch.ordinal,
           state: batch.persistedState,
+          effectiveState: effective.effectiveState,
+          approvalValid: effective.approvalValid,
+          ...(effective.persistedApprovalSha === undefined
+            ? {}
+            : { approvedCommitSha: effective.persistedApprovalSha }),
           planVersionId: batch.currentPlanVersionId,
           aggregateVersion: batch.aggregateVersion,
           implementer:
@@ -806,6 +815,466 @@ Cumulative diff (${evidence.vocabulary.originalBatchBaseSha} → ${evidence.voca
 ${evidence.cumulativePatch}${roundTwoEvidence}`;
 }
 
+interface BatchVerifyOptions {
+  readonly command: number;
+  readonly timeout: number;
+  readonly toolVersion?: string;
+  readonly id?: string;
+  readonly expectedVersion?: number;
+}
+
+/** Stable default command identity so a same-ID retry replays instead of re-executing. */
+export function deriveVerifyCommandId(batchId: string, commandIndex: number): string {
+  return `${batchId}:verify:${commandIndex}`;
+}
+
+export function resolvePlanVerificationCommand(
+  plan: reviewWorkflow.BatchPlanVersion,
+  commandIndex: number,
+): reviewWorkflow.BatchPlanVersion['verificationCommands'][number] {
+  const command = plan.verificationCommands[commandIndex - 1];
+  if (command === undefined) {
+    throw new Error(`Plan ${plan.batchPlanVersionId} has no verification command ${commandIndex}`);
+  }
+  return command;
+}
+
+export async function reviewWorkflowBatchVerifyCommand(
+  workflowId: string,
+  ordinalValue: string,
+  options: BatchVerifyOptions,
+): Promise<void> {
+  await withDatabase(async (db) => {
+    const projectDir = process.cwd();
+    const ordinal = parsePositiveInteger(ordinalValue, 'batch ordinal');
+    const runtime = createRuntime(db, projectDir);
+    const context = resolveRuntimeContext(runtime.store, workflowId, projectDir);
+    const batch = requireBatchByOrdinal(runtime.store, workflowId, ordinal);
+    const plan = runtime.store.getBatchPlan(batch.currentPlanVersionId);
+    if (plan === null) throw new Error(`Batch ${batch.batchId} has no current plan`);
+    const command = resolvePlanVerificationCommand(plan, options.command);
+    const commandId = options.id ?? deriveVerifyCommandId(batch.batchId, options.command);
+    const verificationRecordId = `${commandId}:record`;
+    const executor = persistCliActor(runtime.store, {
+      actorExecutionId: `${commandId}:executor`,
+      actorType: 'HUMAN',
+      authorities: ['VERIFICATION_EXECUTOR'],
+    });
+    const result = await runtime.gateService.executeVerification({
+      workflowId,
+      batchId: batch.batchId,
+      configuration: context.snapshot,
+      commandId,
+      verificationRecordId,
+      executorActorExecutionId: executor.actorExecutionId,
+      ...(options.expectedVersion === undefined
+        ? {}
+        : { expectedBatchVersion: options.expectedVersion }),
+      run: async () => {
+        const executed = await runtime.verificationService.execute({
+          verificationRecordId,
+          workflowId,
+          batchId: batch.batchId,
+          executorActorExecutionId: executor.actorExecutionId,
+          relatedFindingIds: [],
+          configurationHash: context.snapshot.configurationHash,
+          ...(options.toolVersion === undefined ? {} : { toolVersion: options.toolVersion }),
+          command,
+          expectedCommitSha: new reviewWorkflowGit.LocalGitRepository(projectDir).readHeadSha(),
+          timeoutMs: options.timeout * 1000,
+        });
+        return executed.record;
+      },
+    });
+    printJson({
+      workflowId,
+      batchId: batch.batchId,
+      commandId,
+      replayed: result.replayed,
+      verificationRecordId: result.record.verificationRecordId,
+      observedStatus: result.record.observedStatus,
+      commitSha: result.record.commitSha,
+      fullLogLocation: result.record.fullLogLocation,
+      note: 'A successful record is evidence only; acceptance requires attestation.',
+    });
+  });
+}
+
+interface BatchAttestOptions {
+  readonly record: string;
+  readonly mode: 'automatic' | 'human';
+  readonly decision: 'accepted' | 'rejected';
+  readonly rationale: string;
+}
+
+/**
+ * Derives the attestation policy from authoritative sources only: the approved plan's
+ * verification commands, the plan's acceptance criteria, the approved code review's
+ * reviewed commit, and the freshly derived configuration hash. Nothing is echoed from the
+ * record under attestation, and nothing is operator-asserted.
+ *
+ * Facts without a durable evidence source are treated as UNPROVEN and deny automatic
+ * acceptance: the record's toolVersion is operator-supplied at execution time (the local
+ * runner does not capture tool versions), so no expected tool version can be proven and
+ * parser confidence cannot be established — both force independent judgment. Baseline
+ * comparison derives from the approved command's verification type: lint and
+ * static-analysis evidence in this repository is baseline-relative and requires the
+ * assigned reviewer's acceptance.
+ */
+export function deriveVerificationAttestationPolicy(input: {
+  readonly plan: reviewWorkflow.BatchPlanVersion;
+  readonly criteria: readonly reviewWorkflow.AcceptanceCriterion[];
+  readonly record: reviewWorkflow.VerificationRecord;
+  readonly approvedReviewedCommitSha: string;
+  readonly configurationHash: string;
+}): reviewWorkflowVerification.VerificationAttestationPolicy {
+  const approvedCommand = input.plan.verificationCommands.find(
+    (candidate) =>
+      candidate.executable === input.record.command &&
+      JSON.stringify(candidate.arguments) === JSON.stringify(input.record.arguments) &&
+      candidate.workingDirectory === input.record.workingDirectory &&
+      candidate.verificationType === input.record.verificationType,
+  );
+  if (approvedCommand === undefined) {
+    throw new Error(
+      `Verification record ${input.record.verificationRecordId} does not match any approved plan verification command`,
+    );
+  }
+  return {
+    policyConfigurationHash: input.configurationHash,
+    expectedVerificationConfigurationHash: input.configurationHash,
+    expectedCommitSha: input.approvedReviewedCommitSha,
+    approvedCommand,
+    expectedToolVersion: 'UNPROVEN:tool-version-has-no-durable-evidence-source',
+    criterionPolicies: approvedCommand.relatedCriterionIds.map((criterionId) => {
+      const criterion = input.criteria.find(
+        (candidate) => candidate.acceptanceCriterionId === criterionId,
+      );
+      const judgment =
+        criterion === undefined ||
+        criterion.kind === 'MANUAL' ||
+        criterion.kind === 'BROWSER' ||
+        criterion.kind === 'USER_FACING';
+      return {
+        criterionId,
+        allowsAutomaticAcceptance: !judgment,
+        requiresIndependentAttestation: judgment,
+      };
+    }),
+    parserAmbiguityRequiresJudgment: true,
+    baselineComparison:
+      approvedCommand.verificationType === 'lint' ||
+      approvedCommand.verificationType === 'static_analysis',
+  };
+}
+
+export async function reviewWorkflowBatchAttestVerificationCommand(
+  workflowId: string,
+  ordinalValue: string,
+  options: BatchAttestOptions,
+): Promise<void> {
+  await withDatabase(async (db) => {
+    const projectDir = process.cwd();
+    const ordinal = parsePositiveInteger(ordinalValue, 'batch ordinal');
+    const runtime = createRuntime(db, projectDir);
+    const context = resolveRuntimeContext(runtime.store, workflowId, projectDir);
+    const batch = requireBatchByOrdinal(runtime.store, workflowId, ordinal);
+    const recordEntity = runtime.gateStore.workflowStore.getEntity(
+      'VERIFICATION_RECORD',
+      options.record,
+    );
+    if (recordEntity === null || recordEntity.kind !== 'VERIFICATION_RECORD') {
+      throw new Error(`Verification record ${options.record} does not exist`);
+    }
+    const record = recordEntity.value;
+    const plan = runtime.store.getBatchPlan(batch.currentPlanVersionId);
+    if (plan === null) throw new Error(`Batch ${batch.batchId} has no current plan`);
+    const criteria = runtime.store.listAcceptanceCriteria(plan.batchPlanVersionId);
+    const approvedReview = runtime.gateStore
+      .listCodeReviews(batch.batchId)
+      .filter((candidate) => candidate.verdict === 'APPROVED')
+      .at(-1);
+    if (approvedReview === undefined || approvedReview.target.kind !== 'CODE') {
+      throw new Error(`Batch ${batch.batchId} has no approved code review to attest against`);
+    }
+    const attestor = persistCliActor(runtime.store, {
+      actorExecutionId: `${batch.batchId}:verification-attestor:${generateId('execution')}`,
+      actorType: options.mode === 'automatic' ? 'SYSTEM' : 'HUMAN',
+      authorities: ['VERIFICATION_ATTESTOR'],
+      ...(options.mode === 'automatic' ? { assurance: 'PROCESS_ATTESTED' as const } : {}),
+    });
+    const attestation = runtime.verificationService.attest({
+      verificationAttestationId: `${record.verificationRecordId}:attestation:${options.mode}`,
+      verificationRecordId: record.verificationRecordId,
+      workflowId,
+      batchId: batch.batchId,
+      decision: options.decision === 'accepted' ? 'ACCEPTED' : 'REJECTED',
+      acceptanceMode: options.mode === 'automatic' ? 'AUTOMATIC_POLICY' : 'HUMAN',
+      rationale: options.rationale,
+      attestorActorExecutionId: attestor.actorExecutionId,
+      currentHeadSha: new reviewWorkflowGit.LocalGitRepository(projectDir).readHeadSha(),
+      policy: deriveVerificationAttestationPolicy({
+        plan,
+        criteria,
+        record,
+        approvedReviewedCommitSha: approvedReview.target.reviewedCommitSha,
+        configurationHash: context.snapshot.configurationHash,
+      }),
+      createdAt: new Date().toISOString(),
+    });
+    printJson({
+      workflowId,
+      batchId: batch.batchId,
+      verificationAttestationId: attestation.verificationAttestationId,
+      decision: attestation.decision,
+      acceptanceMode: attestation.acceptanceMode,
+    });
+  });
+}
+
+interface BatchFinalAuditOptions extends WorkflowInvocationOptions {
+  readonly id?: string;
+  readonly expectedVersion?: number;
+}
+
+export async function reviewWorkflowBatchFinalAuditCommand(
+  workflowId: string,
+  ordinalValue: string,
+  options: BatchFinalAuditOptions,
+): Promise<void> {
+  await withDatabase(async (db) => {
+    const projectDir = process.cwd();
+    const ordinal = parsePositiveInteger(ordinalValue, 'batch ordinal');
+    const runtime = createRuntime(db, projectDir);
+    const context = resolveRuntimeContext(runtime.store, workflowId, projectDir);
+    const batch = requireBatchByOrdinal(runtime.store, workflowId, ordinal);
+    const plan = runtime.store.getBatchPlan(batch.currentPlanVersionId);
+    if (plan === null) throw new Error(`Batch ${batch.batchId} has no current plan`);
+    const result = await runtime.gateService.finalAudit({
+      workflowId,
+      batchId: batch.batchId,
+      configuration: context.snapshot,
+      resolution: context.roles.reviewer,
+      commandId: options.id ?? `${batch.batchId}:final-audit`,
+      ...(options.expectedVersion === undefined
+        ? {}
+        : { expectedBatchVersion: options.expectedVersion }),
+      actorExecutionId: `${batch.batchId}:final-auditor:${generateId('execution')}`,
+      invocationId: `${batch.batchId}:final-auditor:${generateId('invocation')}`,
+      sessionIdentityId: `${batch.batchId}:final-auditor:${generateId('session')}`,
+      transcriptId: `${batch.batchId}:final-audit:${generateId('transcript')}`,
+      buildPrompt: (evidence) => buildFinalAuditPrompt({ workflowId, batchPlan: plan, evidence }),
+      options: { timeout: options.timeout * 1000 },
+    });
+    printJson(
+      result.capture.accepted
+        ? {
+            status: result.replayed ? 'REPLAYED' : 'CAPTURED',
+            workflowId,
+            batchId: batch.batchId,
+            batchState: result.batch.persistedState,
+            verdict: result.capture.value.review.verdict,
+            scopeComplete: result.capture.value.review.scopeComplete,
+            documentationComplete: result.capture.value.review.documentationComplete,
+          }
+        : {
+            status: 'REJECTED',
+            workflowId,
+            batchId: batch.batchId,
+            errorCode: result.capture.error.code,
+            message: result.capture.error.message,
+          },
+    );
+  });
+}
+
+interface BatchGateOptions {
+  readonly id?: string;
+  readonly expectedVersion?: number;
+}
+
+export async function reviewWorkflowBatchGateCommand(
+  workflowId: string,
+  ordinalValue: string,
+  options: BatchGateOptions,
+): Promise<void> {
+  await withDatabase(async (db) => {
+    const projectDir = process.cwd();
+    const ordinal = parsePositiveInteger(ordinalValue, 'batch ordinal');
+    const runtime = createRuntime(db, projectDir);
+    const context = resolveRuntimeContext(runtime.store, workflowId, projectDir);
+    const batch = requireBatchByOrdinal(runtime.store, workflowId, ordinal);
+    const result = runtime.gateService.evaluateGate({
+      workflowId,
+      batchId: batch.batchId,
+      configuration: context.snapshot,
+      commandId: options.id ?? `${batch.batchId}:gate`,
+      ...(options.expectedVersion === undefined
+        ? {}
+        : { expectedBatchVersion: options.expectedVersion }),
+      createdAt: new Date().toISOString(),
+    });
+    printJson(
+      result.approved
+        ? {
+            status: 'APPROVED_FOR_MERGE',
+            workflowId,
+            batchId: batch.batchId,
+            approvedCommitSha: result.conditions.reviewedCommitSha,
+            conditions: result.conditions,
+          }
+        : {
+            status: 'NOT_APPROVED',
+            workflowId,
+            batchId: batch.batchId,
+            failedConditions: result.failedConditions,
+            conditions: result.conditions,
+          },
+    );
+  });
+}
+
+interface BatchMarkMergedOptions {
+  readonly mergeSha: string;
+  readonly id?: string;
+  readonly expectedVersion?: number;
+}
+
+export async function reviewWorkflowBatchMarkMergedCommand(
+  workflowId: string,
+  ordinalValue: string,
+  options: BatchMarkMergedOptions,
+): Promise<void> {
+  await withDatabase(async (db) => {
+    const projectDir = process.cwd();
+    const ordinal = parsePositiveInteger(ordinalValue, 'batch ordinal');
+    const runtime = createRuntime(db, projectDir);
+    resolveRuntimeContext(runtime.store, workflowId, projectDir);
+    const batch = requireBatchByOrdinal(runtime.store, workflowId, ordinal);
+    const recorder = persistCliActor(runtime.store, {
+      actorExecutionId: `${batch.batchId}:merge-recorder:${generateId('execution')}`,
+      actorType: 'HUMAN',
+      authorities: ['MERGE_RECORDER'],
+    });
+    const merged = runtime.gateService.markMerged({
+      workflowId,
+      batchId: batch.batchId,
+      mergeCommitSha: options.mergeSha,
+      recorder: { actorExecutionId: recorder.actorExecutionId, actorType: 'HUMAN' },
+      commandId: options.id ?? `${batch.batchId}:mark-merged`,
+      ...(options.expectedVersion === undefined
+        ? {}
+        : { expectedBatchVersion: options.expectedVersion }),
+      createdAt: new Date().toISOString(),
+    });
+    printJson({
+      status: merged.persistedState,
+      workflowId,
+      batchId: batch.batchId,
+      mergeCommitSha: options.mergeSha,
+      note: 'External merge recorded; CodeMoot never executes merges.',
+    });
+  });
+}
+
+interface BatchReconcileStaleOptions {
+  readonly id?: string;
+  readonly expectedVersion?: number;
+}
+
+export async function reviewWorkflowBatchReconcileStaleCommand(
+  workflowId: string,
+  ordinalValue: string,
+  options: BatchReconcileStaleOptions,
+): Promise<void> {
+  await withDatabase(async (db) => {
+    const projectDir = process.cwd();
+    const ordinal = parsePositiveInteger(ordinalValue, 'batch ordinal');
+    const runtime = createRuntime(db, projectDir);
+    resolveRuntimeContext(runtime.store, workflowId, projectDir);
+    const batch = requireBatchByOrdinal(runtime.store, workflowId, ordinal);
+    const reconciled = runtime.gateService.reconcileStaleApproval({
+      workflowId,
+      batchId: batch.batchId,
+      commandId: options.id ?? `${batch.batchId}:reconcile-stale`,
+      ...(options.expectedVersion === undefined
+        ? {}
+        : { expectedBatchVersion: options.expectedVersion }),
+      createdAt: new Date().toISOString(),
+    });
+    printJson({
+      status: reconciled.persistedState,
+      workflowId,
+      batchId: batch.batchId,
+      note: 'Stale approval persisted; the batch must be re-verified through a new gate cycle.',
+    });
+  });
+}
+
+export function buildFinalAuditPrompt(input: {
+  readonly workflowId: string;
+  readonly batchPlan: unknown;
+  readonly evidence: reviewWorkflowGate.FinalAuditPromptEvidence;
+}): string {
+  const { evidence } = input;
+  return `Perform the single bounded final completeness audit for workflow ${input.workflowId}.
+
+Verify requirement coverage, every acceptance criterion, scope fidelity to the approved plan,
+and documentation completeness against the final-gate diff below. Never modify repository
+files, the Git index, or HEAD. New findings are permitted only for critical or high defects.
+
+Output exactly one JSON object satisfying the strict FINAL_AUDIT_RESULT schemaVersion 1
+contract. Echo this authoritative target verbatim:
+${JSON.stringify(evidence.target, null, 2)}
+
+Provide one requirementChecks entry per requirement ID (exactly these):
+${JSON.stringify(evidence.requirementIds)}
+
+Provide one acceptanceCriterionChecks entry per criterion ID (exactly these):
+${JSON.stringify(evidence.acceptanceCriterionIds)}
+
+Deferred (non-blocking) findings recorded earlier, for completeness context:
+${JSON.stringify(evidence.deferredFindings.map((finding) => finding.title))}
+
+Approved batch plan:
+${JSON.stringify(input.batchPlan, null, 2)}
+
+Final cumulative diff:
+${evidence.cumulativePatch}`;
+}
+
+function requireBatchByOrdinal(
+  store: reviewWorkflowPlan.ReviewWorkflowPlanStore,
+  workflowId: string,
+  ordinal: number,
+) {
+  const batch = store.listBatches(workflowId).find((candidate) => candidate.ordinal === ordinal);
+  if (batch === undefined) throw new Error(`Workflow ${workflowId} has no batch ${ordinal}`);
+  return batch;
+}
+
+function persistCliActor(
+  store: reviewWorkflowPlan.ReviewWorkflowPlanStore,
+  input: {
+    readonly actorExecutionId: string;
+    readonly actorType: 'HUMAN' | 'SYSTEM' | 'CI';
+    readonly authorities: readonly reviewWorkflow.Authority[];
+    readonly assurance?: 'PROCESS_ATTESTED';
+  },
+): reviewWorkflow.ActorExecutionIdentity {
+  const now = new Date().toISOString();
+  const actor: reviewWorkflow.ActorExecutionIdentity = {
+    actorExecutionId: input.actorExecutionId,
+    actorType: input.actorType,
+    authoritiesExercised: [...input.authorities],
+    identityAssurance: input.assurance ?? 'CLI_ASSERTED',
+    observedEvidence: [{ kind: 'LOCAL_CLI', source: 'codemoot batch', observedAt: now }],
+    startedAt: now,
+  };
+  store.workflowStore.saveEntity({ kind: 'ACTOR_EXECUTION', value: actor });
+  return actor;
+}
+
 export function buildRefinementPrompt(input: {
   readonly workflowId: string;
   readonly repositoryAudit: unknown;
@@ -913,6 +1382,7 @@ ${JSON.stringify(input.acceptanceCriteria, null, 2)}`;
 
 function createRuntime(db: ReturnType<typeof openDatabase>, projectDir: string) {
   const store = new reviewWorkflowPlan.ReviewWorkflowPlanStore(db);
+  const gateStore = new reviewWorkflowGate.ReviewWorkflowGateStore(db);
   const implementationStore = new reviewWorkflowImplementation.ReviewWorkflowImplementationStore(
     db,
   );
@@ -945,6 +1415,26 @@ function createRuntime(db: ReturnType<typeof openDatabase>, projectDir: string) 
       gitService,
       repository,
       roleInvocation,
+    ),
+    gateStore,
+    gateService: new reviewWorkflowGate.ReviewWorkflowGateService(
+      gateStore,
+      commandStore,
+      contractService,
+      new reviewWorkflowGit.ReviewWorkflowGitService(
+        repository,
+        createFilePatchArtifactSink(projectDir),
+      ),
+      repository,
+      roleInvocation,
+    ),
+    verificationService: new reviewWorkflowVerification.ReviewWorkflowVerificationService(
+      store.workflowStore,
+      { readHeadSha: () => repository.readHeadSha() },
+      new reviewWorkflowVerification.LocalVerificationCommandRunner(),
+      new reviewWorkflowVerification.LocalVerificationLogStore(
+        resolve(projectDir, '.codemoot', 'review-workflow', 'verification-logs'),
+      ),
     ),
     codeReviewService: new reviewWorkflowImplementation.ReviewWorkflowCodeReviewService(
       implementationStore,

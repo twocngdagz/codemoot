@@ -34,15 +34,21 @@ import {
 } from './commands/jobs.js';
 import { planGenerateCommand, planReviewCommand } from './commands/plan.js';
 import {
+  reviewWorkflowBatchAttestVerificationCommand,
   reviewWorkflowBatchCompleteImplementationCommand,
+  reviewWorkflowBatchFinalAuditCommand,
   reviewWorkflowBatchFindingsCommand,
+  reviewWorkflowBatchGateCommand,
   reviewWorkflowBatchImplementCommand,
   reviewWorkflowBatchListCommand,
+  reviewWorkflowBatchMarkMergedCommand,
+  reviewWorkflowBatchReconcileStaleCommand,
   reviewWorkflowBatchRespondCommand,
   reviewWorkflowBatchResumeImplementationCommand,
   reviewWorkflowBatchReviewCodeCommand,
   reviewWorkflowBatchReviewPlanCommand,
   reviewWorkflowBatchShowCommand,
+  reviewWorkflowBatchVerifyCommand,
   reviewWorkflowRefineCommand,
   reviewWorkflowStartCommand,
   reviewWorkflowStatusCommand,
@@ -68,6 +74,20 @@ const positiveInteger = (value: string): number => {
     throw new InvalidArgumentError('Value must be a positive integer');
   }
   return Number.parseInt(value, 10);
+};
+
+const parseAttestationMode = (value: string): 'automatic' | 'human' => {
+  if (value !== 'automatic' && value !== 'human') {
+    throw new InvalidArgumentError("Mode must be 'automatic' or 'human'");
+  }
+  return value;
+};
+
+const parseAttestationDecision = (value: string): 'accepted' | 'rejected' => {
+  if (value !== 'accepted' && value !== 'rejected') {
+    throw new InvalidArgumentError("Decision must be 'accepted' or 'rejected'");
+  }
+  return value;
 };
 
 program
@@ -328,6 +348,69 @@ reviewWorkflowBatch
   .argument('<ordinal>', 'One-based batch ordinal')
   .option('--timeout <seconds>', 'Implementer preflight timeout in seconds', positiveInteger, 300)
   .action(reviewWorkflowBatchResumeImplementationCommand);
+
+reviewWorkflowBatch
+  .command('verify')
+  .description('Execute one approved plan verification command and persist the observed record')
+  .argument('<workflow-id>', 'Review workflow ID')
+  .argument('<ordinal>', 'One-based batch ordinal')
+  .requiredOption(
+    '--command <n>',
+    'One-based index into the plan verification commands',
+    positiveInteger,
+  )
+  .option('--timeout <seconds>', 'Verification command timeout in seconds', positiveInteger, 1800)
+  .option('--tool-version <version>', 'Observed tool version recorded as evidence')
+  .action(reviewWorkflowBatchVerifyCommand);
+
+reviewWorkflowBatch
+  .command('attest-verification')
+  .description('Attest acceptance or rejection of a persisted verification record')
+  .argument('<workflow-id>', 'Review workflow ID')
+  .argument('<ordinal>', 'One-based batch ordinal')
+  .requiredOption('--record <id>', 'Verification record ID to attest')
+  .requiredOption('--mode <mode>', "Attestation mode: 'automatic' or 'human'", parseAttestationMode)
+  .requiredOption('--decision <decision>', "'accepted' or 'rejected'", parseAttestationDecision)
+  .requiredOption('--rationale <text>', 'Recorded attestation rationale')
+  .action(reviewWorkflowBatchAttestVerificationCommand);
+
+reviewWorkflowBatch
+  .command('final-audit')
+  .description('Run the single bounded final completeness audit (evidence only, no transition)')
+  .argument('<workflow-id>', 'Review workflow ID')
+  .argument('<ordinal>', 'One-based batch ordinal')
+  .option('--timeout <seconds>', 'Final-audit timeout in seconds', positiveInteger, 1800)
+  .option('--id <command-id>', 'Stable command ID; a same-ID retry replays the persisted audit')
+  .option('--expected-version <n>', 'Expected batch aggregate version', positiveInteger)
+  .action(reviewWorkflowBatchFinalAuditCommand);
+
+reviewWorkflowBatch
+  .command('gate')
+  .description('Evaluate every merge-gate condition; approve for merge only when all pass')
+  .argument('<workflow-id>', 'Review workflow ID')
+  .argument('<ordinal>', 'One-based batch ordinal')
+  .option('--id <command-id>', 'Stable command ID; a same-ID retry replays the recorded approval')
+  .option('--expected-version <n>', 'Expected batch aggregate version', positiveInteger)
+  .action(reviewWorkflowBatchGateCommand);
+
+reviewWorkflowBatch
+  .command('mark-merged')
+  .description('Record an externally performed merge (CodeMoot never executes merges)')
+  .argument('<workflow-id>', 'Review workflow ID')
+  .argument('<ordinal>', 'One-based batch ordinal')
+  .requiredOption('--merge-sha <sha>', 'Merge commit SHA from the external merge')
+  .option('--id <command-id>', 'Stable command ID; a same-ID retry replays the recorded merge')
+  .option('--expected-version <n>', 'Expected batch aggregate version', positiveInteger)
+  .action(reviewWorkflowBatchMarkMergedCommand);
+
+reviewWorkflowBatch
+  .command('reconcile-stale')
+  .description('Persist APPROVAL_STALE once an approved batch has drifted from its approved commit')
+  .argument('<workflow-id>', 'Review workflow ID')
+  .argument('<ordinal>', 'One-based batch ordinal')
+  .option('--id <command-id>', 'Stable command ID; a same-ID retry replays the reconciliation')
+  .option('--expected-version <n>', 'Expected batch aggregate version', positiveInteger)
+  .action(reviewWorkflowBatchReconcileStaleCommand);
 
 const debate = program.command('debate').description('Multi-model debate with session persistence');
 
