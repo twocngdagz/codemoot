@@ -301,6 +301,49 @@ export const REVIEW_WORKFLOW_MIGRATIONS = [
     created_at                        TEXT NOT NULL
   )`,
 
+  `CREATE TABLE IF NOT EXISTS review_workflow_handoff_transcripts (
+    transcript_id             TEXT PRIMARY KEY,
+    workflow_id               TEXT NOT NULL REFERENCES review_workflows(workflow_id),
+    batch_id                  TEXT REFERENCES review_workflow_batches(batch_id),
+    contract_kind             TEXT NOT NULL CHECK(contract_kind IN (
+      'REFINEMENT_RESULT',
+      'REVIEW_RESULT',
+      'IMPLEMENTATION_RESULT',
+      'DISPOSITION_RESULT',
+      'FINAL_AUDIT_RESULT'
+    )),
+    expected_schema_version   INTEGER NOT NULL CHECK(expected_schema_version > 0),
+    actor_execution_id        TEXT NOT NULL,
+    parse_status              TEXT NOT NULL CHECK(parse_status IN ('PARSED', 'REJECTED')),
+    raw_transcript            TEXT NOT NULL,
+    raw_transcript_hash       TEXT NOT NULL,
+    payload_json              TEXT NOT NULL,
+    record_hash               TEXT NOT NULL,
+    created_at                TEXT NOT NULL
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_review_workflow_handoffs_batch
+    ON review_workflow_handoff_transcripts(workflow_id, batch_id, created_at)`,
+  `CREATE INDEX IF NOT EXISTS idx_review_workflow_handoffs_status
+    ON review_workflow_handoff_transcripts(parse_status, created_at)`,
+
+  `CREATE TABLE IF NOT EXISTS review_workflow_structured_reviews (
+    review_round_id             TEXT PRIMARY KEY,
+    transcript_id               TEXT NOT NULL UNIQUE
+                                REFERENCES review_workflow_handoff_transcripts(transcript_id),
+    workflow_id                 TEXT NOT NULL REFERENCES review_workflows(workflow_id),
+    batch_id                    TEXT NOT NULL REFERENCES review_workflow_batches(batch_id),
+    review_round_number         INTEGER NOT NULL CHECK(review_round_number > 0),
+    review_kind                 TEXT NOT NULL CHECK(review_kind IN ('PLAN', 'CODE', 'FINAL_AUDIT')),
+    verdict                     TEXT NOT NULL CHECK(verdict IN ('APPROVED', 'NEEDS_REVISION')),
+    reviewer_actor_execution_id TEXT NOT NULL,
+    payload_json                TEXT NOT NULL,
+    record_hash                 TEXT NOT NULL,
+    created_at                  TEXT NOT NULL,
+    UNIQUE(batch_id, review_kind, review_round_number)
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_review_workflow_structured_reviews_batch
+    ON review_workflow_structured_reviews(batch_id, review_kind, review_round_number)`,
+
   `CREATE TABLE IF NOT EXISTS review_workflow_findings (
     finding_id            TEXT PRIMARY KEY,
     workflow_id           TEXT NOT NULL REFERENCES review_workflows(workflow_id),
@@ -397,6 +440,8 @@ export const REVIEW_WORKFLOW_MIGRATIONS = [
     'review_workflow_repository_audits',
     'review_workflow_implementation_ready_evidence',
     'review_workflow_implementation_commits',
+    'review_workflow_handoff_transcripts',
+    'review_workflow_structured_reviews',
     'review_workflow_verification_records',
     'review_workflow_review_range_evidence',
   ].flatMap((table) => [

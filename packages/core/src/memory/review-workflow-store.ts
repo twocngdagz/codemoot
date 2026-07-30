@@ -4,6 +4,11 @@ import { createHash } from 'node:crypto';
 import type Database from 'better-sqlite3';
 import { z } from 'zod';
 import {
+  handoffTranscriptSchema,
+  structuredReviewSchema,
+} from '../review-workflow-contracts/schemas.js';
+import type { HandoffTranscript, StructuredReview } from '../review-workflow-contracts/types.js';
+import {
   acceptanceCriterionSchema,
   actorExecutionIdentitySchema,
   agentAssignmentSchema,
@@ -57,6 +62,7 @@ export const REVIEW_WORKFLOW_PERSISTENCE_ERROR_CODES = [
   'COMMAND_STATE_CONFLICT',
   'SIDE_EFFECT_NOT_RESERVED',
   'IMMUTABLE_ENTITY_CONFLICT',
+  'HANDOFF_EVIDENCE_CONFLICT',
   'PERSISTED_DATA_INVALID',
 ] as const;
 
@@ -83,6 +89,12 @@ export interface RoleInvocationPersistenceInput {
   readonly session?: SessionIdentity;
   readonly reusedSessionIdentityId?: string;
   readonly execution: ActorExecutionIdentity;
+}
+
+export interface HandoffCapturePersistenceInput {
+  readonly transcript: HandoffTranscript;
+  readonly review?: StructuredReview;
+  readonly entities: readonly PersistableReviewWorkflowEntity[];
 }
 
 export interface ReviewWorkflowEvent {
@@ -134,6 +146,63 @@ export type PersistableReviewWorkflowEntity =
 
 export type ReviewWorkflowEntityKind = PersistableReviewWorkflowEntity['kind'];
 
+function persistableEntityId(entity: PersistableReviewWorkflowEntity): string {
+  switch (entity.kind) {
+    case 'AGENT_ASSIGNMENT':
+      return entity.value.assignmentId;
+    case 'ACTOR_EXECUTION':
+      return entity.value.actorExecutionId;
+    case 'INVOCATION_IDENTITY':
+      return entity.value.invocationId;
+    case 'SESSION_IDENTITY':
+      return entity.value.sessionIdentityId;
+    case 'GENERAL_PLAN_VERSION':
+      return entity.value.generalPlanVersionId;
+    case 'PLAN_REQUIREMENT':
+      return entity.value.requirementId;
+    case 'REPOSITORY_AUDIT':
+      return entity.value.repositoryAuditId;
+    case 'REFINED_PLAN_VERSION':
+      return entity.value.refinedPlanVersionId;
+    case 'BATCH_PLAN_VERSION':
+      return entity.value.batchPlanVersionId;
+    case 'ACCEPTANCE_CRITERION':
+      return entity.value.acceptanceCriterionId;
+    case 'IMPLEMENTATION_ATTEMPT':
+      return entity.value.implementationAttemptId;
+    case 'IMPLEMENTATION_READY_EVIDENCE':
+      return entity.value.implementationReadyEvidenceId;
+    case 'IMPLEMENTATION_COMMIT':
+      return entity.value.resultingCommitSha;
+    case 'FINDING':
+      return entity.value.findingId;
+    case 'FINDING_DISPOSITION':
+      return entity.value.dispositionId;
+    case 'VERIFICATION_RECORD':
+      return entity.value.verificationRecordId;
+    case 'VERIFICATION_ATTESTATION':
+      return entity.value.verificationAttestationId;
+    case 'REVIEW_RANGE_EVIDENCE':
+      return entity.reviewRangeEvidenceId;
+  }
+}
+
+function findingMatchesReview(finding: Finding, review: StructuredReview): boolean {
+  if (finding.repositoryContextSha !== review.target.repositoryContextSha) return false;
+  if (review.target.kind === 'PLAN') {
+    return (
+      finding.reviewedCommitSha === undefined &&
+      finding.reviewedArtifact.artifactId === review.target.planVersionId &&
+      finding.reviewedArtifact.contentHash === review.target.planContentHash
+    );
+  }
+  return (
+    finding.reviewedCommitSha === review.target.reviewedCommitSha &&
+    finding.reviewedArtifact.artifactId === review.target.reviewRangeEvidenceId &&
+    finding.reviewedArtifact.contentHash === review.target.patchHash
+  );
+}
+
 const recordHashRowSchema = z.object({ record_hash: z.string() });
 const payloadRowSchema = z.object({ payload_json: z.string() });
 const contextualPayloadRowSchema = payloadRowSchema.extend({
@@ -182,7 +251,12 @@ function parseJsonObject(serialized: string): Readonly<Record<string, unknown>> 
 function parseStoredPayload<T>(
   serialized: string,
   schema: z.ZodType<T>,
-  entityKind: ReviewWorkflowEntityKind | 'WORKFLOW' | 'BATCH',
+  entityKind:
+    | ReviewWorkflowEntityKind
+    | 'WORKFLOW'
+    | 'BATCH'
+    | 'HANDOFF_TRANSCRIPT'
+    | 'STRUCTURED_REVIEW',
 ): T {
   try {
     return schema.parse(JSON.parse(serialized));
@@ -415,6 +489,159 @@ export class ReviewWorkflowStore {
         createdAt: parsed.created_at,
       };
     });
+  }
+
+  saveHandoffCapture(input: HandoffCapturePersistenceInput): void {
+    const transcript = handoffTranscriptSchema.parse(input.transcript);
+    const review =
+      input.review === undefined ? undefined : structuredReviewSchema.parse(input.review);
+    const actualRawHash = createHash('sha256').update(transcript.rawTranscript).digest('hex');
+    if (actualRawHash !== transcript.rawTranscriptHash) {
+      throw new ReviewWorkflowPersistenceError(
+        'PERSISTED_DATA_INVALID',
+        'Handoff transcript content does not match its recorded hash',
+      );
+    }
+    const artifactIds = [
+      ...(review === undefined ? [] : [review.reviewRoundId]),
+      ...input.entities.map(persistableEntityId),
+    ].sort();
+    const recordedArtifactIds = [...transcript.parsedArtifactIds].sort();
+    const entityKinds = input.entities.map((entity) => entity.kind);
+    const findingIds = input.entities.flatMap((entity) =>
+      entity.kind === 'FINDING' ? [entity.value.findingId] : [],
+    );
+    const reviewFindingIds = review === undefined ? [] : [...review.findingIds].sort();
+    const artifactShapeMatchesContract =
+      transcript.parseStatus === 'REJECTED'
+        ? review === undefined && entityKinds.length === 0
+        : transcript.contractKind === 'REFINEMENT_RESULT'
+          ? review === undefined &&
+            entityKinds.length === 1 &&
+            entityKinds[0] === 'REFINED_PLAN_VERSION'
+          : transcript.contractKind === 'REVIEW_RESULT'
+            ? review !== undefined &&
+              (review.reviewKind === 'PLAN' || review.reviewKind === 'CODE') &&
+              entityKinds.every((kind) => kind === 'FINDING')
+            : transcript.contractKind === 'FINAL_AUDIT_RESULT'
+              ? review?.reviewKind === 'FINAL_AUDIT' &&
+                entityKinds.every((kind) => kind === 'FINDING')
+              : transcript.contractKind === 'IMPLEMENTATION_RESULT'
+                ? review === undefined &&
+                  entityKinds.length === 1 &&
+                  entityKinds[0] === 'IMPLEMENTATION_ATTEMPT'
+                : review === undefined &&
+                  entityKinds.length > 0 &&
+                  entityKinds.every((kind) => kind === 'FINDING_DISPOSITION');
+    const artifactContextMatchesTranscript =
+      transcript.parseStatus === 'REJECTED'
+        ? true
+        : transcript.contractKind === 'REFINEMENT_RESULT'
+          ? input.entities.every(
+              (entity) =>
+                entity.kind === 'REFINED_PLAN_VERSION' &&
+                entity.value.workflowId === transcript.workflowId &&
+                entity.value.actorExecutionId === transcript.actorExecutionId,
+            )
+          : transcript.contractKind === 'IMPLEMENTATION_RESULT'
+            ? input.entities.every(
+                (entity) =>
+                  entity.kind === 'IMPLEMENTATION_ATTEMPT' &&
+                  entity.value.workflowId === transcript.workflowId &&
+                  entity.value.batchId === transcript.batchId &&
+                  entity.value.implementerActorExecutionId === transcript.actorExecutionId,
+              )
+            : transcript.contractKind === 'DISPOSITION_RESULT'
+              ? input.entities.every(
+                  (entity) =>
+                    entity.kind === 'FINDING_DISPOSITION' &&
+                    entity.value.actorExecutionId === transcript.actorExecutionId,
+                )
+              : review !== undefined &&
+                review.reviewerActorExecutionId === transcript.actorExecutionId &&
+                JSON.stringify(reviewFindingIds) === JSON.stringify(findingIds.sort()) &&
+                input.entities.every(
+                  (entity) =>
+                    entity.kind === 'FINDING' &&
+                    entity.value.workflowId === transcript.workflowId &&
+                    entity.value.batchId === transcript.batchId &&
+                    entity.value.reviewRoundId === review.reviewRoundId &&
+                    entity.value.reviewRoundNumber === review.reviewRoundNumber &&
+                    entity.value.reviewKind === review.reviewKind &&
+                    entity.value.reviewerActorExecutionId === transcript.actorExecutionId &&
+                    findingMatchesReview(entity.value, review),
+                );
+    if (
+      (transcript.parseStatus === 'REJECTED' && artifactIds.length > 0) ||
+      (transcript.parseStatus === 'PARSED' &&
+        JSON.stringify(recordedArtifactIds) !== JSON.stringify(artifactIds)) ||
+      !artifactShapeMatchesContract ||
+      !artifactContextMatchesTranscript ||
+      (transcript.contractKind !== 'REFINEMENT_RESULT' && transcript.batchId === undefined)
+    ) {
+      throw new ReviewWorkflowPersistenceError(
+        'PERSISTED_DATA_INVALID',
+        'Handoff contract does not match its captured artifacts',
+      );
+    }
+    if (
+      review !== undefined &&
+      (review.transcriptId !== transcript.transcriptId ||
+        review.workflowId !== transcript.workflowId ||
+        review.batchId !== transcript.batchId)
+    ) {
+      throw new ReviewWorkflowPersistenceError(
+        'PERSISTED_DATA_INVALID',
+        'Structured review context does not match its handoff transcript',
+      );
+    }
+
+    this.db.transaction(() => {
+      if (
+        transcript.contractKind === 'DISPOSITION_RESULT' &&
+        !this.dispositionFindingsMatchTranscript(input.entities, transcript)
+      ) {
+        throw new ReviewWorkflowPersistenceError(
+          'HANDOFF_EVIDENCE_CONFLICT',
+          'Disposition findings do not belong to the captured workflow and batch',
+        );
+      }
+      this.saveHandoffTranscript(transcript);
+      if (review !== undefined) this.saveStructuredReview(review);
+      for (const entity of input.entities) this.saveEntity(entity);
+    })();
+  }
+
+  getHandoffTranscript(transcriptId: string): HandoffTranscript | null {
+    const row = this.db
+      .prepare(
+        `SELECT payload_json
+         FROM review_workflow_handoff_transcripts
+         WHERE transcript_id = ?`,
+      )
+      .get(transcriptId);
+    if (row === undefined) return null;
+    return parseStoredPayload(
+      payloadRowSchema.parse(row).payload_json,
+      handoffTranscriptSchema,
+      'HANDOFF_TRANSCRIPT',
+    );
+  }
+
+  getStructuredReview(reviewRoundId: string): StructuredReview | null {
+    const row = this.db
+      .prepare(
+        `SELECT payload_json
+         FROM review_workflow_structured_reviews
+         WHERE review_round_id = ?`,
+      )
+      .get(reviewRoundId);
+    if (row === undefined) return null;
+    return parseStoredPayload(
+      payloadRowSchema.parse(row).payload_json,
+      structuredReviewSchema,
+      'STRUCTURED_REVIEW',
+    );
   }
 
   saveEntity(entity: PersistableReviewWorkflowEntity): ImmutableSaveResult {
@@ -1042,6 +1269,98 @@ export class ReviewWorkflowStore {
         };
       }
     }
+  }
+
+  private saveHandoffTranscript(transcript: HandoffTranscript): ImmutableSaveResult {
+    return this.saveRecord({
+      table: 'review_workflow_handoff_transcripts',
+      idColumn: 'transcript_id',
+      id: transcript.transcriptId,
+      hashInput: { kind: 'HANDOFF_TRANSCRIPT', value: transcript },
+      insertSql: `INSERT INTO review_workflow_handoff_transcripts (
+        transcript_id,
+        workflow_id,
+        batch_id,
+        contract_kind,
+        expected_schema_version,
+        actor_execution_id,
+        parse_status,
+        raw_transcript,
+        raw_transcript_hash,
+        payload_json,
+        record_hash,
+        created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      values: [
+        transcript.transcriptId,
+        transcript.workflowId,
+        transcript.batchId ?? null,
+        transcript.contractKind,
+        transcript.expectedSchemaVersion,
+        transcript.actorExecutionId,
+        transcript.parseStatus,
+        transcript.rawTranscript,
+        transcript.rawTranscriptHash,
+      ],
+      payload: transcript,
+      createdAt: transcript.createdAt,
+    });
+  }
+
+  private dispositionFindingsMatchTranscript(
+    entities: readonly PersistableReviewWorkflowEntity[],
+    transcript: HandoffTranscript,
+  ): boolean {
+    return entities.every((entity) => {
+      if (entity.kind !== 'FINDING_DISPOSITION') return false;
+      const row = this.db
+        .prepare(
+          `SELECT workflow_id, batch_id
+           FROM review_workflow_findings
+           WHERE finding_id = ?`,
+        )
+        .get(entity.value.findingId);
+      const parsed = z.object({ workflow_id: z.string(), batch_id: z.string() }).safeParse(row);
+      return (
+        parsed.success &&
+        parsed.data.workflow_id === transcript.workflowId &&
+        parsed.data.batch_id === transcript.batchId
+      );
+    });
+  }
+
+  private saveStructuredReview(review: StructuredReview): ImmutableSaveResult {
+    return this.saveRecord({
+      table: 'review_workflow_structured_reviews',
+      idColumn: 'review_round_id',
+      id: review.reviewRoundId,
+      hashInput: { kind: 'STRUCTURED_REVIEW', value: review },
+      insertSql: `INSERT INTO review_workflow_structured_reviews (
+        review_round_id,
+        transcript_id,
+        workflow_id,
+        batch_id,
+        review_round_number,
+        review_kind,
+        verdict,
+        reviewer_actor_execution_id,
+        payload_json,
+        record_hash,
+        created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      values: [
+        review.reviewRoundId,
+        review.transcriptId,
+        review.workflowId,
+        review.batchId,
+        review.reviewRoundNumber,
+        review.reviewKind,
+        review.verdict,
+        review.reviewerActorExecutionId,
+      ],
+      payload: review,
+      createdAt: review.createdAt,
+    });
   }
 
   private savePlanDocument(

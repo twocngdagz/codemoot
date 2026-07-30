@@ -22,6 +22,7 @@ export {
   ReviewWorkflowStore,
 } from './review-workflow-store.js';
 export type {
+  HandoffCapturePersistenceInput,
   ImmutableSaveResult,
   PersistableReviewWorkflowEntity,
   RoleInvocationPersistenceInput,

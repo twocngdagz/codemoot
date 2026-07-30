@@ -223,7 +223,7 @@ export const reviewWorkflowBatchSchema = z
 
 export const evidenceReferenceSchema = z
   .object({
-    kind: z.enum(['FILE', 'DIFF', 'COMMAND', 'PLAN', 'LOG', 'OTHER']),
+    kind: z.enum(['FILE', 'DIFF', 'COMMAND', 'PLAN', 'LOG', 'BROWSER', 'OTHER']),
     location: z.string().min(1),
     description: z.string().min(1),
     contentHash: contentHashSchema.optional(),

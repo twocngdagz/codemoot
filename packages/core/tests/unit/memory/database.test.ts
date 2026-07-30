@@ -22,6 +22,8 @@ describe('openDatabase', () => {
     expect(names).toContain('review_workflow_command_receipts');
     expect(names).toContain('review_workflow_command_side_effects');
     expect(names).toContain('review_workflow_events');
+    expect(names).toContain('review_workflow_handoff_transcripts');
+    expect(names).toContain('review_workflow_structured_reviews');
     expect(names).toContain('review_workflow_verification_attestations');
     db.close();
   });
@@ -68,7 +70,7 @@ describe('openDatabase', () => {
   it('sets schema version', () => {
     const db = openDatabase(':memory:');
     const version = getSchemaVersion(db);
-    expect(version).toBe('9');
+    expect(version).toBe('10');
     db.close();
   });
 
@@ -77,11 +79,11 @@ describe('openDatabase', () => {
     // Run migrations again -- should be idempotent
     runMigrations(db);
     const version = getSchemaVersion(db);
-    expect(version).toBe('9');
+    expect(version).toBe('10');
     db.close();
   });
 
-  it('upgrades a v8 database additively without changing legacy rows', () => {
+  it('upgrades a v9 database additively without changing legacy rows', () => {
     const db = new Database(':memory:');
     db.pragma('foreign_keys = ON');
     db.exec(`
@@ -89,7 +91,7 @@ describe('openDatabase', () => {
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL
       );
-      INSERT INTO schema_meta(key, value) VALUES ('version', '8');
+      INSERT INTO schema_meta(key, value) VALUES ('version', '9');
       CREATE TABLE legacy_sentinel (
         id TEXT PRIMARY KEY,
         value TEXT NOT NULL
@@ -99,7 +101,7 @@ describe('openDatabase', () => {
 
     runMigrations(db);
 
-    expect(getSchemaVersion(db)).toBe('9');
+    expect(getSchemaVersion(db)).toBe('10');
     expect(
       db.prepare('SELECT value FROM legacy_sentinel WHERE id = ?').pluck().get('legacy-1'),
     ).toBe('preserve-me');
@@ -111,6 +113,20 @@ describe('openDatabase', () => {
         .pluck()
         .get(),
     ).toBeGreaterThan(0);
+    expect(
+      db
+        .prepare(
+          `SELECT COUNT(*)
+           FROM sqlite_master
+           WHERE type = 'table'
+             AND name IN (
+               'review_workflow_handoff_transcripts',
+               'review_workflow_structured_reviews'
+             )`,
+        )
+        .pluck()
+        .get(),
+    ).toBe(2);
     db.close();
   });
 });
