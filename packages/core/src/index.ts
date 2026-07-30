@@ -197,7 +197,17 @@ export {
   hashConfig,
   reviewWorkflowPersistence,
 } from './memory/index.js';
-export type { CostSummary, DebateTurnRow, DebateTurnStatus, DebateMessageRow, MessageStatus, ParsedVerdict, UnifiedSession, SessionEvent, CacheEntry } from './memory/index.js';
+export type {
+  CostSummary,
+  DebateTurnRow,
+  DebateTurnStatus,
+  DebateMessageRow,
+  MessageStatus,
+  ParsedVerdict,
+  UnifiedSession,
+  SessionEvent,
+  CacheEntry,
+} from './memory/index.js';
 
 // Model Abstraction (CLI-only)
 export {
@@ -260,6 +270,7 @@ export {
   renderPrompt,
 } from './roles/index.js';
 export type {
+  PreparedRoleInvocation,
   PromptType,
   PromptVariables,
   ResolvedRoleAdapter,
@@ -352,3 +363,4 @@ export * as reviewWorkflowGit from './review-workflow-git/index.js';
 export * as reviewWorkflowIdentity from './review-workflow-identity/index.js';
 export * as reviewWorkflowBaseline from './review-workflow-baseline/index.js';
 export * as reviewWorkflowVerification from './review-workflow-verification/index.js';
+export * as reviewWorkflowPlan from './review-workflow-plan/index.js';

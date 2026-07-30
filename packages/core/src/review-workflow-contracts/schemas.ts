@@ -8,8 +8,10 @@ import {
   gitShaSchema,
   isoTimestampSchema,
   requirementCoverageSchema,
+  verificationCommandSpecSchema,
 } from '../review-workflow/schemas.js';
 import {
+  ACCEPTANCE_CRITERION_KINDS,
   DISPOSITION_KINDS,
   FINDING_CATEGORIES,
   FINDING_SEVERITIES,
@@ -31,6 +33,129 @@ export const REVIEW_WORKFLOW_REVIEW_VERDICTS = ['APPROVED', 'NEEDS_REVISION'] as
 const idSchema = z.string().min(1);
 const uniqueStrings = (values: readonly string[]): boolean =>
   new Set(values).size === values.length;
+
+export const acceptanceCriterionDraftSchema = z
+  .object({
+    acceptanceCriterionId: idSchema,
+    kind: z.enum(ACCEPTANCE_CRITERION_KINDS),
+    statement: z.string().min(1),
+    required: z.boolean(),
+    passCondition: z.string().min(1),
+    sourceRequirementIds: z.array(idSchema).min(1),
+  })
+  .strict()
+  .superRefine((value, context) => {
+    if (!uniqueStrings(value.sourceRequirementIds)) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['sourceRequirementIds'],
+        message: 'Source requirement IDs must be unique',
+      });
+    }
+  });
+
+export const batchPlanDraftSchema = z
+  .object({
+    batchPlanVersionId: idSchema,
+    batchId: idSchema,
+    ordinal: z.number().int().positive(),
+    objective: z.string().min(1),
+    currentRepositoryEvidence: z.array(evidenceReferenceSchema).min(1),
+    dependencies: z.array(idSchema),
+    candidateFiles: z.array(z.string().min(1)),
+    technicalImplementation: z.array(z.string().min(1)).min(1),
+    userJourney: z.array(z.string().min(1)).min(1),
+    expectedBehaviour: z.array(z.string().min(1)).min(1),
+    acceptanceCriteria: z.array(acceptanceCriterionDraftSchema).min(1),
+    technicalAcceptanceCriteria: z.array(idSchema),
+    userFacingAcceptanceCriteria: z.array(idSchema),
+    cliAcceptanceCriteria: z.array(idSchema),
+    browserAcceptanceCriteria: z.discriminatedUnion('applicability', [
+      z
+        .object({
+          applicability: z.literal('APPLICABLE'),
+          criterionIds: z.array(idSchema).min(1),
+        })
+        .strict(),
+      z
+        .object({
+          applicability: z.literal('NOT_APPLICABLE'),
+          reason: z.string().min(1),
+        })
+        .strict(),
+    ]),
+    verificationCommands: z.array(verificationCommandSpecSchema),
+    manualVerification: z.array(z.string().min(1)),
+    documentationChanges: z.array(z.string().min(1)),
+    outOfScope: z.array(z.string().min(1)),
+    rollbackBoundary: z.string().min(1),
+  })
+  .strict()
+  .superRefine((value, context) => {
+    const criterionIds = value.acceptanceCriteria.map(
+      (criterion) => criterion.acceptanceCriterionId,
+    );
+    if (!uniqueStrings(criterionIds)) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['acceptanceCriteria'],
+        message: 'Acceptance criterion IDs must be unique within a batch plan',
+      });
+    }
+    const declaredIds = new Set(criterionIds);
+    const categorizedIds = [
+      ...value.technicalAcceptanceCriteria,
+      ...value.userFacingAcceptanceCriteria,
+      ...value.cliAcceptanceCriteria,
+      ...(value.browserAcceptanceCriteria.applicability === 'APPLICABLE'
+        ? value.browserAcceptanceCriteria.criterionIds
+        : []),
+    ];
+    if (
+      !uniqueStrings(categorizedIds) ||
+      categorizedIds.some((criterionId) => !declaredIds.has(criterionId))
+    ) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['acceptanceCriteria'],
+        message: 'Categorized acceptance criterion IDs must be unique and declared by the batch',
+      });
+    }
+    for (const criterion of value.acceptanceCriteria) {
+      const category =
+        criterion.kind === 'TECHNICAL'
+          ? value.technicalAcceptanceCriteria
+          : criterion.kind === 'USER_FACING'
+            ? value.userFacingAcceptanceCriteria
+            : criterion.kind === 'CLI'
+              ? value.cliAcceptanceCriteria
+              : criterion.kind === 'BROWSER' &&
+                  value.browserAcceptanceCriteria.applicability === 'APPLICABLE'
+                ? value.browserAcceptanceCriteria.criterionIds
+                : [];
+      if (
+        ['TECHNICAL', 'USER_FACING', 'CLI', 'BROWSER'].includes(criterion.kind) &&
+        !category.includes(criterion.acceptanceCriterionId)
+      ) {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['acceptanceCriteria'],
+          message: `Criterion ${criterion.acceptanceCriterionId} is missing from its kind-specific list`,
+        });
+      }
+    }
+    if (
+      value.verificationCommands.some((command) =>
+        command.relatedCriterionIds.some((criterionId) => !declaredIds.has(criterionId)),
+      )
+    ) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['verificationCommands'],
+        message: 'Verification commands may reference only criteria declared by this batch',
+      });
+    }
+  });
 
 export const planReviewTargetSchema = z
   .object({
@@ -155,6 +280,7 @@ export const refinementResultContractSchema = z
     refinedPlanContent: z.string().min(1),
     batchPlanVersionIds: z.array(idSchema).min(1),
     requirementCoverage: z.array(requirementCoverageSchema),
+    batchPlans: z.array(batchPlanDraftSchema).optional(),
   })
   .strict()
   .superRefine((value, context) => {
@@ -195,6 +321,50 @@ export const refinementResultContractSchema = z
         });
       }
     });
+    if (value.batchPlans !== undefined) {
+      const draftPlanIds = value.batchPlans.map((plan) => plan.batchPlanVersionId);
+      const draftBatchIds = value.batchPlans.map((plan) => plan.batchId);
+      const ordinals = value.batchPlans.map((plan) => plan.ordinal);
+      if (
+        !uniqueStrings(draftPlanIds) ||
+        !uniqueStrings(draftBatchIds) ||
+        new Set(ordinals).size !== ordinals.length ||
+        ordinals.some((ordinal, index) => ordinal !== index + 1) ||
+        JSON.stringify([...draftPlanIds].sort()) !==
+          JSON.stringify([...value.batchPlanVersionIds].sort())
+      ) {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['batchPlans'],
+          message:
+            'Batch plan drafts must be unique, sequentially ordered, and match batchPlanVersionIds',
+        });
+      }
+      const allCriterionIds = value.batchPlans.flatMap((plan) =>
+        plan.acceptanceCriteria.map((criterion) => criterion.acceptanceCriterionId),
+      );
+      if (!uniqueStrings(allCriterionIds)) {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['batchPlans'],
+          message: 'Acceptance criterion IDs must be unique across the refined plan',
+        });
+      }
+      const planIdSet = new Set(draftPlanIds);
+      const criterionIdSet = new Set(allCriterionIds);
+      value.requirementCoverage.forEach((coverage, index) => {
+        if (
+          coverage.batchPlanVersionIds.some((id) => !planIdSet.has(id)) ||
+          coverage.acceptanceCriterionIds.some((id) => !criterionIdSet.has(id))
+        ) {
+          context.addIssue({
+            code: z.ZodIssueCode.custom,
+            path: ['requirementCoverage', index],
+            message: 'Requirement coverage must reference materialized plans and criteria',
+          });
+        }
+      });
+    }
   });
 
 export const reviewResultContractSchema = z

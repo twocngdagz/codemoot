@@ -9,6 +9,8 @@ import {
   buildStartCommand,
   buildStatusCommand,
 } from './commands/build.js';
+import { cleanupCommand } from './commands/cleanup.js';
+import { costCommand } from './commands/cost.js';
 import {
   debateCompleteCommand,
   debateHistoryCommand,
@@ -18,36 +20,49 @@ import {
   debateStatusCommand,
   debateTurnCommand,
 } from './commands/debate.js';
-import { cleanupCommand } from './commands/cleanup.js';
-import { costCommand } from './commands/cost.js';
 import { doctorCommand } from './commands/doctor.js';
 import { eventsCommand } from './commands/events.js';
 import { fixCommand } from './commands/fix.js';
 import { initCommand } from './commands/init.js';
 import { installSkillsCommand } from './commands/install-skills.js';
 import {
-  sessionStartCommand,
-  sessionCurrentCommand,
-  sessionListCommand,
-  sessionStatusCommand,
-  sessionCloseCommand,
-} from './commands/session.js';
-import {
+  jobsCancelCommand,
   jobsListCommand,
   jobsLogsCommand,
-  jobsCancelCommand,
   jobsRetryCommand,
   jobsStatusCommand,
 } from './commands/jobs.js';
 import { planGenerateCommand, planReviewCommand } from './commands/plan.js';
+import {
+  reviewWorkflowBatchListCommand,
+  reviewWorkflowBatchReviewPlanCommand,
+  reviewWorkflowBatchShowCommand,
+  reviewWorkflowRefineCommand,
+  reviewWorkflowStartCommand,
+  reviewWorkflowStatusCommand,
+} from './commands/review-workflow.js';
 import { reviewCommand } from './commands/review.js';
 import { runCommand } from './commands/run.js';
+import {
+  sessionCloseCommand,
+  sessionCurrentCommand,
+  sessionListCommand,
+  sessionStartCommand,
+  sessionStatusCommand,
+} from './commands/session.js';
 import { shipitCommand } from './commands/shipit.js';
 import { startCommand } from './commands/start.js';
 import { watchCommand } from './commands/watch.js';
 import { workerCommand } from './commands/worker.js';
 
 const program = new Command();
+
+const positiveInteger = (value: string): number => {
+  if (!/^[1-9]\d*$/.test(value)) {
+    throw new InvalidArgumentError('Value must be a positive integer');
+  }
+  return Number.parseInt(value, 10);
+};
 
 program
   .name('codemoot')
@@ -84,7 +99,12 @@ program
   .description('Run a task through the full workflow')
   .argument('<task>', 'Task description (natural language)')
   .option('--mode <mode>', 'Execution mode (autonomous|interactive)', 'autonomous')
-  .option('--max-iterations <n>', 'Max review loop iterations', (v: string) => Number.parseInt(v, 10), 3)
+  .option(
+    '--max-iterations <n>',
+    'Max review loop iterations',
+    (v: string) => Number.parseInt(v, 10),
+    3,
+  )
   .option('--no-stream', 'Disable streaming output')
   .action(runCommand);
 
@@ -95,34 +115,75 @@ program
   .option('--prompt <instruction>', 'Freeform prompt — codex explores codebase via tools')
   .option('--stdin', 'Read prompt from stdin')
   .option('--diff <revspec>', 'Review a git diff (e.g., HEAD~3..HEAD, origin/main...HEAD)')
-  .option('--scope <glob>', 'Restrict codex exploration to matching files (only with --prompt/--stdin)')
-  .addOption(new Option('--focus <area>', 'Focus area').choices(['security', 'performance', 'bugs', 'all']).default('all'))
-  .option('--preset <name>', 'Use named preset (security-audit|performance|quick-scan|pre-commit|api-review)')
+  .option(
+    '--scope <glob>',
+    'Restrict codex exploration to matching files (only with --prompt/--stdin)',
+  )
+  .addOption(
+    new Option('--focus <area>', 'Focus area')
+      .choices(['security', 'performance', 'bugs', 'all'])
+      .default('all'),
+  )
+  .option(
+    '--preset <name>',
+    'Use named preset (security-audit|performance|quick-scan|pre-commit|api-review)',
+  )
   .option('--session <id>', 'Use specific session (default: active session)')
   .option('--background', 'Enqueue review and return immediately')
-  .option('--timeout <seconds>', 'Timeout in seconds', (v: string) => {
-    if (!/^\d+$/.test(v)) throw new InvalidArgumentError('Timeout must be a positive integer');
-    const n = Number.parseInt(v, 10);
-    if (n <= 0) throw new InvalidArgumentError('Timeout must be a positive integer');
-    return n;
-  }, 600)
+  .option(
+    '--timeout <seconds>',
+    'Timeout in seconds',
+    (v: string) => {
+      if (!/^\d+$/.test(v)) throw new InvalidArgumentError('Timeout must be a positive integer');
+      const n = Number.parseInt(v, 10);
+      if (n <= 0) throw new InvalidArgumentError('Timeout must be a positive integer');
+      return n;
+    },
+    600,
+  )
   .action(reviewCommand);
 
 program
   .command('cleanup')
-  .description('Scan codebase for AI slop: security vulns, anti-patterns, near-duplicates, dead code, and more')
+  .description(
+    'Scan codebase for AI slop: security vulns, anti-patterns, near-duplicates, dead code, and more',
+  )
   .argument('[path]', 'Project path to scan', '.')
-  .addOption(new Option('--scope <scope>', 'What to scan for').choices(['deps', 'unused-exports', 'hardcoded', 'duplicates', 'deadcode', 'security', 'near-duplicates', 'anti-patterns', 'all']).default('all'))
-  .option('--timeout <seconds>', 'Codex scan timeout in seconds', (v: string) => {
-    if (!/^\d+$/.test(v)) throw new InvalidArgumentError('Timeout must be a positive integer');
-    const n = Number.parseInt(v, 10);
-    if (n <= 0) throw new InvalidArgumentError('Timeout must be a positive integer');
-    return n;
-  }, CLEANUP_TIMEOUT_SEC)
-  .option('--max-disputes <n>', 'Max findings to adjudicate', (v: string) => {
-    if (!/^\d+$/.test(v)) throw new InvalidArgumentError('Must be a non-negative integer');
-    return Number.parseInt(v, 10);
-  }, 10)
+  .addOption(
+    new Option('--scope <scope>', 'What to scan for')
+      .choices([
+        'deps',
+        'unused-exports',
+        'hardcoded',
+        'duplicates',
+        'deadcode',
+        'security',
+        'near-duplicates',
+        'anti-patterns',
+        'all',
+      ])
+      .default('all'),
+  )
+  .option(
+    '--timeout <seconds>',
+    'Codex scan timeout in seconds',
+    (v: string) => {
+      if (!/^\d+$/.test(v)) throw new InvalidArgumentError('Timeout must be a positive integer');
+      const n = Number.parseInt(v, 10);
+      if (n <= 0) throw new InvalidArgumentError('Timeout must be a positive integer');
+      return n;
+    },
+    CLEANUP_TIMEOUT_SEC,
+  )
+  .option(
+    '--max-disputes <n>',
+    'Max findings to adjudicate',
+    (v: string) => {
+      if (!/^\d+$/.test(v)) throw new InvalidArgumentError('Must be a non-negative integer');
+      return Number.parseInt(v, 10);
+    },
+    10,
+  )
   .option('--host-findings <path>', 'JSON file with host AI findings for 3-way merge')
   .option('--output <path>', 'Write findings report to JSON file')
   .option('--background', 'Enqueue cleanup and return immediately')
@@ -152,9 +213,59 @@ plan
   .option('--output <file>', 'Save review result to file')
   .action(planReviewCommand);
 
-const debate = program
-  .command('debate')
-  .description('Multi-model debate with session persistence');
+const reviewWorkflow = program
+  .command('workflow')
+  .description('Review-gated workflow plan intake, refinement, and status');
+
+reviewWorkflow
+  .command('start')
+  .description('Import an external plan and capture a fresh repository audit')
+  .requiredOption('--plan <file>', 'External Markdown plan file')
+  .option('--id <workflow-id>', 'Explicit workflow ID')
+  .action((options: { readonly plan: string; readonly id?: string }) =>
+    reviewWorkflowStartCommand(options.plan, options),
+  );
+
+reviewWorkflow
+  .command('status')
+  .description('Show a review-gated workflow and all batch states')
+  .argument('<workflow-id>', 'Review workflow ID')
+  .action(reviewWorkflowStatusCommand);
+
+reviewWorkflow
+  .command('refine')
+  .description('Audit and refine the imported plan into complete batch plans')
+  .argument('<workflow-id>', 'Review workflow ID')
+  .option('--timeout <seconds>', 'Plan-refiner timeout in seconds', positiveInteger, 900)
+  .action(reviewWorkflowRefineCommand);
+
+const reviewWorkflowBatch = program
+  .command('batch')
+  .description('Inspect and review review-gated batch plans');
+
+reviewWorkflowBatch
+  .command('list')
+  .description('List batches in one review-gated workflow')
+  .argument('<workflow-id>', 'Review workflow ID')
+  .action(reviewWorkflowBatchListCommand);
+
+reviewWorkflowBatch
+  .command('show')
+  .description('Show one materialized batch plan and its acceptance criteria')
+  .argument('<workflow-id>', 'Review workflow ID')
+  .argument('<ordinal>', 'One-based batch ordinal')
+  .action(reviewWorkflowBatchShowCommand);
+
+reviewWorkflowBatch
+  .command('review-plan')
+  .description('Run an independent structured review of one batch plan')
+  .argument('<workflow-id>', 'Review workflow ID')
+  .argument('<ordinal>', 'One-based batch ordinal')
+  .option('--round <number>', 'Plan-review round number', positiveInteger, 1)
+  .option('--timeout <seconds>', 'Plan-review timeout in seconds', positiveInteger, 900)
+  .action(reviewWorkflowBatchReviewPlanCommand);
+
+const debate = program.command('debate').description('Multi-model debate with session persistence');
 
 debate
   .command('start')
@@ -179,7 +290,11 @@ debate
   .option('--output <file>', 'Write full untruncated response to file')
   .option('--force', 'Continue past token budget limit', false)
   .option('--quiet', 'Suppress non-error stderr output', false)
-  .option('--response-cap <bytes>', 'Max response bytes in JSON output (default: 16384)', (v: string) => Number.parseInt(v, 10))
+  .option(
+    '--response-cap <bytes>',
+    'Max response bytes in JSON output (default: 16384)',
+    (v: string) => Number.parseInt(v, 10),
+  )
   .action(debateTurnCommand);
 
 debate
@@ -190,7 +305,11 @@ debate
   .option('--output <file>', 'Write full untruncated response to file')
   .option('--force', 'Continue past token budget limit', false)
   .option('--quiet', 'Suppress non-error stderr output', false)
-  .option('--response-cap <bytes>', 'Max response bytes in JSON output (default: 16384)', (v: string) => Number.parseInt(v, 10))
+  .option(
+    '--response-cap <bytes>',
+    'Max response bytes in JSON output (default: 16384)',
+    (v: string) => Number.parseInt(v, 10),
+  )
   .action(debateNextCommand);
 
 debate
@@ -269,10 +388,7 @@ session
   .option('--name <name>', 'Session name')
   .action(sessionStartCommand);
 
-session
-  .command('current')
-  .description('Show the active session')
-  .action(sessionCurrentCommand);
+session.command('current').description('Show the active session').action(sessionCurrentCommand);
 
 session
   .command('list')
@@ -317,7 +433,12 @@ jobs
   .command('logs')
   .description('Show job logs')
   .argument('<job-id>', 'Job ID')
-  .option('--from-seq <n>', 'Start from log sequence number', (v: string) => Number.parseInt(v, 10), 0)
+  .option(
+    '--from-seq <n>',
+    'Start from log sequence number',
+    (v: string) => Number.parseInt(v, 10),
+    0,
+  )
   .option('--limit <n>', 'Max log entries', (v: string) => Number.parseInt(v, 10), 100)
   .action(jobsLogsCommand);
 
@@ -340,7 +461,11 @@ program
   .description('Autofix loop: review code, apply fixes, re-review until approved')
   .argument('<file-or-glob>', 'File path or glob pattern to fix')
   .option('--max-rounds <n>', 'Max review-fix rounds', (v: string) => Number.parseInt(v, 10), 3)
-  .addOption(new Option('--focus <area>', 'Focus area').choices(['security', 'performance', 'bugs', 'all']).default('bugs'))
+  .addOption(
+    new Option('--focus <area>', 'Focus area')
+      .choices(['security', 'performance', 'bugs', 'all'])
+      .default('bugs'),
+  )
   .option('--timeout <seconds>', 'Timeout per round', (v: string) => Number.parseInt(v, 10), 600)
   .option('--dry-run', 'Review only, do not apply fixes', false)
   .option('--no-stage', 'Do not git-stage applied fixes')
@@ -353,7 +478,11 @@ program
 program
   .command('shipit')
   .description('Run composite workflow: lint → test → review → cleanup → commit')
-  .addOption(new Option('--profile <profile>', 'Workflow profile').choices(['fast', 'safe', 'full']).default('safe'))
+  .addOption(
+    new Option('--profile <profile>', 'Workflow profile')
+      .choices(['fast', 'safe', 'full'])
+      .default('safe'),
+  )
   .option('--dry-run', 'Print planned steps without executing', false)
   .option('--no-commit', 'Run checks but skip commit step')
   .option('--json', 'Machine-readable JSON output', false)
@@ -365,7 +494,11 @@ program
 program
   .command('cost')
   .description('Token usage and cost dashboard')
-  .addOption(new Option('--scope <scope>', 'Time scope').choices(['session', 'daily', 'all']).default('daily'))
+  .addOption(
+    new Option('--scope <scope>', 'Time scope')
+      .choices(['session', 'daily', 'all'])
+      .default('daily'),
+  )
   .option('--days <n>', 'Number of days for daily scope', (v: string) => Number.parseInt(v, 10), 30)
   .option('--session <id>', 'Session ID for session scope')
   .action(costCommand);
@@ -376,10 +509,24 @@ program
   .command('watch')
   .description('Watch files and enqueue reviews on change')
   .option('--glob <pattern>', 'Glob pattern to watch', '**/*.{ts,tsx,js,jsx}')
-  .addOption(new Option('--focus <area>', 'Focus area').choices(['security', 'performance', 'bugs', 'all']).default('all'))
+  .addOption(
+    new Option('--focus <area>', 'Focus area')
+      .choices(['security', 'performance', 'bugs', 'all'])
+      .default('all'),
+  )
   .option('--timeout <seconds>', 'Review timeout', (v: string) => Number.parseInt(v, 10), 600)
-  .option('--quiet-ms <ms>', 'Quiet period before flush', (v: string) => Number.parseInt(v, 10), 800)
-  .option('--max-wait-ms <ms>', 'Max wait before forced flush', (v: string) => Number.parseInt(v, 10), 5000)
+  .option(
+    '--quiet-ms <ms>',
+    'Quiet period before flush',
+    (v: string) => Number.parseInt(v, 10),
+    800,
+  )
+  .option(
+    '--max-wait-ms <ms>',
+    'Max wait before forced flush',
+    (v: string) => Number.parseInt(v, 10),
+    5000,
+  )
   .option('--cooldown-ms <ms>', 'Cooldown after flush', (v: string) => Number.parseInt(v, 10), 1500)
   .action(watchCommand);
 
@@ -391,7 +538,11 @@ program
   .option('--follow', 'Follow mode — poll for new events', false)
   .option('--since-seq <n>', 'Start from sequence number', (v: string) => Number.parseInt(v, 10), 0)
   .option('--limit <n>', 'Max events per poll', (v: string) => Number.parseInt(v, 10), 100)
-  .addOption(new Option('--type <type>', 'Event source filter').choices(['all', 'sessions', 'jobs']).default('all'))
+  .addOption(
+    new Option('--type <type>', 'Event source filter')
+      .choices(['all', 'sessions', 'jobs'])
+      .default('all'),
+  )
   .action(eventsCommand);
 
 // ── Worker (background job processor) ──
@@ -400,7 +551,12 @@ jobs
   .command('worker')
   .description('Start background job worker (processes queued jobs)')
   .option('--once', 'Process one job and exit', false)
-  .option('--poll-ms <ms>', 'Poll interval in milliseconds', (v: string) => Number.parseInt(v, 10), 2000)
+  .option(
+    '--poll-ms <ms>',
+    'Poll interval in milliseconds',
+    (v: string) => Number.parseInt(v, 10),
+    2000,
+  )
   .option('--worker-id <id>', 'Worker identifier', `w-${Date.now()}`)
   .action(workerCommand);
 

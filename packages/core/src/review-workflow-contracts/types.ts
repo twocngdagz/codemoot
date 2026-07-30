@@ -20,6 +20,10 @@ export type CodeReviewTarget = DeepReadonly<z.infer<typeof schemas.codeReviewTar
 export type FinalAuditTarget = DeepReadonly<z.infer<typeof schemas.finalAuditTargetSchema>>;
 export type ReviewContractTarget = DeepReadonly<z.infer<typeof schemas.reviewContractTargetSchema>>;
 export type FindingDraft = DeepReadonly<z.infer<typeof schemas.findingDraftSchema>>;
+export type AcceptanceCriterionDraft = DeepReadonly<
+  z.infer<typeof schemas.acceptanceCriterionDraftSchema>
+>;
+export type BatchPlanDraft = DeepReadonly<z.infer<typeof schemas.batchPlanDraftSchema>>;
 export type RefinementResultContract = DeepReadonly<
   z.infer<typeof schemas.refinementResultContractSchema>
 >;

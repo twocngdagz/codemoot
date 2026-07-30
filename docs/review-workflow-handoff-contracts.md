@@ -46,6 +46,16 @@ derived artifacts and authorize no workflow transition.
 The service computes the refined-plan content hash. Every expected requirement must appear once,
 and coverage cannot reference an undeclared batch-plan version.
 
+The plan-lifecycle service additionally requires `batchPlans`. Each draft supplies its batch ID,
+ordinal, repository evidence, dependencies, candidate files, technical steps, user journey,
+expected behaviour, complete acceptance-criterion drafts, verification commands, manual and
+documentation checks, exclusions, and rollback boundary. CodeMoot materializes these as immutable
+`BatchPlanVersion` and `AcceptanceCriterion` records and includes every created record in the
+transcript's `parsedArtifactIds`. Sequential IDs, dependency ordering, requirement sources, and
+criterion ownership are checked against authoritative workflow data before any batch is created.
+The field remains optional in the base version-1 parser for compatibility with refinement
+captures created before the plan-lifecycle service.
+
 ## Plan or code review result
 
 ```json

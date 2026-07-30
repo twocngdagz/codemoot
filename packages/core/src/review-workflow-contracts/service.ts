@@ -6,6 +6,8 @@ import {
   type ReviewWorkflowStore,
 } from '../memory/review-workflow-store.js';
 import type {
+  AcceptanceCriterion,
+  BatchPlanVersion,
   Finding,
   FindingDisposition,
   ImplementationAttempt,
@@ -69,6 +71,8 @@ export type HandoffCaptureResult<Value> = AcceptedHandoffCapture<Value> | Reject
 export interface RefinementCaptureValue {
   readonly contract: RefinementResultContract;
   readonly refinedPlan: RefinedPlanVersion;
+  readonly batchPlans: readonly BatchPlanVersion[];
+  readonly acceptanceCriteria: readonly AcceptanceCriterion[];
 }
 
 export interface ReviewCaptureValue {
@@ -150,6 +154,20 @@ function validateExactIds(
 export class ReviewWorkflowContractService {
   constructor(private readonly store: ReviewWorkflowStore) {}
 
+  captureRefinementRejection(
+    context: HandoffCaptureContext,
+    message: string,
+  ): RejectedHandoffCapture {
+    const error = new HandoffParseError('SCHEMA_INVALID', message);
+    const transcript = rejectedTranscript(context, 'REFINEMENT_RESULT', error);
+    this.store.saveHandoffCapture({ transcript, entities: [] });
+    return {
+      accepted: false,
+      transcript,
+      error: { code: error.code, message: error.message },
+    };
+  }
+
   captureRefinement(
     input: HandoffCaptureContext & {
       readonly generalPlanVersionId: string;
@@ -158,6 +176,7 @@ export class ReviewWorkflowContractService {
       readonly refinedPlanVersionId: string;
       readonly version: number;
       readonly expectedRequirementIds: readonly string[];
+      readonly requireMaterializedBatchPlans?: boolean;
     },
   ): HandoffCaptureResult<RefinementCaptureValue> {
     try {
@@ -178,6 +197,54 @@ export class ReviewWorkflowContractService {
           'Requirement coverage references an undeclared batch plan version',
         );
       }
+      if (input.requireMaterializedBatchPlans && contract.batchPlans === undefined) {
+        throw new HandoffParseError(
+          'SCHEMA_INVALID',
+          'Plan-lifecycle refinement requires complete materialized batch plans',
+        );
+      }
+      const batchPlans: readonly BatchPlanVersion[] = (contract.batchPlans ?? []).map((draft) => ({
+        batchPlanVersionId: draft.batchPlanVersionId,
+        workflowId: input.workflowId,
+        batchId: draft.batchId,
+        version: 1,
+        contentHash: hashHandoffContent(JSON.stringify(draft)),
+        repositoryContextSha: input.repositoryContextSha,
+        objective: draft.objective,
+        currentRepositoryEvidence: draft.currentRepositoryEvidence,
+        dependencies: draft.dependencies,
+        candidateFiles: draft.candidateFiles,
+        technicalImplementation: draft.technicalImplementation,
+        userJourney: draft.userJourney,
+        expectedBehaviour: draft.expectedBehaviour,
+        technicalAcceptanceCriteria: draft.technicalAcceptanceCriteria,
+        userFacingAcceptanceCriteria: draft.userFacingAcceptanceCriteria,
+        cliAcceptanceCriteria: draft.cliAcceptanceCriteria,
+        browserAcceptanceCriteria: draft.browserAcceptanceCriteria,
+        verificationCommands: draft.verificationCommands,
+        manualVerification: draft.manualVerification,
+        documentationChanges: draft.documentationChanges,
+        outOfScope: draft.outOfScope,
+        rollbackBoundary: draft.rollbackBoundary,
+        addressedFindingIds: [],
+        actorExecutionId: input.actorExecutionId,
+        createdAt: input.createdAt,
+      }));
+      const acceptanceCriteria: readonly AcceptanceCriterion[] = (
+        contract.batchPlans ?? []
+      ).flatMap((draft) =>
+        draft.acceptanceCriteria.map((criterion) => ({
+          acceptanceCriterionId: criterion.acceptanceCriterionId,
+          batchPlanVersionId: draft.batchPlanVersionId,
+          kind: criterion.kind,
+          statement: criterion.statement,
+          required: criterion.required,
+          passCondition: criterion.passCondition,
+          status: 'PENDING',
+          sourceRequirementIds: criterion.sourceRequirementIds,
+          createdAt: input.createdAt,
+        })),
+      );
       const refinedPlan: RefinedPlanVersion = {
         refinedPlanVersionId: input.refinedPlanVersionId,
         workflowId: input.workflowId,
@@ -193,12 +260,25 @@ export class ReviewWorkflowContractService {
       };
       const transcript = parsedTranscript(input, 'REFINEMENT_RESULT', [
         refinedPlan.refinedPlanVersionId,
+        ...batchPlans.map((plan) => plan.batchPlanVersionId),
+        ...acceptanceCriteria.map((criterion) => criterion.acceptanceCriterionId),
       ]);
       this.store.saveHandoffCapture({
         transcript,
-        entities: [{ kind: 'REFINED_PLAN_VERSION', value: refinedPlan }],
+        entities: [
+          { kind: 'REFINED_PLAN_VERSION', value: refinedPlan },
+          ...batchPlans.map((value) => ({ kind: 'BATCH_PLAN_VERSION' as const, value })),
+          ...acceptanceCriteria.map((value) => ({
+            kind: 'ACCEPTANCE_CRITERION' as const,
+            value,
+          })),
+        ],
       });
-      return { accepted: true, transcript, value: { contract, refinedPlan } };
+      return {
+        accepted: true,
+        transcript,
+        value: { contract, refinedPlan, batchPlans, acceptanceCriteria },
+      };
     } catch (error) {
       return this.captureRejected(input, 'REFINEMENT_RESULT', error);
     }

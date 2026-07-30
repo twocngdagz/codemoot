@@ -3,6 +3,8 @@ export {
   REVIEW_WORKFLOW_CONTRACT_PARSE_STATUSES,
   REVIEW_WORKFLOW_CONTRACT_SCHEMA_VERSION,
   REVIEW_WORKFLOW_REVIEW_VERDICTS,
+  acceptanceCriterionDraftSchema,
+  batchPlanDraftSchema,
   codeReviewTargetSchema,
   dispositionDraftSchema,
   dispositionResultContractSchema,
@@ -49,6 +51,8 @@ export type {
   ReviewCaptureValue,
 } from './service.js';
 export type {
+  AcceptanceCriterionDraft,
+  BatchPlanDraft,
   CodeReviewTarget,
   DispositionDraft,
   DispositionResultContract,

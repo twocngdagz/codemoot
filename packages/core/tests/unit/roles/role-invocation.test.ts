@@ -270,6 +270,50 @@ describe('review-workflow role invocation', () => {
     });
   });
 
+  it('prepares process-attested evidence without persistence until explicitly persisted', async () => {
+    const { roles } = setup();
+    reserve('command-refinement');
+    vi.spyOn(roles.implementer.adapter, 'send').mockResolvedValue(
+      bridgeResult(roles.implementer, 'refinement-vendor-session', 1010),
+    );
+    const service = new RoleInvocationService(store);
+
+    const prepared = await service.prepare({
+      resolution: roles.implementer,
+      workflowId: 'workflow-6',
+      commandId: 'command-refinement',
+      actorExecutionId: 'execution-refinement',
+      invocationId: 'invocation-refinement',
+      sessionIdentityId: 'session-refinement',
+      prompt: 'Refine the imported plan.',
+      additionalAuthorities: ['PLAN_REFINER'],
+    });
+
+    expect(prepared.execution.authoritiesExercised).toEqual(['IMPLEMENTER', 'PLAN_REFINER']);
+    expect(store.getEntity('INVOCATION_IDENTITY', prepared.invocation.invocationId)).toBeNull();
+    service.persistPrepared(prepared);
+    expect(store.getEntity('INVOCATION_IDENTITY', prepared.invocation.invocationId)).not.toBeNull();
+  });
+
+  it('rejects authority escalation before invoking the reviewer adapter', async () => {
+    const { roles } = setup();
+    const send = vi.spyOn(roles.reviewer.adapter, 'send');
+
+    await expect(
+      new RoleInvocationService(store).prepare({
+        resolution: roles.reviewer,
+        workflowId: 'workflow-6',
+        commandId: 'command-reviewer-escalation',
+        actorExecutionId: 'execution-reviewer-escalation',
+        invocationId: 'invocation-reviewer-escalation',
+        sessionIdentityId: 'session-reviewer-escalation',
+        prompt: 'Refine the plan.',
+        additionalAuthorities: ['PLAN_REFINER'],
+      }),
+    ).rejects.toMatchObject({ code: 'AUTHORITY_NOT_ALLOWED' });
+    expect(send).not.toHaveBeenCalled();
+  });
+
   it('rejects a snapshot that reuses the same configured agent key', () => {
     const { config, snapshot } = setup();
     const registry = ModelRegistry.fromConfig(config, '/repository');

@@ -204,6 +204,66 @@ function findingMatchesReview(finding: Finding, review: StructuredReview): boole
   );
 }
 
+function refinementEntitiesMatchTranscript(
+  entities: readonly PersistableReviewWorkflowEntity[],
+  transcript: HandoffTranscript,
+): boolean {
+  const refinedPlans = entities.flatMap((entity) =>
+    entity.kind === 'REFINED_PLAN_VERSION' ? [entity.value] : [],
+  );
+  const batchPlans = entities.flatMap((entity) =>
+    entity.kind === 'BATCH_PLAN_VERSION' ? [entity.value] : [],
+  );
+  const acceptanceCriteria = entities.flatMap((entity) =>
+    entity.kind === 'ACCEPTANCE_CRITERION' ? [entity.value] : [],
+  );
+  if (
+    refinedPlans.length !== 1 ||
+    entities.some(
+      (entity) =>
+        entity.kind !== 'REFINED_PLAN_VERSION' &&
+        entity.kind !== 'BATCH_PLAN_VERSION' &&
+        entity.kind !== 'ACCEPTANCE_CRITERION',
+    )
+  ) {
+    return false;
+  }
+  const refinedPlan = refinedPlans[0];
+  if (
+    refinedPlan === undefined ||
+    refinedPlan.workflowId !== transcript.workflowId ||
+    refinedPlan.actorExecutionId !== transcript.actorExecutionId
+  ) {
+    return false;
+  }
+  if (batchPlans.length === 0 && acceptanceCriteria.length === 0) {
+    return entities.length === 1;
+  }
+  const batchPlanIds = new Set(batchPlans.map((plan) => plan.batchPlanVersionId));
+  const expectedBatchPlanIds = new Set(refinedPlan.batchPlanVersionIds);
+  if (
+    batchPlanIds.size !== expectedBatchPlanIds.size ||
+    [...batchPlanIds].some((id) => !expectedBatchPlanIds.has(id)) ||
+    batchPlans.some(
+      (plan) =>
+        plan.workflowId !== transcript.workflowId ||
+        plan.actorExecutionId !== transcript.actorExecutionId ||
+        plan.repositoryContextSha !== refinedPlan.repositoryContextSha,
+    ) ||
+    acceptanceCriteria.some((criterion) => !batchPlanIds.has(criterion.batchPlanVersionId))
+  ) {
+    return false;
+  }
+  const criterionIds = new Set(
+    acceptanceCriteria.map((criterion) => criterion.acceptanceCriterionId),
+  );
+  return refinedPlan.requirementCoverage.every(
+    (coverage) =>
+      coverage.batchPlanVersionIds.every((id) => batchPlanIds.has(id)) &&
+      coverage.acceptanceCriterionIds.every((id) => criterionIds.has(id)),
+  );
+}
+
 const recordHashRowSchema = z.object({ record_hash: z.string() });
 const payloadRowSchema = z.object({ payload_json: z.string() });
 const contextualPayloadRowSchema = payloadRowSchema.extend({
@@ -517,9 +577,7 @@ export class ReviewWorkflowStore {
       transcript.parseStatus === 'REJECTED'
         ? review === undefined && entityKinds.length === 0
         : transcript.contractKind === 'REFINEMENT_RESULT'
-          ? review === undefined &&
-            entityKinds.length === 1 &&
-            entityKinds[0] === 'REFINED_PLAN_VERSION'
+          ? review === undefined && refinementEntitiesMatchTranscript(input.entities, transcript)
           : transcript.contractKind === 'REVIEW_RESULT'
             ? review !== undefined &&
               (review.reviewKind === 'PLAN' || review.reviewKind === 'CODE') &&
@@ -538,12 +596,7 @@ export class ReviewWorkflowStore {
       transcript.parseStatus === 'REJECTED'
         ? true
         : transcript.contractKind === 'REFINEMENT_RESULT'
-          ? input.entities.every(
-              (entity) =>
-                entity.kind === 'REFINED_PLAN_VERSION' &&
-                entity.value.workflowId === transcript.workflowId &&
-                entity.value.actorExecutionId === transcript.actorExecutionId,
-            )
+          ? refinementEntitiesMatchTranscript(input.entities, transcript)
           : transcript.contractKind === 'IMPLEMENTATION_RESULT'
             ? input.entities.every(
                 (entity) =>

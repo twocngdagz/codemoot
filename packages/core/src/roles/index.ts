@@ -8,6 +8,7 @@ export {
   RoleInvocationService,
 } from './role-invocation.js';
 export type {
+  PreparedRoleInvocation,
   RoleInvocationErrorCode,
   RoleInvocationInput,
   RoleInvocationResult,

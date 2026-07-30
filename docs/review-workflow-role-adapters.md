@@ -34,6 +34,13 @@ bridge calls must return process-attested invocation evidence and vendor-session
 CodeMoot then stores the assignment, invocation identity, session identity, and actor execution
 links together.
 
+Coordinators that need the process-attested actor in a command receipt use the split
+`prepare`/`persistPrepared` form: the bridge call and evidence validation happen first, then the
+receipt is reserved, and only then are the invocation records persisted. The ordinary `invoke`
+method performs both steps for callers that already have a receipt. Extra authorities are
+allowlisted by role; the implementer may additionally exercise `PLAN_REFINER`, while a reviewer
+cannot escalate beyond `REVIEWER`.
+
 ## Session isolation
 
 A stored session is scoped to one workflow, one assigned role, and one adapter. Resume is refused

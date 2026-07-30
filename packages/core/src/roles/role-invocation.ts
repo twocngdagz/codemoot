@@ -7,6 +7,7 @@ import {
 } from '../review-workflow/schemas.js';
 import type {
   ActorExecutionIdentity,
+  Authority,
   InvocationIdentity,
   SessionIdentity,
 } from '../review-workflow/types.js';
@@ -21,6 +22,7 @@ export const ROLE_INVOCATION_ERROR_CODES = [
   'SESSION_WORKFLOW_MISMATCH',
   'SESSION_ADAPTER_MISMATCH',
   'CROSS_ROLE_SESSION_REUSE',
+  'AUTHORITY_NOT_ALLOWED',
 ] as const;
 
 export type RoleInvocationErrorCode = (typeof ROLE_INVOCATION_ERROR_CODES)[number];
@@ -45,6 +47,7 @@ export interface RoleInvocationInput {
   readonly prompt: string;
   readonly options?: BridgeOptions;
   readonly previousSessionIdentityId?: string;
+  readonly additionalAuthorities?: readonly Authority[];
 }
 
 export interface RoleInvocationResult {
@@ -54,6 +57,15 @@ export interface RoleInvocationResult {
   readonly session: SessionIdentity;
   readonly resumed: boolean;
 }
+
+export type PreparedRoleInvocation = RoleInvocationResult & {
+  readonly assignment: ResolvedRoleAdapter['assignment'];
+};
+
+const ROLE_AUTHORITIES: Readonly<Record<ResolvedRoleAdapter['role'], readonly Authority[]>> = {
+  implementer: ['IMPLEMENTER', 'PLAN_REFINER'],
+  reviewer: ['REVIEWER'],
+};
 
 /**
  * Invokes one resolved role and persists the assignment → execution → invocation/session links.
@@ -65,6 +77,18 @@ export class RoleInvocationService {
   constructor(private readonly store: ReviewWorkflowStore) {}
 
   async invoke(input: RoleInvocationInput): Promise<RoleInvocationResult> {
+    const prepared = await this.prepare(input);
+    this.persistPrepared(prepared);
+    return prepared;
+  }
+
+  /**
+   * Performs the external bridge call and validates its evidence without writing it.
+   *
+   * Coordinators use this split form when the command receipt must name the process-attested
+   * actor, while the invocation row itself must reference that receipt.
+   */
+  async prepare(input: RoleInvocationInput): Promise<PreparedRoleInvocation> {
     const { assignment, adapter } = input.resolution;
     const expectedRole = input.resolution.role === 'implementer' ? 'IMPLEMENTER' : 'REVIEWER';
     if (assignment.assignedRole !== expectedRole || assignment.workflowId !== input.workflowId) {
@@ -73,6 +97,7 @@ export class RoleInvocationService {
         'Resolved role assignment does not match the requested workflow invocation',
       );
     }
+    const authoritiesExercised = this.resolveAuthorities(input);
 
     const previousSession = this.loadPreviousSession(input);
 
@@ -188,20 +213,25 @@ export class RoleInvocationService {
       assignmentId: assignment.assignmentId,
       invocationIdentityId: invocation.invocationId,
       sessionIdentityId: session.sessionIdentityId,
-      authoritiesExercised: [assignment.assignedRole],
+      authoritiesExercised,
       identityAssurance: invocationEvidence.identityAssurance,
       observedEvidence: buildObservedEvidence(invocation, invocationEvidence),
       startedAt: invocation.startedAt,
       finishedAt: invocation.finishedAt,
     });
 
+    return { call, execution, invocation, session, resumed, assignment };
+  }
+
+  persistPrepared(prepared: PreparedRoleInvocation): void {
     this.store.saveRoleInvocation({
-      assignment,
-      invocation,
-      ...(resumed ? { reusedSessionIdentityId: session.sessionIdentityId } : { session }),
-      execution,
+      assignment: prepared.assignment,
+      invocation: prepared.invocation,
+      ...(prepared.resumed
+        ? { reusedSessionIdentityId: prepared.session.sessionIdentityId }
+        : { session: prepared.session }),
+      execution: prepared.execution,
     });
-    return { call, execution, invocation, session, resumed };
   }
 
   private assertSessionBelongsToRole(session: SessionIdentity, input: RoleInvocationInput): void {
@@ -253,6 +283,21 @@ export class RoleInvocationService {
         'Implementer and reviewer cannot share a vendor session',
       );
     }
+  }
+
+  private resolveAuthorities(input: RoleInvocationInput): readonly Authority[] {
+    const allowed = new Set(ROLE_AUTHORITIES[input.resolution.role]);
+    const requested = [
+      input.resolution.assignment.assignedRole,
+      ...(input.additionalAuthorities ?? []),
+    ];
+    if (requested.some((authority) => !allowed.has(authority))) {
+      throw new RoleInvocationError(
+        'AUTHORITY_NOT_ALLOWED',
+        `Role ${input.resolution.role} cannot exercise the requested workflow authority`,
+      );
+    }
+    return [...new Set(requested)];
   }
 }
 
