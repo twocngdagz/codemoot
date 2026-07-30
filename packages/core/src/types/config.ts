@@ -136,4 +136,4 @@ export interface ProjectConfig {
 }
 
 export type ExecutionMode = 'autonomous' | 'interactive' | 'dashboard';
-export type PresetName = 'cli-first';
+export type PresetName = 'cli-first' | 'review-gated';

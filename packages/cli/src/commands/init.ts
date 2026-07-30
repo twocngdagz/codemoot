@@ -2,7 +2,7 @@ import { existsSync } from 'node:fs';
 import { basename, join } from 'node:path';
 
 import type { PresetName } from '@codemoot/core';
-import { loadConfig, writeConfig } from '@codemoot/core';
+import { listPresets, loadConfig, writeConfig } from '@codemoot/core';
 import chalk from 'chalk';
 
 interface InitOptions {
@@ -21,16 +21,18 @@ export async function initCommand(options: InitOptions): Promise<void> {
     process.exit(1);
   }
 
-  // Validate preset name
-  const validPresets: PresetName[] = ['cli-first'];
-  // Select preset
+  // Validate the preset against the canonical list — never a hard-coded copy.
+  const validPresets: PresetName[] = listPresets();
   let presetName: PresetName = 'cli-first';
   if (options.preset) {
-    if (!validPresets.includes(options.preset as PresetName)) {
-      console.error(chalk.red(`Unknown preset: ${options.preset}. Available: ${validPresets.join(', ')}`));
+    const requested = validPresets.find((candidate) => candidate === options.preset);
+    if (requested === undefined) {
+      console.error(
+        chalk.red(`Unknown preset: ${options.preset}. Available: ${validPresets.join(', ')}`),
+      );
       process.exit(1);
     }
-    presetName = options.preset as PresetName;
+    presetName = requested;
   } else if (options.nonInteractive) {
     presetName = 'cli-first';
   } else {
@@ -54,5 +56,13 @@ export async function initCommand(options: InitOptions): Promise<void> {
     console.log(chalk.gray(`  ${alias}: ${modelConfig.model}`));
   }
 
-  console.log(chalk.gray('\nNext: codemoot plan "describe your task"'));
+  if (presetName === 'review-gated') {
+    console.log(
+      chalk.gray(
+        '\nNext: write your plan as Markdown, then: codemoot workflow start --plan <plan.md>',
+      ),
+    );
+  } else {
+    console.log(chalk.gray('\nNext: codemoot plan "describe your task"'));
+  }
 }

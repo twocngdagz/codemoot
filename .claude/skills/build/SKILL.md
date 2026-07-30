@@ -1,76 +1,83 @@
 ---
 name: build
-description: Autonomous build loop — debate, plan, implement, review, fix — all in one session with GPT review.
+description: Build features through the review-gated batch workflow — plan intake, refinement, per-batch implementation with independent review, verification, and a hard merge gate.
 user-invocable: true
 ---
 
-# /build — Autonomous Build Loop
+# /build — Review-Gated Batch Workflow
 
 ## Usage
-`/build <task description>`
+`/build <task description or plan file>`
 
 ## Description
-Full pipeline: debate approach with GPT → user approval → implement → GPT review → fix → re-review until approved. SQLite tracking throughout.
+The documented build path: an external plan is imported and refined into complete batch
+plans, then each batch runs one bounded implement → review → correct → final-review cycle,
+followed by verification, a single final audit, and a merge gate that checks every condition
+against durable evidence. Two separated agents (implementer and reviewer) with distinct CLI
+adapters do the work; a debate is **not** required at any point (the `/debate` skill remains
+available for ad-hoc questions).
+
+Legacy note: the old autonomous loop (`codemoot build start`) is deprecated — it still works
+but prints a stderr warning and receives no new capabilities. See
+`docs/review-workflow-adoption.md` for migration and for the identity/commit limitations.
 
 ## Instructions
 
-### Phase 0: Initialize
-1. Record user's exact request (acceptance criteria)
-2. `codemoot build start "TASK"`
-3. Save buildId and debateId
+### Phase 0: Plan intake
+1. Write (or receive) the plan as a Markdown file with explicit requirements.
+2. `codemoot workflow start --plan <plan.md>` — imports the plan and captures a repository
+   audit. Save the workflowId.
+3. `codemoot workflow refine <workflow-id>` — the refiner turns the plan into complete,
+   reviewable batch plans with acceptance criteria and verification commands.
 
-### Phase 1: Debate the Approach (MANDATORY)
-Use /debate protocol. Loop until GPT says STANCE: SUPPORT.
-- Gather codebase context first
-- Send detailed implementation plan to GPT
-- Revise on OPPOSE/UNCERTAIN — never skip
+### Phase 1: Per-batch bounded cycle (repeat per batch ordinal N)
+1. `codemoot batch review-plan <workflow-id> <N>` — independent plan review; revise until
+   approved.
+2. Implement and commit:
+   ```bash
+   codemoot batch implement <workflow-id> <N> --commit-mode agent
+   codemoot batch complete-implementation <workflow-id> <N> --commit <sha> --commit-mode agent
+   ```
+   (Use `--commit-mode human` when a human creates the implementation commit.)
+3. `codemoot batch review-code <workflow-id> <N>` — ONE complete initial review.
+4. Correction pass (at most once, only when the review returned blockers), in this exact
+   order:
+   ```bash
+   codemoot batch resume-implementation <workflow-id> <N>
+   codemoot batch implement <workflow-id> <N> --commit-mode agent
+   codemoot batch complete-implementation <workflow-id> <N> --commit <corrected-sha> --commit-mode agent
+   codemoot batch respond <workflow-id> <N> --file <dispositions.json>
+   codemoot batch review-code <workflow-id> <N>
+   ```
+   The final `review-code` is the ONE bounded final review (round 2). Never a third
+   automatic round — unresolved CRITICAL/HIGH blockers escalate to a human decision.
 
-### Phase 1.25: Plan Review (Optional but Recommended)
-Before user approval, validate the plan with GPT:
-```bash
-codemoot plan review /path/to/plan.md --build BUILD_ID
-```
-GPT reviews the plan against actual codebase, returns ISSUE/SUGGEST lines.
-Fix HIGH issues before presenting to user.
+### Phase 2: Verification and gate
+1. Per plan verification command index `i`:
+   ```bash
+   codemoot batch verify <workflow-id> <N> --command <i>
+   ```
+   (add `--background` to enqueue; `codemoot workflow jobs run` processes the queue).
+2. Attest each successful record — acceptance requires independent judgment:
+   ```bash
+   codemoot batch attest-verification <workflow-id> <N> --record <record-id> --mode human --decision accepted --rationale "<what was independently confirmed>"
+   ```
+3. `codemoot batch final-audit <workflow-id> <N>` — the single completeness audit.
+4. `codemoot batch gate <workflow-id> <N>` — approves for merge only when every condition
+   passes against durable evidence.
+5. Merge externally, then record it:
+   ```bash
+   codemoot batch mark-merged <workflow-id> <N> --merge-sha <sha>
+   ```
+   The merge happens outside CodeMoot and is recorded by a HUMAN or CI actor; CodeMoot
+   verifies the merge commit exists and contains the approved commit, but does not
+   authenticate who performed the merge. CodeMoot never executes merges.
 
-### Phase 1.5: User Approval Gate
-Present agreed plan. Wait for explicit approval via AskUserQuestion.
-```bash
-codemoot build event BUILD_ID plan_approved
-codemoot debate complete DEBATE_ID
-```
+### Observability
+- `codemoot workflow status <workflow-id>` — batch states plus effective approval state.
+- `codemoot workflow events <workflow-id> --cursor <name> --ack` — incremental event feed.
+- MCP: `codemoot_workflow_status|events|gate|jobs` expose the same operations to clients.
 
-### Phase 2: Implement
-Write code. Run tests: `pnpm run test`
-Never send broken code to review.
-```bash
-codemoot build event BUILD_ID impl_completed
-```
-
-### Phase 3: GPT Review
-```bash
-codemoot build review BUILD_ID
-```
-Parse verdict: approved → Phase 4.5, needs_revision → Phase 4
-
-### Phase 4: Fix Issues
-Fix every CRITICAL and BUG. Run tests. Back to Phase 3.
-```bash
-codemoot build event BUILD_ID fix_completed
-```
-
-### Phase 4.5: Completeness Check
-Compare deliverables against original request. Every requirement must be met.
-
-### Phase 5: Done
-```bash
-codemoot build status BUILD_ID
-```
-Present summary with metrics, requirements checklist, GPT verdict.
-
-### Rules
-1. NEVER skip debate rounds
-2. NEVER skip user approval
-3. NEVER declare done without completeness check
-4. Run tests after every implementation/fix
-5. Zero API cost (ChatGPT subscription)
+## Configuration
+`codemoot init --preset review-gated` writes a starting `.cowork.yml` (Claude implementer,
+Codex reviewer, strict identity separation, all gates required, debate disabled).

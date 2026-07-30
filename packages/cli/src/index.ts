@@ -122,7 +122,7 @@ program
 program
   .command('init')
   .description('Initialize CodeMoot in the current project')
-  .option('--preset <name>', 'Use preset (cli-first)')
+  .option('--preset <name>', 'Use preset (cli-first|review-gated)')
   .option('--non-interactive', 'Skip prompts, use defaults')
   .option('--force', 'Overwrite existing .cowork.yml')
   .action(initCommand);

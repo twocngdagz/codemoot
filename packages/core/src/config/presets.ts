@@ -34,9 +34,48 @@ const PRESET_CONFIGS: Record<PresetName, Record<string, unknown>> = {
       },
     },
   },
+  // The documented build path: review-gated batches with strict identity separation and a
+  // hard merge gate. Debate stays available but is NOT a dependency of this workflow.
+  'review-gated': {
+    workflow: 'review-gated-batches',
+    models: {
+      implementer: {
+        provider: 'anthropic',
+        model: 'claude-sonnet-4-5',
+        cliAdapter: { kind: 'claude', command: 'claude', args: [], timeout: 1800 },
+      },
+      reviewer: {
+        provider: 'openai',
+        model: 'gpt-5.3-codex',
+        cliAdapter: { kind: 'codex', command: 'codex', args: ['exec'], timeout: 1800 },
+      },
+    },
+    roles: {
+      implementer: { model: 'implementer' },
+      reviewer: { model: 'reviewer' },
+    },
+    reviewGated: {
+      identity: {
+        minimumAssurance: 'process_attested',
+        requireDifferentAdapterKinds: true,
+        prohibitSharedSessions: true,
+      },
+      commit: { mode: 'either', agentMayCommit: true },
+      gates: {
+        planReview: 'required',
+        codeReview: 'required',
+        verification: 'required',
+        humanMerge: 'required',
+        blockingSeverities: ['critical', 'high'],
+        requireAllFindingResponses: true,
+        requireAcceptedAttestations: true,
+      },
+    },
+    debate: { enabled: false },
+  },
 };
 
-const VALID_PRESETS: PresetName[] = ['cli-first'];
+const VALID_PRESETS: PresetName[] = ['cli-first', 'review-gated'];
 
 /**
  * Load a built-in preset by name. Returns a partial config to be merged with defaults.

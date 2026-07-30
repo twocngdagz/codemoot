@@ -1,11 +1,21 @@
 // packages/cli/src/commands/build.ts — CLI build commands
 
-import type { BridgeCallResult, BuildRun, BuildSummary } from '@codemoot/core';
-import { BuildStore, DebateStore, REVIEW_DIFF_MAX_CHARS, REVIEW_TEXT_MAX_CHARS, SessionManager, buildHandoffEnvelope, generateId, loadConfig, openDatabase } from '@codemoot/core';
-import chalk from 'chalk';
 import { execFileSync, execSync } from 'node:child_process';
 import { unlinkSync } from 'node:fs';
 import { join } from 'node:path';
+import type { BridgeCallResult, BuildRun, BuildSummary } from '@codemoot/core';
+import {
+  BuildStore,
+  DebateStore,
+  REVIEW_DIFF_MAX_CHARS,
+  REVIEW_TEXT_MAX_CHARS,
+  SessionManager,
+  buildHandoffEnvelope,
+  generateId,
+  loadConfig,
+  openDatabase,
+} from '@codemoot/core';
+import chalk from 'chalk';
 
 import { createProgressCallbacks } from '../progress.js';
 import { getDbPath } from '../utils.js';
@@ -18,6 +28,13 @@ interface StartOptions {
 }
 
 export async function buildStartCommand(task: string, options: StartOptions): Promise<void> {
+  // Deprecation notice on stderr so scripted stdout consumers are unaffected.
+  console.error(
+    'Warning: `codemoot build` is deprecated. Use the review-gated batch workflow instead: ' +
+      '`codemoot workflow start --plan <plan.md>` — see ' +
+      'https://github.com/twocngdagz/codemoot/blob/master/docs/review-workflow-adoption.md. ' +
+      'The legacy build loop still works but will not receive new capabilities.',
+  );
   let db: ReturnType<typeof openDatabase> | undefined;
   try {
     const buildId = generateId();
@@ -30,7 +47,10 @@ export async function buildStartCommand(task: string, options: StartOptions): Pr
     // Check git status
     let baselineRef: string | null = null;
     try {
-      const dirty = execSync('git status --porcelain', { cwd: projectDir, encoding: 'utf-8' }).trim();
+      const dirty = execSync('git status --porcelain', {
+        cwd: projectDir,
+        encoding: 'utf-8',
+      }).trim();
       if (dirty && !options.allowDirty) {
         db.close();
         console.error(chalk.red('Working tree is dirty. Commit or stash your changes first.'));
@@ -38,8 +58,13 @@ export async function buildStartCommand(task: string, options: StartOptions): Pr
         process.exit(1);
       }
       if (dirty && options.allowDirty) {
-        execSync('git stash push -u -m "codemoot-build-baseline"', { cwd: projectDir, encoding: 'utf-8' });
-        console.error(chalk.yellow('Auto-stashed dirty changes with marker "codemoot-build-baseline"'));
+        execSync('git stash push -u -m "codemoot-build-baseline"', {
+          cwd: projectDir,
+          encoding: 'utf-8',
+        });
+        console.error(
+          chalk.yellow('Auto-stashed dirty changes with marker "codemoot-build-baseline"'),
+        );
       }
       baselineRef = execSync('git rev-parse HEAD', { cwd: projectDir, encoding: 'utf-8' }).trim();
     } catch {
@@ -60,7 +85,12 @@ export async function buildStartCommand(task: string, options: StartOptions): Pr
       thread: [],
       runningSummary: '',
       stanceHistory: [],
-      usage: { totalPromptTokens: 0, totalCompletionTokens: 0, totalCalls: 0, startedAt: Date.now() },
+      usage: {
+        totalPromptTokens: 0,
+        totalCompletionTokens: 0,
+        totalCalls: 0,
+        startedAt: Date.now(),
+      },
       status: 'running',
       sessionIds: {},
       resumeStats: { attempted: 0, succeeded: 0, fallbacks: 0 },
@@ -83,7 +113,12 @@ export async function buildStartCommand(task: string, options: StartOptions): Pr
     buildStore.updateWithEvent(
       buildId,
       { debateId },
-      { eventType: 'debate_started', actor: 'system', phase: 'debate', payload: { task, debateId, baselineRef } },
+      {
+        eventType: 'debate_started',
+        actor: 'system',
+        phase: 'debate',
+        payload: { task, debateId, baselineRef },
+      },
     );
 
     const output = {
@@ -238,7 +273,11 @@ export async function buildEventCommand(
       }
       const input = Buffer.concat(chunks).toString('utf-8').trim();
       if (input) {
-        try { payload = JSON.parse(input); } catch { payload = { text: input }; }
+        try {
+          payload = JSON.parse(input);
+        } catch {
+          payload = { text: input };
+        }
       }
     }
 
@@ -268,27 +307,27 @@ export async function buildEventCommand(
       updates.currentLoop = run.currentLoop + 1;
     }
 
-    store.updateWithEvent(
-      buildId,
-      updates as Parameters<BuildStore['updateWithEvent']>[1],
-      {
-        eventType: eventType as Parameters<BuildStore['updateWithEvent']>[2]['eventType'],
-        actor: 'system',
-        phase: (updates.currentPhase ?? run.currentPhase) as Parameters<BuildStore['updateWithEvent']>[2]['phase'],
-        loopIndex: options.loop ?? run.currentLoop,
-        payload,
-        tokensUsed: options.tokens ?? 0,
-      },
-    );
+    store.updateWithEvent(buildId, updates as Parameters<BuildStore['updateWithEvent']>[1], {
+      eventType: eventType as Parameters<BuildStore['updateWithEvent']>[2]['eventType'],
+      actor: 'system',
+      phase: (updates.currentPhase ?? run.currentPhase) as Parameters<
+        BuildStore['updateWithEvent']
+      >[2]['phase'],
+      loopIndex: options.loop ?? run.currentLoop,
+      payload,
+      tokensUsed: options.tokens ?? 0,
+    });
 
     const updated = store.get(buildId);
-    console.log(JSON.stringify({
-      buildId,
-      eventType,
-      newStatus: updated?.status,
-      newPhase: updated?.currentPhase,
-      seq: updated?.lastEventSeq,
-    }));
+    console.log(
+      JSON.stringify({
+        buildId,
+        eventType,
+        newStatus: updated?.status,
+        newPhase: updated?.currentPhase,
+        seq: updated?.lastEventSeq,
+      }),
+    );
 
     db.close();
   } catch (error) {
@@ -324,14 +363,33 @@ export async function buildReviewCommand(buildId: string): Promise<void> {
         const tmpIndex = join(projectDir, '.git', 'codemoot-review-index');
         try {
           // Copy current HEAD tree into temp index, then add all working tree changes
-          execFileSync('git', ['read-tree', 'HEAD'], { cwd: projectDir, encoding: 'utf-8', env: { ...process.env, GIT_INDEX_FILE: tmpIndex } });
-          execFileSync('git', ['add', '-A'], { cwd: projectDir, encoding: 'utf-8', env: { ...process.env, GIT_INDEX_FILE: tmpIndex } });
-          diff = execFileSync('git', ['diff', '--cached', run.baselineRef, '--'], { cwd: projectDir, encoding: 'utf-8', maxBuffer: 1024 * 1024, env: { ...process.env, GIT_INDEX_FILE: tmpIndex } });
+          execFileSync('git', ['read-tree', 'HEAD'], {
+            cwd: projectDir,
+            encoding: 'utf-8',
+            env: { ...process.env, GIT_INDEX_FILE: tmpIndex },
+          });
+          execFileSync('git', ['add', '-A'], {
+            cwd: projectDir,
+            encoding: 'utf-8',
+            env: { ...process.env, GIT_INDEX_FILE: tmpIndex },
+          });
+          diff = execFileSync('git', ['diff', '--cached', run.baselineRef, '--'], {
+            cwd: projectDir,
+            encoding: 'utf-8',
+            maxBuffer: 1024 * 1024,
+            env: { ...process.env, GIT_INDEX_FILE: tmpIndex },
+          });
         } finally {
-          try { unlinkSync(tmpIndex); } catch { /* already cleaned */ }
+          try {
+            unlinkSync(tmpIndex);
+          } catch {
+            /* already cleaned */
+          }
         }
       } catch (err) {
-        console.error(chalk.red(`Failed to generate diff: ${err instanceof Error ? err.message : String(err)}`));
+        console.error(
+          chalk.red(`Failed to generate diff: ${err instanceof Error ? err.message : String(err)}`),
+        );
         db.close();
         process.exit(1);
       }
@@ -364,7 +422,12 @@ export async function buildReviewCommand(buildId: string): Promise<void> {
       command: 'build-review',
       task: `Review code changes for the task: "${run.task}"\n\nGIT DIFF (against baseline ${run.baselineRef}):\n${diff.slice(0, REVIEW_DIFF_MAX_CHARS)}\n\nReview for:\n1. Correctness — does the code work as intended?\n2. Bugs — any logic errors, edge cases, or crashes?\n3. Security — any vulnerabilities introduced?\n4. Code quality — naming, structure, patterns\n5. Completeness — does it fully implement the task?`,
       resumed: Boolean(existingSession),
-      constraints: run.reviewCycles > 0 ? [`This is review cycle ${run.reviewCycles + 1}. Focus on whether prior issues were addressed.`] : undefined,
+      constraints:
+        run.reviewCycles > 0
+          ? [
+              `This is review cycle ${run.reviewCycles + 1}. Focus on whether prior issues were addressed.`,
+            ]
+          : undefined,
     });
 
     const progress = createProgressCallbacks('build-review');
@@ -438,13 +501,23 @@ export async function buildReviewCommand(buildId: string): Promise<void> {
       buildStore.updateWithEvent(
         buildId,
         { currentPhase: 'done', status: 'completed', completedAt: Date.now() },
-        { eventType: 'phase_transition', actor: 'system', phase: 'done', payload: { reason: 'review_approved' } },
+        {
+          eventType: 'phase_transition',
+          actor: 'system',
+          phase: 'done',
+          payload: { reason: 'review_approved' },
+        },
       );
     } else {
       buildStore.updateWithEvent(
         buildId,
         { currentPhase: 'fix', status: 'fixing' },
-        { eventType: 'phase_transition', actor: 'system', phase: 'fix', payload: { reason: 'review_needs_revision' } },
+        {
+          eventType: 'phase_transition',
+          actor: 'system',
+          phase: 'fix',
+          payload: { reason: 'review_needs_revision' },
+        },
       );
     }
 

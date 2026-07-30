@@ -148,3 +148,11 @@ CodeMoot is designed to support multiple AI CLIs. To add a new one:
 ## License
 
 By contributing, you agree that your contributions will be licensed under the MIT License.
+
+## Building features with CodeMoot itself
+
+The documented build path is the review-gated batch workflow (`codemoot workflow start`,
+per-batch bounded reviews, verification, merge gate) — see
+[docs/review-workflow-adoption.md](docs/review-workflow-adoption.md). The legacy
+`codemoot build` loop is deprecated; debate remains available as a standalone tool and is
+never required by the workflow.

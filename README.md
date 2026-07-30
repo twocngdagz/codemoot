@@ -25,6 +25,10 @@ codemoot fix src/         # autofix loop: review → fix → re-review
 # Debate architecture with GPT
 codemoot debate start "Should we use REST or GraphQL?"
 
+# Build features the review-gated way (recommended)
+codemoot init --preset review-gated
+codemoot workflow start --plan plan.md
+
 # Ship with confidence
 codemoot shipit --profile safe
 ```
@@ -71,13 +75,36 @@ codemoot shipit --profile safe
 | `codemoot debate history <id>` | Full message history (`--output <file>` for untruncated export) |
 | `codemoot debate complete <id>` | Mark debate as done |
 
+### Review-Gated Batch Workflow (recommended build path)
+
+Two separated agents — an implementer and an independent reviewer — build features in
+review-gated batches: one bounded implement → review → correct → final-review cycle per
+batch, then verification, a single final audit, and a merge gate that checks every condition
+against durable evidence. No debate dependency; merges happen externally and are only
+recorded (by a HUMAN or CI actor) — CodeMoot verifies the merge commit exists and contains
+the approved commit, but does not authenticate who performed the merge. See
+[docs/review-workflow-adoption.md](docs/review-workflow-adoption.md) for migration from the
+legacy build loop and the current identity/commit limitations.
+
+| Command | Description |
+|---------|-------------|
+| `codemoot workflow start --plan <file>` | Import an external plan and capture a repository audit |
+| `codemoot workflow refine <id>` | Refine the plan into complete batch plans |
+| `codemoot workflow status <id>` | Batch states plus effective merge-approval state |
+| `codemoot batch review-plan / implement / complete-implementation` | Per-batch plan review and implementation |
+| `codemoot batch review-code / respond` | One complete initial review, one correction pass, one bounded final review |
+| `codemoot batch verify / attest-verification` | Execute approved verification commands and attest acceptance |
+| `codemoot batch final-audit / gate / mark-merged` | Single completeness audit, full merge gate, external-merge recording |
+| `codemoot workflow jobs run / list / show / cancel` | Background jobs with receipt-bound replay safety (`--background` on verify/review-code/final-audit) |
+| `codemoot workflow events <id> --cursor <name> --ack` | Incremental workflow event feed with durable cursors |
+
 ### Automation
 
 | Command | Description |
 |---------|-------------|
 | `codemoot shipit [--profile fast\|safe\|full]` | Composite workflow: lint → test → review → cleanup → commit |
 | `codemoot watch` | Watch files, auto-enqueue reviews on save |
-| `codemoot build start <task>` | Automated build loop with GPT review |
+| `codemoot build start <task>` | **Deprecated** legacy build loop (stderr warning) — use the review-gated workflow |
 
 ### Background Jobs
 
