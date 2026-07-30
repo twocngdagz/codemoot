@@ -138,6 +138,12 @@ export function createReviewWorkflowConfigurationSnapshot(
       requireAllFindingResponses: policy.gates.requireAllFindingResponses,
       requireAcceptedAttestations: policy.gates.requireAcceptedAttestations,
     },
+    pacing: {
+      maxCodeReviewRounds: policy.pacing.maxCodeReviewRounds,
+      maxCorrectionPasses: policy.pacing.maxCorrectionPasses,
+      deferNonBlockingFindings: policy.pacing.deferNonBlockingFindings,
+      unresolvedAfterFinalReview: policy.pacing.unresolvedAfterFinalReview,
+    },
     assignments: { implementer, reviewer },
     authorityGrants: createAuthorityGrantSnapshot(commitPolicy),
   };

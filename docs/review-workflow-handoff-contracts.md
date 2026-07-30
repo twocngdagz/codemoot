@@ -115,7 +115,9 @@ A plan target instead carries `planVersionId`, `planContentHash`, and `repositor
 
 These are implementation claims. Listing a verification record does not create, execute, or
 attest verification evidence. Verification execution belongs to the later verification batch.
-A `BLOCKED` outcome must include `blockerReason`.
+A `BLOCKED` outcome must include `blockerReason`. The implementation lifecycle compares a
+`COMPLETE` result's `changedFiles` against fresh committed and worktree paths before creating
+implementation-ready evidence.
 
 ## Disposition result
 

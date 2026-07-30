@@ -99,10 +99,18 @@ export interface ReviewGatedGateConfig {
   requireAcceptedAttestations: boolean;
 }
 
+export interface ReviewGatedPacingConfig {
+  maxCodeReviewRounds: number;
+  maxCorrectionPasses: number;
+  deferNonBlockingFindings: true;
+  unresolvedAfterFinalReview: 'human_decision_required';
+}
+
 export interface ReviewGatedConfig {
   identity: ReviewGatedIdentityConfig;
   commit: ReviewGatedCommitConfig;
   gates: ReviewGatedGateConfig;
+  pacing: ReviewGatedPacingConfig;
 }
 
 export interface ProjectConfig {

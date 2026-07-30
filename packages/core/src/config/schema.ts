@@ -134,10 +134,20 @@ export const reviewGatedGateConfigSchema = z
     }
   });
 
+export const reviewGatedPacingConfigSchema = z.object({
+  maxCodeReviewRounds: z.number().int().min(1).max(2).default(2),
+  maxCorrectionPasses: z.number().int().min(0).max(1).default(1),
+  deferNonBlockingFindings: z.literal(true).default(true),
+  unresolvedAfterFinalReview: z
+    .literal('human_decision_required')
+    .default('human_decision_required'),
+});
+
 export const reviewGatedConfigSchema = z.object({
   identity: reviewGatedIdentityConfigSchema.default(COMPATIBILITY_REVIEW_GATED_CONFIG.identity),
   commit: reviewGatedCommitConfigSchema.default(COMPATIBILITY_REVIEW_GATED_CONFIG.commit),
   gates: reviewGatedGateConfigSchema.default(COMPATIBILITY_REVIEW_GATED_CONFIG.gates),
+  pacing: reviewGatedPacingConfigSchema.default(COMPATIBILITY_REVIEW_GATED_CONFIG.pacing),
 });
 
 const memoryConfigSchema = z.object({

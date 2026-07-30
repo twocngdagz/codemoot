@@ -48,6 +48,7 @@ export interface GitWorktreeSnapshot {
   readonly branch: string;
   readonly clean: boolean;
   readonly statusPorcelain: string;
+  readonly changedPaths: readonly string[];
   readonly worktreeFingerprint: string;
 }
 

@@ -11,6 +11,7 @@ export {
   reviewGatedConfigSchema,
   reviewGatedGateConfigSchema,
   reviewGatedIdentityConfigSchema,
+  reviewGatedPacingConfigSchema,
   validateConfig,
 } from './schema.js';
 export type { ProjectConfigInput } from './schema.js';

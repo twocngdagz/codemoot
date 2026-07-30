@@ -88,6 +88,37 @@ function parseChangedFiles(output: string): readonly ChangedFile[] {
   return changedFiles;
 }
 
+function parseWorktreeChangedPaths(output: string): readonly string[] {
+  if (output.length === 0) return [];
+
+  const fields = output.split('\0');
+  if (fields.at(-1) === '') fields.pop();
+  const paths: string[] = [];
+
+  for (let index = 0; index < fields.length; index += 1) {
+    const entry = fields[index];
+    if (entry === undefined || entry.length < 4 || entry[2] !== ' ') {
+      throw new ReviewWorkflowGitError(
+        'GIT_COMMAND_FAILED',
+        'Git porcelain status output contained an invalid entry',
+      );
+    }
+    const status = entry.slice(0, 2);
+    paths.push(entry.slice(3));
+    if (status.includes('R') || status.includes('C')) {
+      index += 1;
+      if (fields[index] === undefined) {
+        throw new ReviewWorkflowGitError(
+          'GIT_COMMAND_FAILED',
+          'Git porcelain rename or copy output is incomplete',
+        );
+      }
+    }
+  }
+
+  return [...new Set(paths)].sort();
+}
+
 export class LocalGitRepository implements GitRepository {
   readonly repositoryRoot: string;
 
@@ -135,6 +166,7 @@ export class LocalGitRepository implements GitRepository {
       branch: endingBranch.length === 0 ? 'HEAD' : endingBranch,
       clean: endingStatus.length === 0,
       statusPorcelain: endingStatus,
+      changedPaths: parseWorktreeChangedPaths(endingStatus),
       worktreeFingerprint: sha256(endingStatus),
     };
   }

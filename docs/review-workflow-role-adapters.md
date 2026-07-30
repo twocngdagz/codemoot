@@ -38,8 +38,9 @@ Coordinators that need the process-attested actor in a command receipt use the s
 `prepare`/`persistPrepared` form: the bridge call and evidence validation happen first, then the
 receipt is reserved, and only then are the invocation records persisted. The ordinary `invoke`
 method performs both steps for callers that already have a receipt. Extra authorities are
-allowlisted by role; the implementer may additionally exercise `PLAN_REFINER`, while a reviewer
-cannot escalate beyond `REVIEWER`.
+allowlisted by role; the implementer may additionally exercise `PLAN_REFINER` and, only when its
+immutable assignment permits commits, `COMMIT_CREATOR`. A reviewer cannot escalate beyond
+`REVIEWER`.
 
 ## Session isolation
 

@@ -248,9 +248,14 @@ describe('ReviewWorkflowPlanService', () => {
 
     expect(result.accepted).toBe(true);
     expect(service.getStatus('workflow-1').batches).toMatchObject([
-      { ordinal: 1, persistedState: 'DRAFT', originalBatchBaseSha: SHA },
-      { ordinal: 2, persistedState: 'DRAFT', originalBatchBaseSha: SHA },
+      { ordinal: 1, persistedState: 'DRAFT' },
+      { ordinal: 2, persistedState: 'DRAFT' },
     ]);
+    expect(
+      service
+        .getStatus('workflow-1')
+        .batches.every((batch) => batch.originalBatchBaseSha === undefined),
+    ).toBe(true);
     expect(store.getWorkflow('workflow-1')?.refinedPlanVersionId).toBe('refined-plan-1');
     expect(
       store.getBatchPlan(deriveBatchPlanVersionId(deriveWorkflowBatchId('workflow-1', 1))),

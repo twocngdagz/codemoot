@@ -552,6 +552,58 @@ export class ReviewWorkflowStore {
     });
   }
 
+  /**
+   * Records the reviewer's decision on one pending disposition. Dispositions are otherwise
+   * immutable; only the PENDING → ACCEPTED/REJECTED decision fields may be completed, and a
+   * completed decision can never be changed.
+   */
+  decideDisposition(input: {
+    readonly dispositionId: string;
+    readonly decision: 'ACCEPTED' | 'REJECTED';
+    readonly reviewerActorExecutionId: string;
+    readonly rationale: string;
+    readonly decidedAt: string;
+  }): FindingDisposition {
+    const entity = this.getEntity('FINDING_DISPOSITION', input.dispositionId);
+    if (entity === null || entity.kind !== 'FINDING_DISPOSITION') {
+      throw new ReviewWorkflowPersistenceError(
+        'PERSISTED_DATA_INVALID',
+        `Disposition ${input.dispositionId} does not exist`,
+      );
+    }
+    const current = entity.value;
+    if (current.reviewerDecision.decision !== 'PENDING') {
+      throw new ReviewWorkflowPersistenceError(
+        'IMMUTABLE_ENTITY_CONFLICT',
+        `Disposition ${input.dispositionId} already carries a reviewer decision`,
+      );
+    }
+    const updated = findingDispositionSchema.parse({
+      ...current,
+      reviewerDecision: {
+        decision: input.decision,
+        reviewerActorExecutionId: input.reviewerActorExecutionId,
+        rationale: input.rationale,
+        decidedAt: input.decidedAt,
+      },
+      updatedAt: input.decidedAt,
+    });
+    this.db
+      .prepare(
+        `UPDATE review_workflow_dispositions
+         SET reviewer_decision = ?, payload_json = ?, record_hash = ?, updated_at = ?
+         WHERE disposition_id = ?`,
+      )
+      .run(
+        input.decision,
+        serializeJson(updated),
+        hashRecord({ kind: 'FINDING_DISPOSITION', value: updated }),
+        input.decidedAt,
+        input.dispositionId,
+      );
+    return updated;
+  }
+
   saveHandoffCapture(input: HandoffCapturePersistenceInput): void {
     const transcript = handoffTranscriptSchema.parse(input.transcript);
     const review =

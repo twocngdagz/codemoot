@@ -63,7 +63,7 @@ export type PreparedRoleInvocation = RoleInvocationResult & {
 };
 
 const ROLE_AUTHORITIES: Readonly<Record<ResolvedRoleAdapter['role'], readonly Authority[]>> = {
-  implementer: ['IMPLEMENTER', 'PLAN_REFINER'],
+  implementer: ['IMPLEMENTER', 'PLAN_REFINER', 'COMMIT_CREATOR'],
   reviewer: ['REVIEWER'],
 };
 
@@ -291,7 +291,10 @@ export class RoleInvocationService {
       input.resolution.assignment.assignedRole,
       ...(input.additionalAuthorities ?? []),
     ];
-    if (requested.some((authority) => !allowed.has(authority))) {
+    const commitAuthorityDenied =
+      requested.includes('COMMIT_CREATOR') &&
+      input.resolution.assignment.commitPermission !== 'AUTHORIZED';
+    if (requested.some((authority) => !allowed.has(authority)) || commitAuthorityDenied) {
       throw new RoleInvocationError(
         'AUTHORITY_NOT_ALLOWED',
         `Role ${input.resolution.role} cannot exercise the requested workflow authority`,

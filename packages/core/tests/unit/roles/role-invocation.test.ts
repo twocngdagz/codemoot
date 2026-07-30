@@ -314,6 +314,47 @@ describe('review-workflow role invocation', () => {
     expect(send).not.toHaveBeenCalled();
   });
 
+  it('allows commit authority only for an authorized implementer assignment', async () => {
+    const deniedSetup = setup();
+    const deniedSend = vi.spyOn(deniedSetup.roles.implementer.adapter, 'send');
+    await expect(
+      new RoleInvocationService(store).prepare({
+        resolution: deniedSetup.roles.implementer,
+        workflowId: 'workflow-6',
+        commandId: 'command-denied-commit',
+        actorExecutionId: 'execution-denied-commit',
+        invocationId: 'invocation-denied-commit',
+        sessionIdentityId: 'session-denied-commit',
+        prompt: 'Commit the implementation.',
+        additionalAuthorities: ['COMMIT_CREATOR'],
+      }),
+    ).rejects.toMatchObject({ code: 'AUTHORITY_NOT_ALLOWED' });
+    expect(deniedSend).not.toHaveBeenCalled();
+
+    const authorizedResolution = {
+      ...deniedSetup.roles.implementer,
+      assignment: {
+        ...deniedSetup.roles.implementer.assignment,
+        commitPermission: 'AUTHORIZED' as const,
+      },
+    };
+    vi.spyOn(authorizedResolution.adapter, 'send').mockResolvedValue(
+      bridgeResult(authorizedResolution, 'authorized-commit-session', 1011),
+    );
+    const prepared = await new RoleInvocationService(store).prepare({
+      resolution: authorizedResolution,
+      workflowId: 'workflow-6',
+      commandId: 'command-authorized-commit',
+      actorExecutionId: 'execution-authorized-commit',
+      invocationId: 'invocation-authorized-commit',
+      sessionIdentityId: 'session-authorized-commit',
+      prompt: 'Commit the implementation.',
+      additionalAuthorities: ['COMMIT_CREATOR'],
+    });
+
+    expect(prepared.execution.authoritiesExercised).toEqual(['IMPLEMENTER', 'COMMIT_CREATOR']);
+  });
+
   it('rejects a snapshot that reuses the same configured agent key', () => {
     const { config, snapshot } = setup();
     const registry = ModelRegistry.fromConfig(config, '/repository');

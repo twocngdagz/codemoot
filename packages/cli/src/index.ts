@@ -34,7 +34,13 @@ import {
 } from './commands/jobs.js';
 import { planGenerateCommand, planReviewCommand } from './commands/plan.js';
 import {
+  reviewWorkflowBatchCompleteImplementationCommand,
+  reviewWorkflowBatchFindingsCommand,
+  reviewWorkflowBatchImplementCommand,
   reviewWorkflowBatchListCommand,
+  reviewWorkflowBatchRespondCommand,
+  reviewWorkflowBatchResumeImplementationCommand,
+  reviewWorkflowBatchReviewCodeCommand,
   reviewWorkflowBatchReviewPlanCommand,
   reviewWorkflowBatchShowCommand,
   reviewWorkflowRefineCommand,
@@ -241,7 +247,7 @@ reviewWorkflow
 
 const reviewWorkflowBatch = program
   .command('batch')
-  .description('Inspect and review review-gated batch plans');
+  .description('Inspect and execute review-gated batches');
 
 reviewWorkflowBatch
   .command('list')
@@ -264,6 +270,64 @@ reviewWorkflowBatch
   .option('--round <number>', 'Plan-review round number', positiveInteger, 1)
   .option('--timeout <seconds>', 'Plan-review timeout in seconds', positiveInteger, 900)
   .action(reviewWorkflowBatchReviewPlanCommand);
+
+reviewWorkflowBatch
+  .command('implement')
+  .description('Execute one completely approved batch through its structured handoff')
+  .argument('<workflow-id>', 'Review workflow ID')
+  .argument('<ordinal>', 'One-based batch ordinal')
+  .addOption(
+    new Option('--commit-mode <mode>', 'Who creates the implementation commit').choices([
+      'agent',
+      'human',
+    ]),
+  )
+  .option('--timeout <seconds>', 'Implementation timeout in seconds', positiveInteger, 3600)
+  .action(reviewWorkflowBatchImplementCommand);
+
+reviewWorkflowBatch
+  .command('complete-implementation')
+  .description('Validate the implementation commit and complete implementation')
+  .argument('<workflow-id>', 'Review workflow ID')
+  .argument('<ordinal>', 'One-based batch ordinal')
+  .requiredOption('--commit <sha>', 'Resulting implementation commit SHA')
+  .addOption(
+    new Option('--commit-mode <mode>', 'Who created the implementation commit')
+      .choices(['agent', 'human'])
+      .makeOptionMandatory(),
+  )
+  .action(reviewWorkflowBatchCompleteImplementationCommand);
+
+reviewWorkflowBatch
+  .command('review-code')
+  .description('Run one bounded independent code-review round for a completed implementation')
+  .argument('<workflow-id>', 'Review workflow ID')
+  .argument('<ordinal>', 'One-based batch ordinal')
+  .option('--timeout <seconds>', 'Code-review timeout in seconds', positiveInteger, 1800)
+  .action(reviewWorkflowBatchReviewCodeCommand);
+
+reviewWorkflowBatch
+  .command('findings')
+  .description('List persisted code-review findings, statuses, and disposition decisions')
+  .argument('<workflow-id>', 'Review workflow ID')
+  .argument('<ordinal>', 'One-based batch ordinal')
+  .action(reviewWorkflowBatchFindingsCommand);
+
+reviewWorkflowBatch
+  .command('respond')
+  .description('Submit the consolidated disposition result for the correction pass')
+  .argument('<workflow-id>', 'Review workflow ID')
+  .argument('<ordinal>', 'One-based batch ordinal')
+  .requiredOption('--file <path>', 'Path to the DISPOSITION_RESULT JSON handoff')
+  .action(reviewWorkflowBatchRespondCommand);
+
+reviewWorkflowBatch
+  .command('resume-implementation')
+  .description('Return an awaiting-commit batch to implementation')
+  .argument('<workflow-id>', 'Review workflow ID')
+  .argument('<ordinal>', 'One-based batch ordinal')
+  .option('--timeout <seconds>', 'Implementer preflight timeout in seconds', positiveInteger, 300)
+  .action(reviewWorkflowBatchResumeImplementationCommand);
 
 const debate = program.command('debate').description('Multi-model debate with session persistence');
 

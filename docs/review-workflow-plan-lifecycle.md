@@ -14,6 +14,9 @@ codemoot workflow status <workflow-id>
 codemoot batch list <workflow-id>
 codemoot batch show <workflow-id> <ordinal>
 codemoot batch review-plan <workflow-id> <ordinal>
+codemoot batch implement <workflow-id> <ordinal>
+codemoot batch complete-implementation <workflow-id> <ordinal> --commit <sha> --commit-mode human
+codemoot batch resume-implementation <workflow-id> <ordinal>
 ```
 
 `workflow start` imports the external Markdown plan, assigns stable requirement IDs, resolves the
@@ -32,6 +35,10 @@ must echo the persisted plan ID, content hash, and repository-context SHA. CodeM
 complete finding list, computes the blocking count from the configured severities, and asks the
 Batch 1 kernel to approve or reject the plan. The model cannot choose a different target or
 override the configured blocking policy.
+
+Approved batches continue through the separately documented
+[implementation lifecycle](review-workflow-implementation-lifecycle.md). Planning commands do
+not edit files or create commits.
 
 ## Persistence and identity
 
@@ -55,5 +62,6 @@ bound when available, and the configured minimum identity assurance is enforced 
 - Git access is read-only.
 - Model prose, Markdown fences, trailing text, unknown JSON fields, stale targets, forward
   dependencies, incomplete requirement coverage, and policy-inconsistent verdicts fail closed.
-- Batch implementation, code review, verification execution, merge approval, jobs, MCP tools,
-  and autonomous multi-batch coordination belong to later batches.
+- Code review and the bounded correction loop are delivered by the implementation lifecycle
+  (see review-workflow-implementation-lifecycle.md); verification acceptance, merge approval,
+  jobs, MCP tools, and autonomous multi-batch coordination belong to later batches.

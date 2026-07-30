@@ -28,6 +28,7 @@ export const HANDOFF_PARSE_ERROR_CODES = [
   'SCHEMA_INVALID',
   'TARGET_MISMATCH',
   'EXPECTED_FINDINGS_MISMATCH',
+  'POLICY_MISMATCH',
 ] as const;
 
 export type HandoffParseErrorCode = (typeof HANDOFF_PARSE_ERROR_CODES)[number];

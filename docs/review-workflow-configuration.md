@@ -150,3 +150,19 @@ Creating a commit does not grant implementer or reviewer authority.
 - Unknown fields survive migration.
 - Migration adds `kind` to an existing CLI adapter when it can be inferred from the provider.
 - Legacy workflow, model aliases, and provider behaviour remain unchanged.
+
+## Pacing
+
+`reviewGated.pacing` bounds the review loop (owner-directed amendment, 2026-07-30). Defaults
+encode the hard rules; the schema rejects values permitting a third automatic review round:
+
+```yaml
+reviewGated:
+  pacing:
+    maxCodeReviewRounds: 2        # 1..2; initial + at most one bounded final review
+    maxCorrectionPasses: 1        # 0..1; the single permitted correction pass
+    deferNonBlockingFindings: true
+    unresolvedAfterFinalReview: human_decision_required
+```
+
+Migrated pre-pacing configurations receive these defaults automatically.

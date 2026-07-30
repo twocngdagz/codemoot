@@ -14,7 +14,6 @@ import type {
   CommandReceipt,
   ReviewWorkflowBatch,
   StateChangingCommandRequest,
-  TransitionCommand,
 } from '../review-workflow/types.js';
 import { ReviewWorkflowPersistenceError, ReviewWorkflowStore } from './review-workflow-store.js';
 
@@ -465,6 +464,7 @@ export class ReviewWorkflowCommandStore {
     readonly eventPayload: Readonly<Record<string, unknown>>;
     readonly resultHash: string;
     readonly result?: unknown;
+    readonly transitionActorExecutionId?: string;
   }): CommandCompletion {
     requireNonEmpty(input.eventType, 'Event type');
     requireNonEmpty(input.resultHash, 'Result hash');
@@ -497,14 +497,19 @@ export class ReviewWorkflowCommandStore {
       const currentBatch = reviewWorkflowBatchSchema.parse(
         parseStoredJson(row.payload_json, 'batch aggregate'),
       );
-      const transition = this.deriveAllowedTransition(stored, currentBatch);
+      const transitionActor = this.resolveTransitionActor(stored, input.transitionActorExecutionId);
+      const transition = this.deriveAllowedTransitionForActor(
+        stored,
+        currentBatch,
+        transitionActor,
+      );
       this.assertTransitionMatches(input.commandId, input.transition, transition);
       const nextVersion = row.aggregate_version + 1;
       const nextSequence = row.last_event_sequence + 1;
       const updatedAt = this.timestamp();
       const nextBatch = this.nextBatchSnapshot(
         currentBatch,
-        stored.request.command,
+        stored.request,
         transition,
         nextVersion,
         updatedAt,
@@ -519,6 +524,7 @@ export class ReviewWorkflowCommandStore {
                aggregate_version = ?,
                last_event_sequence = ?,
                current_plan_version_id = ?,
+               original_batch_base_sha = ?,
                blocked_from_state = ?,
                blocked_resume_state = ?,
                payload_json = ?,
@@ -531,6 +537,7 @@ export class ReviewWorkflowCommandStore {
           nextBatch.aggregateVersion,
           nextSequence,
           nextBatch.currentPlanVersionId,
+          nextBatch.originalBatchBaseSha ?? null,
           nextBatch.blockedFromState ?? null,
           nextBatch.blockedResumeState ?? null,
           payloadJson,
@@ -553,6 +560,7 @@ export class ReviewWorkflowCommandStore {
         eventType: input.eventType,
         eventPayload: input.eventPayload,
         createdAt: updatedAt,
+        actorExecutionId: transitionActor.actorExecutionId,
       });
       this.completeReceipt({
         stored,
@@ -568,6 +576,58 @@ export class ReviewWorkflowCommandStore {
         replayed: false,
         command: this.requireCommand(input.commandId),
       };
+    })();
+  }
+
+  /**
+   * Completes an invocation-only receipt: the external side effect ran and its evidence was
+   * persisted, but the state transition it feeds is decided by a separate receipt. Requires a
+   * claimed side effect so at-most-once semantics still hold.
+   */
+  succeedWithoutTransition(input: {
+    readonly commandId: string;
+    readonly resultHash: string;
+    readonly result?: unknown;
+  }): CommandCompletion {
+    requireNonEmpty(input.resultHash, 'Result hash');
+    return this.db.transaction(() => {
+      const stored = this.requireCommand(input.commandId);
+      if (stored.receipt.status === 'SUCCEEDED') {
+        this.assertSuccessfulReplay(stored, input.resultHash);
+        return { replayed: true, command: stored };
+      }
+      this.assertCanComplete(stored);
+      if (stored.sideEffect === null) {
+        throw new ReviewWorkflowPersistenceError(
+          'COMMAND_STATE_CONFLICT',
+          `Command ${input.commandId} has no side effect; complete it with its transition`,
+        );
+      }
+      const updatedAt = this.timestamp();
+      const update = this.db
+        .prepare(
+          `UPDATE review_workflow_command_receipts
+           SET status = 'SUCCEEDED',
+               result_hash = ?,
+               result_json = ?,
+               updated_at = ?
+           WHERE command_id = ? AND status = ?`,
+        )
+        .run(
+          input.resultHash,
+          input.result === undefined ? null : serializeJson(input.result),
+          updatedAt,
+          input.commandId,
+          stored.receipt.status,
+        );
+      if (update.changes !== 1) {
+        throw new ReviewWorkflowPersistenceError(
+          'COMMAND_STATE_CONFLICT',
+          `Command ${input.commandId} completion lost an optimistic race`,
+        );
+      }
+      this.markSideEffectOutcomeRecorded(input.commandId, updatedAt);
+      return { replayed: false, command: this.requireCommand(input.commandId) };
     })();
   }
 
@@ -742,11 +802,24 @@ export class ReviewWorkflowCommandStore {
   private deriveAllowedTransition(
     stored: StoredReviewWorkflowCommand,
     currentBatch: ReviewWorkflowBatch | null,
+    transitionActorExecutionId?: string,
+  ): AllowedTransition {
+    return this.deriveAllowedTransitionForActor(
+      stored,
+      currentBatch,
+      this.resolveTransitionActor(stored, transitionActorExecutionId),
+    );
+  }
+
+  private deriveAllowedTransitionForActor(
+    stored: StoredReviewWorkflowCommand,
+    currentBatch: ReviewWorkflowBatch | null,
+    actor: StateChangingCommandRequest['requester'],
   ): AllowedTransition {
     const result = transitionBatch({
       currentState: currentBatch?.persistedState ?? null,
       command: stored.request.command,
-      actor: stored.request.requester,
+      actor,
       ...(currentBatch?.blockedFromState === undefined
         ? {}
         : { blockedFromState: currentBatch.blockedFromState }),
@@ -761,6 +834,37 @@ export class ReviewWorkflowCommandStore {
       );
     }
     return result;
+  }
+
+  /**
+   * Resolves the actor for kernel re-derivation. The receipt requester records who asked for
+   * the command before any side effect ran; when an agent invocation produced richer
+   * process-attested evidence, the caller names that persisted execution and the kernel is
+   * re-evaluated against the durable record, never a caller-supplied object.
+   */
+  private resolveTransitionActor(
+    stored: StoredReviewWorkflowCommand,
+    transitionActorExecutionId: string | undefined,
+  ): StateChangingCommandRequest['requester'] {
+    if (transitionActorExecutionId === undefined) return stored.request.requester;
+    const entity = this.workflowStore.getEntity('ACTOR_EXECUTION', transitionActorExecutionId);
+    if (entity === null || entity.kind !== 'ACTOR_EXECUTION') {
+      throw new ReviewWorkflowPersistenceError(
+        'PERSISTED_DATA_INVALID',
+        `Transition actor execution ${transitionActorExecutionId} is not persisted`,
+      );
+    }
+    const claimedInvocationId = stored.sideEffect?.sideEffectIdentity;
+    if (
+      claimedInvocationId !== undefined &&
+      entity.value.invocationIdentityId !== claimedInvocationId
+    ) {
+      throw new ReviewWorkflowPersistenceError(
+        'COMMAND_STATE_CONFLICT',
+        `Transition actor ${transitionActorExecutionId} is not bound to the claimed invocation ${claimedInvocationId}`,
+      );
+    }
+    return entity.value;
   }
 
   private assertTransitionMatches(
@@ -784,11 +888,16 @@ export class ReviewWorkflowCommandStore {
 
   private nextBatchSnapshot(
     current: ReviewWorkflowBatch,
-    command: TransitionCommand,
+    request: StateChangingCommandRequest,
     transition: AllowedTransition,
     aggregateVersion: number,
     updatedAt: string,
   ): ReviewWorkflowBatch {
+    const { command } = request;
+    const originalBatchBaseSha =
+      command.type === 'START_IMPLEMENTATION'
+        ? this.implementationBaseSha(current, request.targetCommitSha)
+        : current.originalBatchBaseSha;
     const base = {
       batchId: current.batchId,
       workflowId: current.workflowId,
@@ -801,9 +910,7 @@ export class ReviewWorkflowCommandStore {
           : current.currentPlanVersionId,
       implementerAssignmentId: current.implementerAssignmentId,
       reviewerAssignmentId: current.reviewerAssignmentId,
-      ...(current.originalBatchBaseSha === undefined
-        ? {}
-        : { originalBatchBaseSha: current.originalBatchBaseSha }),
+      ...(originalBatchBaseSha === undefined ? {} : { originalBatchBaseSha }),
       createdAt: current.createdAt,
       updatedAt,
     };
@@ -823,6 +930,28 @@ export class ReviewWorkflowCommandStore {
     });
   }
 
+  private implementationBaseSha(
+    current: ReviewWorkflowBatch,
+    targetCommitSha: string | undefined,
+  ): string {
+    if (targetCommitSha === undefined) {
+      throw new ReviewWorkflowPersistenceError(
+        'PERSISTED_DATA_INVALID',
+        'START_IMPLEMENTATION requires the fresh repository HEAD as its target commit SHA',
+      );
+    }
+    if (
+      current.originalBatchBaseSha !== undefined &&
+      current.originalBatchBaseSha !== targetCommitSha
+    ) {
+      throw new ReviewWorkflowPersistenceError(
+        'COMMAND_STATE_CONFLICT',
+        'An established original batch base SHA cannot be replaced',
+      );
+    }
+    return current.originalBatchBaseSha ?? targetCommitSha;
+  }
+
   private insertEvent(input: {
     readonly stored: StoredReviewWorkflowCommand;
     readonly sequence: number;
@@ -830,6 +959,7 @@ export class ReviewWorkflowCommandStore {
     readonly eventType: string;
     readonly eventPayload: Readonly<Record<string, unknown>>;
     readonly createdAt: string;
+    readonly actorExecutionId?: string;
   }): void {
     this.db
       .prepare(
@@ -852,7 +982,7 @@ export class ReviewWorkflowCommandStore {
         input.aggregateVersion,
         input.eventType,
         input.stored.receipt.commandId,
-        input.stored.receipt.requesterActorExecutionId,
+        input.actorExecutionId ?? input.stored.receipt.requesterActorExecutionId,
         serializeJson(input.eventPayload),
         input.createdAt,
       );

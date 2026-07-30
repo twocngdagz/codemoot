@@ -19,4 +19,10 @@ export const COMPATIBILITY_REVIEW_GATED_CONFIG: ReviewGatedConfig = {
     requireAllFindingResponses: true,
     requireAcceptedAttestations: true,
   },
+  pacing: {
+    maxCodeReviewRounds: 2,
+    maxCorrectionPasses: 1,
+    deferNonBlockingFindings: true,
+    unresolvedAfterFinalReview: 'human_decision_required',
+  },
 };

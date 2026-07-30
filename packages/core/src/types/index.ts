@@ -20,6 +20,7 @@ export type {
   ReviewGatedCommitConfig,
   ReviewGatedBlockingSeverity,
   ReviewGatedGateConfig,
+  ReviewGatedPacingConfig,
   ReviewGatedConfig,
 } from './config.js';
 

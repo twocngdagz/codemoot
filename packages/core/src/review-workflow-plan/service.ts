@@ -274,7 +274,6 @@ export class ReviewWorkflowPlanService {
           currentPlanVersionId: draft.batchPlanVersionId,
           implementerAssignmentId: workflow.implementerAssignmentId,
           reviewerAssignmentId: workflow.reviewerAssignmentId,
-          originalBatchBaseSha: audit.headSha,
           createdAt: input.createdAt,
           updatedAt: input.createdAt,
         };
@@ -415,11 +414,18 @@ export class ReviewWorkflowPlanService {
         result: capture.value.review,
       });
       const current = this.requireBatch(input.batchId);
+      const currentPlan = this.store.getBatchPlan(current.currentPlanVersionId);
+      if (currentPlan === null) {
+        throw new ReviewWorkflowPlanError(
+          'BATCH_NOT_FOUND',
+          `Current batch plan ${current.currentPlanVersionId} does not exist`,
+        );
+      }
       const evidence = {
         reviewedPlanVersionId: plan.batchPlanVersionId,
         currentPlanVersionId: current.currentPlanVersionId,
         reviewedPlanContentHash: plan.contentHash,
-        currentPlanContentHash: plan.contentHash,
+        currentPlanContentHash: currentPlan.contentHash,
         unresolvedFindingCount: blockingFindingCount,
         incompleteDispositionCount: 0,
         roleSeparation: input.roleSeparation,

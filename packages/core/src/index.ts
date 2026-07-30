@@ -26,6 +26,7 @@ export type {
   ReviewGatedCommitConfig,
   ReviewGatedBlockingSeverity,
   ReviewGatedGateConfig,
+  ReviewGatedPacingConfig,
   ReviewGatedConfig,
   // Workflow
   WorkflowDefinition,
@@ -156,6 +157,7 @@ export {
   reviewGatedConfigSchema,
   reviewGatedGateConfigSchema,
   reviewGatedIdentityConfigSchema,
+  reviewGatedPacingConfigSchema,
   validateConfig,
   loadPreset,
   listPresets,
@@ -364,3 +366,4 @@ export * as reviewWorkflowIdentity from './review-workflow-identity/index.js';
 export * as reviewWorkflowBaseline from './review-workflow-baseline/index.js';
 export * as reviewWorkflowVerification from './review-workflow-verification/index.js';
 export * as reviewWorkflowPlan from './review-workflow-plan/index.js';
+export * as reviewWorkflowImplementation from './review-workflow-implementation/index.js';

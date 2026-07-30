@@ -21,6 +21,7 @@ import type {
 
 const NOW = '2026-07-29T00:00:00.000Z';
 const SHA_A = 'a'.repeat(40);
+const SHA_B = 'b'.repeat(40);
 
 const WORKFLOW: WorkflowRun = {
   workflowId: 'workflow-1',
@@ -63,6 +64,45 @@ const PLAN_REFINER: ActorExecutionIdentity = {
   identityAssurance: 'CLI_ASSERTED',
   observedEvidence: [],
   startedAt: NOW,
+};
+
+const IMPLEMENTER: ActorExecutionIdentity = {
+  actorExecutionId: 'actor-implementer',
+  actorType: 'AGENT',
+  assignmentId: WORKFLOW.implementerAssignmentId,
+  sessionIdentityId: 'session-implementer',
+  authoritiesExercised: ['IMPLEMENTER'],
+  identityAssurance: 'PROCESS_ATTESTED',
+  observedEvidence: [],
+  startedAt: NOW,
+};
+
+const IMPLEMENTER_ASSIGNMENT = {
+  assignmentId: WORKFLOW.implementerAssignmentId,
+  workflowId: WORKFLOW.workflowId,
+  assignedRole: 'IMPLEMENTER' as const,
+  configuredAgentKey: 'implementer',
+  configuredModelAlias: 'implementer',
+  expectedAdapterKind: 'CLAUDE' as const,
+  provider: 'anthropic',
+  configuredModel: 'claude-supported',
+  commitPermission: 'AUTHORIZED' as const,
+  configurationHash: WORKFLOW.configurationHash,
+  assignedAt: NOW,
+};
+
+const REVIEWER_ASSIGNMENT = {
+  assignmentId: WORKFLOW.reviewerAssignmentId,
+  workflowId: WORKFLOW.workflowId,
+  assignedRole: 'REVIEWER' as const,
+  configuredAgentKey: 'reviewer',
+  configuredModelAlias: 'reviewer',
+  expectedAdapterKind: 'CODEX' as const,
+  provider: 'openai',
+  configuredModel: 'codex-supported',
+  commitPermission: 'DENIED' as const,
+  configurationHash: WORKFLOW.configurationHash,
+  assignedAt: NOW,
 };
 
 function makeRequest(
@@ -475,6 +515,135 @@ describe('ReviewWorkflowCommandStore', () => {
         aggregateVersion: 1,
         currentPlanVersionId: 'batch-plan-2',
       });
+    } finally {
+      isolatedDb.close();
+    }
+  });
+
+  it('establishes the original batch base exactly once at implementation start', () => {
+    const isolatedDb = openDatabase(':memory:');
+    try {
+      const isolatedWorkflowStore = new ReviewWorkflowStore(isolatedDb);
+      const isolatedCommandStore = new ReviewWorkflowCommandStore(isolatedDb);
+      const approvedBatch: ReviewWorkflowBatch = {
+        ...BATCH,
+        persistedState: 'APPROVED_FOR_IMPLEMENTATION',
+        originalBatchBaseSha: undefined,
+      };
+      const request: StateChangingCommandRequest = {
+        ...makeRequest('command-start-implementation', 0, {
+          type: 'START_IMPLEMENTATION',
+          evidence: {
+            approvedPlanVersionId: BATCH.currentPlanVersionId,
+            currentPlanVersionId: BATCH.currentPlanVersionId,
+            roleSeparation: {
+              implementerAssignment: IMPLEMENTER_ASSIGNMENT,
+              reviewerAssignment: REVIEWER_ASSIGNMENT,
+              implementerSessionIdentityId: IMPLEMENTER.sessionIdentityId,
+              minimumIdentityAssurance: 'PROCESS_ATTESTED',
+            },
+          },
+        }),
+        targetCommitSha: SHA_A,
+        requester: IMPLEMENTER,
+        authorityExercised: 'IMPLEMENTER',
+      };
+      const transition = requireAllowed(request, approvedBatch.persistedState);
+      isolatedWorkflowStore.createWorkflow(WORKFLOW);
+      isolatedWorkflowStore.createBatch(approvedBatch);
+      isolatedCommandStore.reserve(request);
+
+      isolatedCommandStore.succeedWithTransition({
+        commandId: request.commandId,
+        transition,
+        eventType: 'batch.implementation-started',
+        eventPayload: { originalBatchBaseSha: SHA_A },
+        resultHash: 'implementation-start-result',
+      });
+
+      expect(isolatedWorkflowStore.getBatch(BATCH.batchId)).toMatchObject({
+        persistedState: 'IMPLEMENTING',
+        originalBatchBaseSha: SHA_A,
+      });
+      expect(
+        isolatedDb
+          .prepare('SELECT original_batch_base_sha FROM review_workflow_batches WHERE batch_id = ?')
+          .pluck()
+          .get(BATCH.batchId),
+      ).toBe(SHA_A);
+    } finally {
+      isolatedDb.close();
+    }
+  });
+
+  it.each([
+    { name: 'missing', originalBatchBaseSha: undefined, targetCommitSha: undefined },
+    { name: 'replacement', originalBatchBaseSha: SHA_A, targetCommitSha: SHA_B },
+  ])('rejects a $name implementation base at transition completion', (fixture) => {
+    const isolatedDb = openDatabase(':memory:');
+    try {
+      const isolatedWorkflowStore = new ReviewWorkflowStore(isolatedDb);
+      const isolatedCommandStore = new ReviewWorkflowCommandStore(isolatedDb);
+      const approvedBatchBase: ReviewWorkflowBatch = {
+        batchId: BATCH.batchId,
+        workflowId: BATCH.workflowId,
+        ordinal: BATCH.ordinal,
+        persistedState: 'APPROVED_FOR_IMPLEMENTATION',
+        aggregateVersion: BATCH.aggregateVersion,
+        currentPlanVersionId: BATCH.currentPlanVersionId,
+        implementerAssignmentId: BATCH.implementerAssignmentId,
+        reviewerAssignmentId: BATCH.reviewerAssignmentId,
+        createdAt: BATCH.createdAt,
+        updatedAt: BATCH.updatedAt,
+      };
+      const approvedBatch: ReviewWorkflowBatch =
+        fixture.originalBatchBaseSha === undefined
+          ? approvedBatchBase
+          : { ...approvedBatchBase, originalBatchBaseSha: fixture.originalBatchBaseSha };
+      const command: TransitionCommand = {
+        type: 'START_IMPLEMENTATION',
+        evidence: {
+          approvedPlanVersionId: BATCH.currentPlanVersionId,
+          currentPlanVersionId: BATCH.currentPlanVersionId,
+          roleSeparation: {
+            implementerAssignment: IMPLEMENTER_ASSIGNMENT,
+            reviewerAssignment: REVIEWER_ASSIGNMENT,
+            implementerSessionIdentityId: IMPLEMENTER.sessionIdentityId,
+            minimumIdentityAssurance: 'PROCESS_ATTESTED',
+          },
+        },
+      };
+      const requestBase: StateChangingCommandRequest = {
+        commandId: `command-start-${fixture.name}`,
+        workflowId: WORKFLOW.workflowId,
+        batchId: BATCH.batchId,
+        expectedAggregateVersion: 0,
+        canonicalRequestHash: `hash-start-${fixture.name}`,
+        requester: IMPLEMENTER,
+        authorityExercised: 'IMPLEMENTER',
+        command,
+      };
+      const request: StateChangingCommandRequest =
+        fixture.targetCommitSha === undefined
+          ? requestBase
+          : { ...requestBase, targetCommitSha: fixture.targetCommitSha };
+      const transition = requireAllowed(request, approvedBatch.persistedState);
+      isolatedWorkflowStore.createWorkflow(WORKFLOW);
+      isolatedWorkflowStore.createBatch(approvedBatch);
+      isolatedCommandStore.reserve(request);
+
+      expectPersistenceCode(
+        () =>
+          isolatedCommandStore.succeedWithTransition({
+            commandId: request.commandId,
+            transition,
+            eventType: 'batch.implementation-started',
+            eventPayload: {},
+            resultHash: 'invalid-implementation-start',
+          }),
+        fixture.name === 'missing' ? 'PERSISTED_DATA_INVALID' : 'COMMAND_STATE_CONFLICT',
+      );
+      expect(isolatedWorkflowStore.getBatch(BATCH.batchId)).toEqual(approvedBatch);
     } finally {
       isolatedDb.close();
     }

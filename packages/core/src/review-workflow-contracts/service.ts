@@ -158,8 +158,20 @@ export class ReviewWorkflowContractService {
     context: HandoffCaptureContext,
     message: string,
   ): RejectedHandoffCapture {
+    return this.captureRejection(context, 'REFINEMENT_RESULT', message);
+  }
+
+  captureReviewRejection(context: HandoffCaptureContext, message: string): RejectedHandoffCapture {
+    return this.captureRejection(context, 'REVIEW_RESULT', message);
+  }
+
+  private captureRejection(
+    context: HandoffCaptureContext,
+    contractKind: ReviewWorkflowContractKind,
+    message: string,
+  ): RejectedHandoffCapture {
     const error = new HandoffParseError('SCHEMA_INVALID', message);
-    const transcript = rejectedTranscript(context, 'REFINEMENT_RESULT', error);
+    const transcript = rejectedTranscript(context, contractKind, error);
     this.store.saveHandoffCapture({ transcript, entities: [] });
     return {
       accepted: false,
@@ -290,11 +302,21 @@ export class ReviewWorkflowContractService {
       readonly reviewRoundId: string;
       readonly reviewRoundNumber: number;
       readonly expectedTarget: ReviewContractTarget;
+      readonly requiredVerdict?: (contract: ReviewResultContract) => 'APPROVED' | 'NEEDS_REVISION';
     },
   ): HandoffCaptureResult<ReviewCaptureValue> {
     try {
       const contract = parseReviewResult(input.rawTranscript);
       requireExpectedTarget(contract.target, input.expectedTarget);
+      if (input.requiredVerdict !== undefined) {
+        const expectedVerdict = input.requiredVerdict(contract);
+        if (contract.verdict !== expectedVerdict) {
+          throw new HandoffParseError(
+            'POLICY_MISMATCH',
+            `Reviewer verdict must be ${expectedVerdict} for the declared findings`,
+          );
+        }
+      }
       const reviewKind = contract.target.kind;
       const findings = materializeFindings({
         workflowId: input.workflowId,

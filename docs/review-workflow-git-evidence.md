@@ -38,6 +38,10 @@ operation.
 The service requires a clean worktree and `I = H` before review evidence can be
 captured. It verifies that both `B0` and `P` are ancestors of `I`.
 
+`B0` is established once, from a fresh clean HEAD, when the approved batch enters
+`IMPLEMENTING`. Batch-plan materialization does not guess the base of later batches.
+Persistence rejects a missing start target and any attempt to replace an established base.
+
 ## Canonical review ranges
 
 Patch content is generated with one canonical argument form:

@@ -63,6 +63,20 @@ export const reviewWorkflowConfigurationSnapshotSchema = z
     commitPolicy: z.enum(['HUMAN_REQUIRED', 'AGENT_AUTHORIZED', 'EITHER']),
     agentMayCommit: z.boolean(),
     gates: reviewWorkflowGatePolicySnapshotSchema,
+    pacing: z
+      .object({
+        maxCodeReviewRounds: z.number().int().min(1).max(2),
+        maxCorrectionPasses: z.number().int().min(0).max(1),
+        deferNonBlockingFindings: z.literal(true),
+        unresolvedAfterFinalReview: z.literal('human_decision_required'),
+      })
+      .strict()
+      .default({
+        maxCodeReviewRounds: 2,
+        maxCorrectionPasses: 1,
+        deferNonBlockingFindings: true,
+        unresolvedAfterFinalReview: 'human_decision_required',
+      }),
     assignments: z
       .object({
         implementer: agentAssignmentSchema,

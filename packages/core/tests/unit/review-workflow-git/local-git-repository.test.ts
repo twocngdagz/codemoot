@@ -54,6 +54,7 @@ describe('LocalGitRepository', () => {
       branch: 'main',
       clean: true,
       statusPorcelain: '',
+      changedPaths: [],
     });
     expect(worktree.worktreeFingerprint).toBe(createHash('sha256').update('').digest('hex'));
     expect(commit).toMatchObject({
@@ -116,9 +117,17 @@ describe('LocalGitRepository', () => {
 
     expect(worktree.clean).toBe(false);
     expect(worktree.statusPorcelain).toContain('untracked.txt');
+    expect(worktree.changedPaths).toEqual(['untracked.txt']);
     expect(repository.isAncestor(baseSha, descendantSha)).toBe(true);
     expect(repository.isAncestor(descendantSha, baseSha)).toBe(false);
     expect(repository.readHeadSha()).toBe(descendantSha);
     expect(worktree.statusPorcelain).toBe(repository.readWorktree().statusPorcelain);
+  });
+
+  it('reports the destination path for an uncommitted rename', () => {
+    git(repositoryRoot, ['mv', 'src/example.txt', 'src/renamed.txt']);
+    const repository = new LocalGitRepository(repositoryRoot);
+
+    expect(repository.readWorktree().changedPaths).toEqual(['src/renamed.txt']);
   });
 });
