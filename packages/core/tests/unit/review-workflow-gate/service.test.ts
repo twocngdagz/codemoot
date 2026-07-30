@@ -1131,7 +1131,6 @@ describe('ReviewWorkflowGateService', () => {
       configuration: snapshot,
       commandId: `${BATCH_ID}:verify:1`,
       verificationRecordId: `record-${head.slice(0, 8)}-ACCEPTED`,
-      executorActorExecutionId: 'plan-author',
       run: async () => record(),
     });
     expect(first.replayed).toBe(false);
@@ -1142,7 +1141,6 @@ describe('ReviewWorkflowGateService', () => {
       configuration: snapshot,
       commandId: `${BATCH_ID}:verify:1`,
       verificationRecordId: `record-${head.slice(0, 8)}-ACCEPTED`,
-      executorActorExecutionId: 'plan-author',
       run: async () => record(),
     });
     expect(second.replayed).toBe(true);
@@ -1258,7 +1256,6 @@ describe('ReviewWorkflowGateService', () => {
         configuration: snapshot,
         commandId: `${BATCH_ID}:shared-id`,
         verificationRecordId: `${BATCH_ID}:shared-id:record`,
-        executorActorExecutionId: 'plan-author',
         run: async () => persistAcceptedVerification(head),
       }),
     ).rejects.toThrowError(/only a completed identical command can be replayed/);
@@ -1269,7 +1266,6 @@ describe('ReviewWorkflowGateService', () => {
       configuration: snapshot,
       commandId: `${BATCH_ID}:verify:9`,
       verificationRecordId: `record-${head.slice(0, 8)}-ACCEPTED`,
-      executorActorExecutionId: 'plan-author',
       run: async () => persistAcceptedVerification(head),
     });
     expect(verified.replayed).toBe(false);

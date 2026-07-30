@@ -94,7 +94,6 @@ export interface GateVerificationExecutionInput {
   readonly configuration: ReviewWorkflowConfigurationSnapshot;
   readonly commandId: string;
   readonly verificationRecordId: string;
-  readonly executorActorExecutionId: string;
   readonly expectedBatchVersion?: number;
   readonly run: () => Promise<VerificationRecord>;
 }

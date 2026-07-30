@@ -9,6 +9,9 @@ import {
   buildRefinementPrompt,
   deriveVerificationAttestationPolicy,
   deriveVerifyCommandId,
+  parseCodeReviewJobPayload,
+  parseFinalAuditJobPayload,
+  parseVerificationJobPayload,
   resolvePlanVerificationCommand,
 } from '../src/commands/review-workflow.js';
 
@@ -96,6 +99,52 @@ const CRITERIA_FIXTURE: readonly reviewWorkflow.AcceptanceCriterion[] = [
     createdAt: '2026-07-30T12:00:00.000Z',
   },
 ];
+
+describe('review workflow background job payloads', () => {
+  it('round-trips a verification payload and preserves optional fields', () => {
+    expect(
+      parseVerificationJobPayload({
+        ordinal: 12,
+        command: 2,
+        timeout: 900,
+        toolVersion: '9.15.9',
+        expectedVersion: 7,
+      }),
+    ).toEqual({ ordinal: 12, command: 2, timeout: 900, toolVersion: '9.15.9', expectedVersion: 7 });
+    expect(parseVerificationJobPayload({ ordinal: 12, command: 1, timeout: 600 })).toEqual({
+      ordinal: 12,
+      command: 1,
+      timeout: 600,
+    });
+  });
+
+  it('rejects malformed persisted payloads instead of guessing', () => {
+    expect(() =>
+      parseVerificationJobPayload({ ordinal: 0, command: 1, timeout: 600 }),
+    ).toThrowError(/ordinal must be a positive integer/);
+    expect(() =>
+      parseVerificationJobPayload({ ordinal: 1, command: 1, timeout: 600, toolVersion: '' }),
+    ).toThrowError(/toolVersion must be a non-empty string/);
+    expect(() => parseFinalAuditJobPayload({ ordinal: 1 })).toThrowError(
+      /timeout must be a positive integer/,
+    );
+    expect(() =>
+      parseCodeReviewJobPayload({ ordinal: 1, round: 'two', timeout: 600 }),
+    ).toThrowError(/round must be a positive integer/);
+  });
+
+  it('parses audit and review payloads with only their declared fields', () => {
+    expect(parseFinalAuditJobPayload({ ordinal: 12, timeout: 1800 })).toEqual({
+      ordinal: 12,
+      timeout: 1800,
+    });
+    expect(parseCodeReviewJobPayload({ ordinal: 12, round: 2, timeout: 1800 })).toEqual({
+      ordinal: 12,
+      round: 2,
+      timeout: 1800,
+    });
+  });
+});
 
 describe('review workflow gate CLI behavior', () => {
   it('derives a stable verify command identity so a retry replays instead of re-running', () => {

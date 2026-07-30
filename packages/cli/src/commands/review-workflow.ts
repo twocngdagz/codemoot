@@ -13,6 +13,7 @@ import {
   reviewWorkflowGit,
   reviewWorkflowIdentity,
   reviewWorkflowImplementation,
+  reviewWorkflowJobs,
   reviewWorkflowPersistence,
   reviewWorkflowPlan,
   reviewWorkflowVerification,
@@ -643,7 +644,86 @@ export async function reviewWorkflowBatchResumeImplementationCommand(
   });
 }
 
-interface BatchReviewCodeOptions extends WorkflowInvocationOptions {}
+interface BatchReviewCodeOptions extends WorkflowInvocationOptions {
+  readonly background?: boolean;
+}
+
+export interface CodeReviewJobPayload {
+  readonly ordinal: number;
+  readonly round: number;
+  readonly timeout: number;
+}
+
+export function parseCodeReviewJobPayload(
+  payload: Readonly<Record<string, unknown>>,
+): CodeReviewJobPayload {
+  return {
+    ordinal: requirePositiveIntegerField(payload, 'ordinal'),
+    round: requirePositiveIntegerField(payload, 'round'),
+    timeout: requirePositiveIntegerField(payload, 'timeout'),
+  };
+}
+
+async function performCodeReview(
+  runtime: ReviewWorkflowRuntime,
+  projectDir: string,
+  workflowId: string,
+  commandId: string,
+  expectedBatchId: string | null,
+  payload: CodeReviewJobPayload,
+): Promise<Record<string, unknown>> {
+  const context = resolveRuntimeContext(runtime.store, workflowId, projectDir);
+  const batch =
+    expectedBatchId === null
+      ? requireBatchByOrdinal(runtime.store, workflowId, payload.ordinal)
+      : requireBatchMatchingJob(runtime.store, workflowId, payload.ordinal, expectedBatchId);
+  const plan = runtime.store.getBatchPlan(batch.currentPlanVersionId);
+  if (plan === null) throw new Error(`Batch ${batch.batchId} has no current plan`);
+  const result = await runtime.codeReviewService.review({
+    workflowId,
+    batchId: batch.batchId,
+    configuration: context.snapshot,
+    resolution: context.roles.reviewer,
+    commandId,
+    actorExecutionId: `${batch.batchId}:reviewer:${generateId('execution')}`,
+    // The claimed side-effect identity IS the invocation ID (transition-actor binding), so
+    // it is derived from the command ID to give code review a durable receipt identity.
+    invocationId: `${commandId}:code-review-invocation`,
+    sessionIdentityId: `${batch.batchId}:reviewer:${generateId('session')}`,
+    transcriptId: `${batch.batchId}:code-review-${payload.round}:${generateId('transcript')}`,
+    reviewRoundId: reviewWorkflowImplementation.deriveCodeReviewRoundId(
+      batch.batchId,
+      payload.round,
+    ),
+    buildPrompt: (evidence) =>
+      buildCodeReviewPrompt({
+        workflowId,
+        batchId: batch.batchId,
+        batchPlan: plan,
+        evidence,
+      }),
+    options: { timeout: payload.timeout * 1000 },
+  });
+  return result.status === 'REJECTED'
+    ? {
+        status: result.status,
+        workflowId,
+        batchId: batch.batchId,
+        round: result.round,
+        errorCode: result.errorCode,
+        message: result.message,
+      }
+    : {
+        status: result.status,
+        workflowId,
+        batchId: batch.batchId,
+        round: result.round,
+        state: result.batch.persistedState,
+        blockingFindingCount: result.blockingFindingCount,
+        ...(result.status === 'VERIFYING' ? {} : { blockingFindingIds: result.blockingFindingIds }),
+        deferredFindingIds: result.deferredFindingIds,
+      };
+}
 
 export async function reviewWorkflowBatchReviewCodeCommand(
   workflowId: string,
@@ -654,64 +734,27 @@ export async function reviewWorkflowBatchReviewCodeCommand(
     const projectDir = process.cwd();
     const ordinal = parsePositiveInteger(ordinalValue, 'batch ordinal');
     const runtime = createRuntime(db, projectDir);
-    const context = resolveRuntimeContext(runtime.store, workflowId, projectDir);
-    const batch = runtime.store
-      .listBatches(workflowId)
-      .find((candidate) => candidate.ordinal === ordinal);
-    if (batch === undefined) throw new Error(`Workflow ${workflowId} has no batch ${ordinal}`);
+    resolveRuntimeContext(runtime.store, workflowId, projectDir);
+    const batch = requireBatchByOrdinal(runtime.store, workflowId, ordinal);
     const round =
       runtime.implementationStore
         .getEvents(batch.batchId)
         .filter((event) => event.eventType === 'CODE_REVIEW_STARTED').length + 1;
-    const reviewRoundId = reviewWorkflowImplementation.deriveCodeReviewRoundId(
-      batch.batchId,
-      round,
-    );
-    const plan = runtime.store.getBatchPlan(batch.currentPlanVersionId);
-    if (plan === null) throw new Error(`Batch ${batch.batchId} has no current plan`);
-    const result = await runtime.codeReviewService.review({
-      workflowId,
-      batchId: batch.batchId,
-      configuration: context.snapshot,
-      resolution: context.roles.reviewer,
-      commandId: `${batch.batchId}:code-review-${round}`,
-      actorExecutionId: `${batch.batchId}:reviewer:${generateId('execution')}`,
-      invocationId: `${batch.batchId}:reviewer:${generateId('invocation')}`,
-      sessionIdentityId: `${batch.batchId}:reviewer:${generateId('session')}`,
-      transcriptId: `${batch.batchId}:code-review-${round}:${generateId('transcript')}`,
-      reviewRoundId,
-      buildPrompt: (evidence) =>
-        buildCodeReviewPrompt({
-          workflowId,
-          batchId: batch.batchId,
-          batchPlan: plan,
-          evidence,
-        }),
-      options: { timeout: options.timeout * 1000 },
-    });
-    printJson(
-      result.status === 'REJECTED'
-        ? {
-            status: result.status,
-            workflowId,
-            batchId: batch.batchId,
-            round: result.round,
-            errorCode: result.errorCode,
-            message: result.message,
-          }
-        : {
-            status: result.status,
-            workflowId,
-            batchId: batch.batchId,
-            round: result.round,
-            state: result.batch.persistedState,
-            blockingFindingCount: result.blockingFindingCount,
-            ...(result.status === 'VERIFYING'
-              ? {}
-              : { blockingFindingIds: result.blockingFindingIds }),
-            deferredFindingIds: result.deferredFindingIds,
-          },
-    );
+    const commandId = `${batch.batchId}:code-review-${round}`;
+    const payload: CodeReviewJobPayload = { ordinal, round, timeout: options.timeout };
+    if (options.background === true) {
+      const job = runtime.jobService.enqueue({
+        jobId: `${commandId}:job`,
+        workflowId,
+        batchId: batch.batchId,
+        jobType: 'CODE_REVIEW',
+        commandId,
+        payload: { ...payload },
+      });
+      printJson({ status: 'QUEUED', jobId: job.jobId, commandId: job.commandId });
+      return;
+    }
+    printJson(await performCodeReview(runtime, projectDir, workflowId, commandId, null, payload));
   });
 }
 
@@ -821,6 +864,33 @@ interface BatchVerifyOptions {
   readonly toolVersion?: string;
   readonly id?: string;
   readonly expectedVersion?: number;
+  readonly background?: boolean;
+}
+
+export interface VerificationJobPayload {
+  readonly ordinal: number;
+  readonly command: number;
+  readonly timeout: number;
+  readonly toolVersion?: string;
+  readonly expectedVersion?: number;
+}
+
+/** Background job payloads are plain persisted JSON; parse them strictly on the way back in. */
+export function parseVerificationJobPayload(
+  payload: Readonly<Record<string, unknown>>,
+): VerificationJobPayload {
+  const ordinal = requirePositiveIntegerField(payload, 'ordinal');
+  const command = requirePositiveIntegerField(payload, 'command');
+  const timeout = requirePositiveIntegerField(payload, 'timeout');
+  const toolVersion = optionalStringField(payload, 'toolVersion');
+  const expectedVersion = optionalPositiveIntegerField(payload, 'expectedVersion');
+  return {
+    ordinal,
+    command,
+    timeout,
+    ...(toolVersion === undefined ? {} : { toolVersion }),
+    ...(expectedVersion === undefined ? {} : { expectedVersion }),
+  };
 }
 
 /** Stable default command identity so a same-ID retry replays instead of re-executing. */
@@ -839,6 +909,68 @@ export function resolvePlanVerificationCommand(
   return command;
 }
 
+async function performBatchVerification(
+  runtime: ReviewWorkflowRuntime,
+  projectDir: string,
+  workflowId: string,
+  commandId: string,
+  expectedBatchId: string | null,
+  payload: VerificationJobPayload,
+): Promise<Record<string, unknown>> {
+  const context = resolveRuntimeContext(runtime.store, workflowId, projectDir);
+  const batch =
+    expectedBatchId === null
+      ? requireBatchByOrdinal(runtime.store, workflowId, payload.ordinal)
+      : requireBatchMatchingJob(runtime.store, workflowId, payload.ordinal, expectedBatchId);
+  const plan = runtime.store.getBatchPlan(batch.currentPlanVersionId);
+  if (plan === null) throw new Error(`Batch ${batch.batchId} has no current plan`);
+  const command = resolvePlanVerificationCommand(plan, payload.command);
+  const verificationRecordId = `${commandId}:record`;
+  const result = await runtime.gateService.executeVerification({
+    workflowId,
+    batchId: batch.batchId,
+    configuration: context.snapshot,
+    commandId,
+    verificationRecordId,
+    ...(payload.expectedVersion === undefined
+      ? {}
+      : { expectedBatchVersion: payload.expectedVersion }),
+    run: async () => {
+      // The executor actor is persisted only when the operation actually runs — a replayed
+      // command never re-persists identity records.
+      const executor = persistCliActor(runtime.store, {
+        actorExecutionId: `${commandId}:executor:${generateId('execution')}`,
+        actorType: 'HUMAN',
+        authorities: ['VERIFICATION_EXECUTOR'],
+      });
+      const executed = await runtime.verificationService.execute({
+        verificationRecordId,
+        workflowId,
+        batchId: batch.batchId,
+        executorActorExecutionId: executor.actorExecutionId,
+        relatedFindingIds: [],
+        configurationHash: context.snapshot.configurationHash,
+        ...(payload.toolVersion === undefined ? {} : { toolVersion: payload.toolVersion }),
+        command,
+        expectedCommitSha: new reviewWorkflowGit.LocalGitRepository(projectDir).readHeadSha(),
+        timeoutMs: payload.timeout * 1000,
+      });
+      return executed.record;
+    },
+  });
+  return {
+    workflowId,
+    batchId: batch.batchId,
+    commandId,
+    replayed: result.replayed,
+    verificationRecordId: result.record.verificationRecordId,
+    observedStatus: result.record.observedStatus,
+    commitSha: result.record.commitSha,
+    fullLogLocation: result.record.fullLogLocation,
+    note: 'A successful record is evidence only; acceptance requires attestation.',
+  };
+}
+
 export async function reviewWorkflowBatchVerifyCommand(
   workflowId: string,
   ordinalValue: string,
@@ -848,55 +980,33 @@ export async function reviewWorkflowBatchVerifyCommand(
     const projectDir = process.cwd();
     const ordinal = parsePositiveInteger(ordinalValue, 'batch ordinal');
     const runtime = createRuntime(db, projectDir);
-    const context = resolveRuntimeContext(runtime.store, workflowId, projectDir);
+    resolveRuntimeContext(runtime.store, workflowId, projectDir);
     const batch = requireBatchByOrdinal(runtime.store, workflowId, ordinal);
-    const plan = runtime.store.getBatchPlan(batch.currentPlanVersionId);
-    if (plan === null) throw new Error(`Batch ${batch.batchId} has no current plan`);
-    const command = resolvePlanVerificationCommand(plan, options.command);
     const commandId = options.id ?? deriveVerifyCommandId(batch.batchId, options.command);
-    const verificationRecordId = `${commandId}:record`;
-    const executor = persistCliActor(runtime.store, {
-      actorExecutionId: `${commandId}:executor`,
-      actorType: 'HUMAN',
-      authorities: ['VERIFICATION_EXECUTOR'],
-    });
-    const result = await runtime.gateService.executeVerification({
-      workflowId,
-      batchId: batch.batchId,
-      configuration: context.snapshot,
-      commandId,
-      verificationRecordId,
-      executorActorExecutionId: executor.actorExecutionId,
+    const payload: VerificationJobPayload = {
+      ordinal,
+      command: options.command,
+      timeout: options.timeout,
+      ...(options.toolVersion === undefined ? {} : { toolVersion: options.toolVersion }),
       ...(options.expectedVersion === undefined
         ? {}
-        : { expectedBatchVersion: options.expectedVersion }),
-      run: async () => {
-        const executed = await runtime.verificationService.execute({
-          verificationRecordId,
-          workflowId,
-          batchId: batch.batchId,
-          executorActorExecutionId: executor.actorExecutionId,
-          relatedFindingIds: [],
-          configurationHash: context.snapshot.configurationHash,
-          ...(options.toolVersion === undefined ? {} : { toolVersion: options.toolVersion }),
-          command,
-          expectedCommitSha: new reviewWorkflowGit.LocalGitRepository(projectDir).readHeadSha(),
-          timeoutMs: options.timeout * 1000,
-        });
-        return executed.record;
-      },
-    });
-    printJson({
-      workflowId,
-      batchId: batch.batchId,
-      commandId,
-      replayed: result.replayed,
-      verificationRecordId: result.record.verificationRecordId,
-      observedStatus: result.record.observedStatus,
-      commitSha: result.record.commitSha,
-      fullLogLocation: result.record.fullLogLocation,
-      note: 'A successful record is evidence only; acceptance requires attestation.',
-    });
+        : { expectedVersion: options.expectedVersion }),
+    };
+    if (options.background === true) {
+      const job = runtime.jobService.enqueue({
+        jobId: `${commandId}:job`,
+        workflowId,
+        batchId: batch.batchId,
+        jobType: 'VERIFICATION',
+        commandId,
+        payload: { ...payload },
+      });
+      printJson({ status: 'QUEUED', jobId: job.jobId, commandId: job.commandId });
+      return;
+    }
+    printJson(
+      await performBatchVerification(runtime, projectDir, workflowId, commandId, null, payload),
+    );
   });
 }
 
@@ -1035,6 +1145,76 @@ export async function reviewWorkflowBatchAttestVerificationCommand(
 interface BatchFinalAuditOptions extends WorkflowInvocationOptions {
   readonly id?: string;
   readonly expectedVersion?: number;
+  readonly background?: boolean;
+}
+
+export interface FinalAuditJobPayload {
+  readonly ordinal: number;
+  readonly timeout: number;
+  readonly expectedVersion?: number;
+}
+
+export function parseFinalAuditJobPayload(
+  payload: Readonly<Record<string, unknown>>,
+): FinalAuditJobPayload {
+  const ordinal = requirePositiveIntegerField(payload, 'ordinal');
+  const timeout = requirePositiveIntegerField(payload, 'timeout');
+  const expectedVersion = optionalPositiveIntegerField(payload, 'expectedVersion');
+  return {
+    ordinal,
+    timeout,
+    ...(expectedVersion === undefined ? {} : { expectedVersion }),
+  };
+}
+
+async function performFinalAudit(
+  runtime: ReviewWorkflowRuntime,
+  projectDir: string,
+  workflowId: string,
+  commandId: string,
+  expectedBatchId: string | null,
+  payload: FinalAuditJobPayload,
+): Promise<Record<string, unknown>> {
+  const context = resolveRuntimeContext(runtime.store, workflowId, projectDir);
+  const batch =
+    expectedBatchId === null
+      ? requireBatchByOrdinal(runtime.store, workflowId, payload.ordinal)
+      : requireBatchMatchingJob(runtime.store, workflowId, payload.ordinal, expectedBatchId);
+  const plan = runtime.store.getBatchPlan(batch.currentPlanVersionId);
+  if (plan === null) throw new Error(`Batch ${batch.batchId} has no current plan`);
+  const result = await runtime.gateService.finalAudit({
+    workflowId,
+    batchId: batch.batchId,
+    configuration: context.snapshot,
+    resolution: context.roles.reviewer,
+    commandId,
+    actorExecutionId: `${batch.batchId}:final-auditor:${generateId('execution')}`,
+    invocationId: `${batch.batchId}:final-auditor:${generateId('invocation')}`,
+    sessionIdentityId: `${batch.batchId}:final-auditor:${generateId('session')}`,
+    transcriptId: `${batch.batchId}:final-audit:${generateId('transcript')}`,
+    ...(payload.expectedVersion === undefined
+      ? {}
+      : { expectedBatchVersion: payload.expectedVersion }),
+    buildPrompt: (evidence) => buildFinalAuditPrompt({ workflowId, batchPlan: plan, evidence }),
+    options: { timeout: payload.timeout * 1000 },
+  });
+  return result.capture.accepted
+    ? {
+        status: result.replayed ? 'REPLAYED' : 'CAPTURED',
+        workflowId,
+        batchId: batch.batchId,
+        batchState: result.batch.persistedState,
+        verdict: result.capture.value.review.verdict,
+        scopeComplete: result.capture.value.review.scopeComplete,
+        documentationComplete: result.capture.value.review.documentationComplete,
+      }
+    : {
+        status: 'REJECTED',
+        workflowId,
+        batchId: batch.batchId,
+        errorCode: result.capture.error.code,
+        message: result.capture.error.message,
+      };
 }
 
 export async function reviewWorkflowBatchFinalAuditCommand(
@@ -1046,45 +1226,29 @@ export async function reviewWorkflowBatchFinalAuditCommand(
     const projectDir = process.cwd();
     const ordinal = parsePositiveInteger(ordinalValue, 'batch ordinal');
     const runtime = createRuntime(db, projectDir);
-    const context = resolveRuntimeContext(runtime.store, workflowId, projectDir);
+    resolveRuntimeContext(runtime.store, workflowId, projectDir);
     const batch = requireBatchByOrdinal(runtime.store, workflowId, ordinal);
-    const plan = runtime.store.getBatchPlan(batch.currentPlanVersionId);
-    if (plan === null) throw new Error(`Batch ${batch.batchId} has no current plan`);
-    const result = await runtime.gateService.finalAudit({
-      workflowId,
-      batchId: batch.batchId,
-      configuration: context.snapshot,
-      resolution: context.roles.reviewer,
-      commandId: options.id ?? `${batch.batchId}:final-audit`,
+    const commandId = options.id ?? `${batch.batchId}:final-audit`;
+    const payload: FinalAuditJobPayload = {
+      ordinal,
+      timeout: options.timeout,
       ...(options.expectedVersion === undefined
         ? {}
-        : { expectedBatchVersion: options.expectedVersion }),
-      actorExecutionId: `${batch.batchId}:final-auditor:${generateId('execution')}`,
-      invocationId: `${batch.batchId}:final-auditor:${generateId('invocation')}`,
-      sessionIdentityId: `${batch.batchId}:final-auditor:${generateId('session')}`,
-      transcriptId: `${batch.batchId}:final-audit:${generateId('transcript')}`,
-      buildPrompt: (evidence) => buildFinalAuditPrompt({ workflowId, batchPlan: plan, evidence }),
-      options: { timeout: options.timeout * 1000 },
-    });
-    printJson(
-      result.capture.accepted
-        ? {
-            status: result.replayed ? 'REPLAYED' : 'CAPTURED',
-            workflowId,
-            batchId: batch.batchId,
-            batchState: result.batch.persistedState,
-            verdict: result.capture.value.review.verdict,
-            scopeComplete: result.capture.value.review.scopeComplete,
-            documentationComplete: result.capture.value.review.documentationComplete,
-          }
-        : {
-            status: 'REJECTED',
-            workflowId,
-            batchId: batch.batchId,
-            errorCode: result.capture.error.code,
-            message: result.capture.error.message,
-          },
-    );
+        : { expectedVersion: options.expectedVersion }),
+    };
+    if (options.background === true) {
+      const job = runtime.jobService.enqueue({
+        jobId: `${commandId}:job`,
+        workflowId,
+        batchId: batch.batchId,
+        jobType: 'FINAL_AUDIT',
+        commandId,
+        payload: { ...payload },
+      });
+      printJson({ status: 'QUEUED', jobId: job.jobId, commandId: job.commandId });
+      return;
+    }
+    printJson(await performFinalAudit(runtime, projectDir, workflowId, commandId, null, payload));
   });
 }
 
@@ -1211,6 +1375,191 @@ export async function reviewWorkflowBatchReconcileStaleCommand(
   });
 }
 
+type ReviewWorkflowRuntime = ReturnType<typeof createRuntime>;
+
+function requirePositiveIntegerField(
+  payload: Readonly<Record<string, unknown>>,
+  field: string,
+): number {
+  const value = payload[field];
+  if (typeof value !== 'number' || !Number.isInteger(value) || value <= 0) {
+    throw new Error(`Job payload field ${field} must be a positive integer`);
+  }
+  return value;
+}
+
+function optionalPositiveIntegerField(
+  payload: Readonly<Record<string, unknown>>,
+  field: string,
+): number | undefined {
+  return payload[field] === undefined ? undefined : requirePositiveIntegerField(payload, field);
+}
+
+function optionalStringField(
+  payload: Readonly<Record<string, unknown>>,
+  field: string,
+): string | undefined {
+  const value = payload[field];
+  if (value === undefined) return undefined;
+  if (typeof value !== 'string' || value.length === 0) {
+    throw new Error(`Job payload field ${field} must be a non-empty string`);
+  }
+  return value;
+}
+
+/**
+ * The executor table used by the background worker. Every executor passes the job's
+ * ORIGINAL command ID through to the underlying workflow service, so a retried job replays
+ * the durable receipt instead of repeating any agent or verification invocation.
+ */
+function buildJobExecutors(
+  runtime: ReviewWorkflowRuntime,
+  projectDir: string,
+): Record<reviewWorkflowJobs.ReviewWorkflowJobType, reviewWorkflowJobs.ReviewWorkflowJobExecutor> {
+  return {
+    VERIFICATION: (job) =>
+      performBatchVerification(
+        runtime,
+        projectDir,
+        job.workflowId,
+        job.commandId,
+        job.batchId,
+        parseVerificationJobPayload(job.payload),
+      ),
+    FINAL_AUDIT: (job) =>
+      performFinalAudit(
+        runtime,
+        projectDir,
+        job.workflowId,
+        job.commandId,
+        job.batchId,
+        parseFinalAuditJobPayload(job.payload),
+      ),
+    CODE_REVIEW: (job) =>
+      performCodeReview(
+        runtime,
+        projectDir,
+        job.workflowId,
+        job.commandId,
+        job.batchId,
+        parseCodeReviewJobPayload(job.payload),
+      ),
+  };
+}
+
+interface JobsRunOptions {
+  readonly worker?: string;
+  readonly maxJobs: number;
+  readonly lease: number;
+}
+
+export async function reviewWorkflowJobsRunCommand(options: JobsRunOptions): Promise<void> {
+  await withDatabase(async (db) => {
+    const projectDir = process.cwd();
+    const runtime = createRuntime(db, projectDir);
+    const workerId = options.worker ?? `worker:${generateId('worker')}`;
+    const executors = buildJobExecutors(runtime, projectDir);
+    const processed: Record<string, unknown>[] = [];
+    for (let index = 0; index < options.maxJobs; index += 1) {
+      const outcome = await runtime.jobService.runNext({
+        workerId,
+        leaseSeconds: options.lease,
+        executors,
+      });
+      if (outcome.outcome === 'IDLE') break;
+      processed.push({
+        jobId: outcome.job.jobId,
+        commandId: outcome.job.commandId,
+        jobType: outcome.job.jobType,
+        outcome: outcome.outcome,
+        status: outcome.job.status,
+        attemptCount: outcome.job.attemptCount,
+        ...(outcome.job.errorCode === undefined ? {} : { errorCode: outcome.job.errorCode }),
+      });
+    }
+    printJson({ workerId, processed });
+  });
+}
+
+export async function reviewWorkflowJobsListCommand(workflowId: string): Promise<void> {
+  await withDatabase(async (db) => {
+    const runtime = createRuntime(db, process.cwd());
+    printJson({
+      workflowId,
+      jobs: runtime.jobStore.list(workflowId).map((job) => ({
+        jobId: job.jobId,
+        batchId: job.batchId,
+        jobType: job.jobType,
+        commandId: job.commandId,
+        status: job.status,
+        attemptCount: job.attemptCount,
+        maxAttempts: job.maxAttempts,
+        ...(job.errorCode === undefined ? {} : { errorCode: job.errorCode }),
+        ...(job.errorMessage === undefined ? {} : { errorMessage: job.errorMessage }),
+      })),
+    });
+  });
+}
+
+export async function reviewWorkflowJobsShowCommand(jobId: string): Promise<void> {
+  await withDatabase(async (db) => {
+    const runtime = createRuntime(db, process.cwd());
+    const job = runtime.jobStore.require(jobId);
+    printJson({ ...job });
+  });
+}
+
+export async function reviewWorkflowJobsCancelCommand(jobId: string): Promise<void> {
+  await withDatabase(async (db) => {
+    const runtime = createRuntime(db, process.cwd());
+    const job = runtime.jobService.cancel(jobId);
+    printJson({ jobId: job.jobId, status: job.status });
+  });
+}
+
+interface EventsOptions {
+  readonly after: number;
+  readonly limit: number;
+  readonly cursor?: string;
+  readonly ack?: boolean;
+}
+
+export async function reviewWorkflowEventsCommand(
+  workflowId: string,
+  options: EventsOptions,
+): Promise<void> {
+  await withDatabase(async (db) => {
+    const runtime = createRuntime(db, process.cwd());
+    const cursor = options.cursor === undefined ? null : runtime.jobStore.getCursor(options.cursor);
+    if (cursor !== null && cursor.workflowId !== workflowId) {
+      throw new Error(`Cursor ${options.cursor} belongs to workflow ${cursor.workflowId}`);
+    }
+    const afterEventId = cursor === null ? options.after : cursor.lastEventId;
+    const events = runtime.jobStore.listWorkflowEvents(workflowId, afterEventId, options.limit);
+    const lastEventId = events.at(-1)?.eventId ?? afterEventId;
+    if (options.cursor !== undefined && options.ack === true && events.length > 0) {
+      runtime.jobStore.advanceCursor({ cursorId: options.cursor, workflowId, lastEventId });
+    }
+    printJson({
+      workflowId,
+      afterEventId,
+      lastEventId,
+      ...(options.cursor === undefined
+        ? {}
+        : { cursorId: options.cursor, acknowledged: options.ack === true && events.length > 0 }),
+      events: events.map((event) => ({
+        eventId: event.eventId,
+        batchId: event.batchId,
+        sequence: event.sequence,
+        eventType: event.eventType,
+        commandId: event.commandId,
+        payload: event.payload,
+        createdAt: event.createdAt,
+      })),
+    });
+  });
+}
+
 export function buildFinalAuditPrompt(input: {
   readonly workflowId: string;
   readonly batchPlan: unknown;
@@ -1241,6 +1590,25 @@ ${JSON.stringify(input.batchPlan, null, 2)}
 
 Final cumulative diff:
 ${evidence.cumulativePatch}`;
+}
+
+/**
+ * Resolves a batch by ordinal and requires it to be the job's authoritative batch — a
+ * payload whose ordinal points at a different batch must never reach the operation.
+ */
+export function requireBatchMatchingJob(
+  store: reviewWorkflowPlan.ReviewWorkflowPlanStore,
+  workflowId: string,
+  ordinal: number,
+  expectedBatchId: string,
+) {
+  const batch = requireBatchByOrdinal(store, workflowId, ordinal);
+  if (batch.batchId !== expectedBatchId) {
+    throw new Error(
+      `Job payload ordinal ${ordinal} resolves to batch ${batch.batchId}, not the job's batch ${expectedBatchId}`,
+    );
+  }
+  return batch;
 }
 
 function requireBatchByOrdinal(
@@ -1387,6 +1755,7 @@ function createRuntime(db: ReturnType<typeof openDatabase>, projectDir: string) 
     db,
   );
   const commandStore = new reviewWorkflowPersistence.ReviewWorkflowCommandStore(db);
+  const jobStore = new reviewWorkflowJobs.ReviewWorkflowJobStore(db);
   const contractService = new reviewWorkflowContracts.ReviewWorkflowContractService(
     store.workflowStore,
   );
@@ -1416,6 +1785,8 @@ function createRuntime(db: ReturnType<typeof openDatabase>, projectDir: string) 
       repository,
       roleInvocation,
     ),
+    jobStore,
+    jobService: new reviewWorkflowJobs.ReviewWorkflowJobService(jobStore, commandStore),
     gateStore,
     gateService: new reviewWorkflowGate.ReviewWorkflowGateService(
       gateStore,

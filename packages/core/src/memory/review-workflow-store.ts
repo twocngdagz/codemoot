@@ -552,6 +552,49 @@ export class ReviewWorkflowStore {
     });
   }
 
+  /** Workflow-scoped incremental event read: everything after the event-ID cursor, oldest first. */
+  listWorkflowEvents(
+    workflowId: string,
+    afterEventId = 0,
+    limit = 100,
+  ): readonly ReviewWorkflowEvent[] {
+    const rows = this.db
+      .prepare(
+        `SELECT
+          event_id,
+          workflow_id,
+          batch_id,
+          sequence,
+          aggregate_version,
+          event_type,
+          command_id,
+          actor_execution_id,
+          payload_json,
+          created_at
+        FROM review_workflow_events
+        WHERE workflow_id = ? AND event_id > ?
+        ORDER BY event_id ASC
+        LIMIT ?`,
+      )
+      .all(workflowId, afterEventId, limit);
+
+    return rows.map((row) => {
+      const parsed = eventRowSchema.parse(row);
+      return {
+        eventId: parsed.event_id,
+        workflowId: parsed.workflow_id,
+        batchId: parsed.batch_id,
+        sequence: parsed.sequence,
+        aggregateVersion: parsed.aggregate_version,
+        eventType: parsed.event_type,
+        commandId: parsed.command_id,
+        actorExecutionId: parsed.actor_execution_id,
+        payload: parseJsonObject(parsed.payload_json),
+        createdAt: parsed.created_at,
+      };
+    });
+  }
+
   /**
    * Records the reviewer's decision on one pending disposition. Dispositions are otherwise
    * immutable; only the PENDING → ACCEPTED/REJECTED decision fields may be completed, and a

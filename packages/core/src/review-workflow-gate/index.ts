@@ -2,6 +2,7 @@ export {
   ReviewWorkflowGateService,
   deriveFinalAuditRangeEvidenceId,
   deriveFinalAuditRoundId,
+  deriveFinalAuditSideEffectIdentity,
 } from './service.js';
 export { ReviewWorkflowGateStore } from './store.js';
 export {

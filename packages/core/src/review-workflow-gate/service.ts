@@ -90,6 +90,16 @@ export function deriveFinalAuditRoundId(batchId: string): string {
   return `${batchId}:final-audit:1`;
 }
 
+/**
+ * The final audit completes without a state transition, so its claimed side-effect identity
+ * is a deterministic derivation rather than the per-attempt invocation ID. This gives the
+ * final audit a durable identity distinct from code review (whose claimed identity must be
+ * its invocation, for transition-actor binding) even when command IDs collide.
+ */
+export function deriveFinalAuditSideEffectIdentity(commandId: string): string {
+  return `${commandId}:final-audit-invocation`;
+}
+
 export class ReviewWorkflowGateService {
   constructor(
     private readonly store: ReviewWorkflowGateStore,
@@ -114,7 +124,10 @@ export class ReviewWorkflowGateService {
       workflowId: input.workflowId,
       batchId: input.batchId,
       commandType: 'START_CODE_REVIEW',
-      sideEffect: { kind: 'AGENT_INVOCATION' },
+      sideEffect: {
+        kind: 'AGENT_INVOCATION',
+        identity: deriveFinalAuditSideEffectIdentity(input.commandId),
+      },
     });
     if (replayed !== null) return this.replayFinalAudit(input.batchId);
     this.requireState(context.batch, 'VERIFYING');
@@ -208,7 +221,10 @@ export class ReviewWorkflowGateService {
         : { expectedVersion: input.expectedBatchVersion }),
     });
     this.commandStore.reserve(request, 'AGENT_INVOCATION');
-    this.commandStore.claimSideEffect(input.commandId, input.invocationId);
+    this.commandStore.claimSideEffect(
+      input.commandId,
+      deriveFinalAuditSideEffectIdentity(input.commandId),
+    );
     let prepared: PreparedRoleInvocation;
     try {
       prepared = await this.roleInvoker.prepare({

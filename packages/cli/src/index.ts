@@ -1,3 +1,5 @@
+import { realpathSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { Command, InvalidArgumentError, Option } from 'commander';
 
 import { CLEANUP_TIMEOUT_SEC, VERSION } from '@codemoot/core';
@@ -49,6 +51,11 @@ import {
   reviewWorkflowBatchReviewPlanCommand,
   reviewWorkflowBatchShowCommand,
   reviewWorkflowBatchVerifyCommand,
+  reviewWorkflowEventsCommand,
+  reviewWorkflowJobsCancelCommand,
+  reviewWorkflowJobsListCommand,
+  reviewWorkflowJobsRunCommand,
+  reviewWorkflowJobsShowCommand,
   reviewWorkflowRefineCommand,
   reviewWorkflowStartCommand,
   reviewWorkflowStatusCommand,
@@ -324,6 +331,7 @@ reviewWorkflowBatch
   .argument('<workflow-id>', 'Review workflow ID')
   .argument('<ordinal>', 'One-based batch ordinal')
   .option('--timeout <seconds>', 'Code-review timeout in seconds', positiveInteger, 1800)
+  .option('--background', 'Enqueue as a background job and return job and command IDs')
   .action(reviewWorkflowBatchReviewCodeCommand);
 
 reviewWorkflowBatch
@@ -361,6 +369,9 @@ reviewWorkflowBatch
   )
   .option('--timeout <seconds>', 'Verification command timeout in seconds', positiveInteger, 1800)
   .option('--tool-version <version>', 'Observed tool version recorded as evidence')
+  .option('--id <command-id>', 'Stable command ID; a same-ID retry replays the persisted record')
+  .option('--expected-version <n>', 'Expected batch aggregate version', positiveInteger)
+  .option('--background', 'Enqueue as a background job and return job and command IDs')
   .action(reviewWorkflowBatchVerifyCommand);
 
 reviewWorkflowBatch
@@ -382,6 +393,7 @@ reviewWorkflowBatch
   .option('--timeout <seconds>', 'Final-audit timeout in seconds', positiveInteger, 1800)
   .option('--id <command-id>', 'Stable command ID; a same-ID retry replays the persisted audit')
   .option('--expected-version <n>', 'Expected batch aggregate version', positiveInteger)
+  .option('--background', 'Enqueue as a background job and return job and command IDs')
   .action(reviewWorkflowBatchFinalAuditCommand);
 
 reviewWorkflowBatch
@@ -411,6 +423,51 @@ reviewWorkflowBatch
   .option('--id <command-id>', 'Stable command ID; a same-ID retry replays the reconciliation')
   .option('--expected-version <n>', 'Expected batch aggregate version', positiveInteger)
   .action(reviewWorkflowBatchReconcileStaleCommand);
+
+const reviewWorkflowJobsCommand = reviewWorkflow
+  .command('jobs')
+  .description('Background workflow jobs: durable, receipt-bound, replay-safe');
+
+reviewWorkflowJobsCommand
+  .command('run')
+  .description('Claim and process queued workflow jobs; retries never repeat invocations')
+  .option('--worker <id>', 'Stable worker identity for lease ownership')
+  .option('--max-jobs <n>', 'Maximum jobs to process before exiting', positiveInteger, 10)
+  .option('--lease <seconds>', 'Claim lease duration in seconds', positiveInteger, 1800)
+  .action(reviewWorkflowJobsRunCommand);
+
+reviewWorkflowJobsCommand
+  .command('list')
+  .description('List background jobs for a workflow')
+  .argument('<workflow-id>', 'Review workflow ID')
+  .action(reviewWorkflowJobsListCommand);
+
+reviewWorkflowJobsCommand
+  .command('show')
+  .description('Show one background job, including payload and recorded outcome')
+  .argument('<job-id>', 'Job ID')
+  .action(reviewWorkflowJobsShowCommand);
+
+reviewWorkflowJobsCommand
+  .command('cancel')
+  .description('Cancel a queued or running background job')
+  .argument('<job-id>', 'Job ID')
+  .action(reviewWorkflowJobsCancelCommand);
+
+reviewWorkflow
+  .command('events')
+  .description('Read workflow events incrementally by event-ID cursor')
+  .argument('<workflow-id>', 'Review workflow ID')
+  .option(
+    '--after <event-id>',
+    'Read events with an event ID greater than this',
+    positiveInteger,
+    0,
+  )
+  .option('--limit <n>', 'Maximum events to return', positiveInteger, 100)
+  .option('--cursor <id>', 'Named durable cursor; reading starts after its last position')
+  .option('--ack', 'Advance the named cursor past the returned events')
+  .action(reviewWorkflowEventsCommand);
 
 const debate = program.command('debate').description('Multi-model debate with session persistence');
 
@@ -707,6 +764,17 @@ jobs
   .option('--worker-id <id>', 'Worker identifier', `w-${Date.now()}`)
   .action(workerCommand);
 
-program.parse();
+// Parse only when executed as the CLI entry point; importing this module (for command-surface
+// tests) must never trigger argument parsing.
+const entryPath = process.argv[1];
+let invokedDirectly = false;
+if (entryPath !== undefined) {
+  try {
+    invokedDirectly = realpathSync(entryPath) === fileURLToPath(import.meta.url);
+  } catch {
+    invokedDirectly = false;
+  }
+}
+if (invokedDirectly) program.parse();
 
 export { program };

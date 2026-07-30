@@ -503,6 +503,37 @@ export const REVIEW_WORKFLOW_MIGRATIONS = [
   `CREATE INDEX IF NOT EXISTS idx_review_workflow_baseline_comparison_attestations
     ON review_workflow_baseline_comparison_attestations(comparison_id, decision, created_at)`,
 
+  `CREATE TABLE IF NOT EXISTS review_workflow_jobs (
+    job_id            TEXT PRIMARY KEY,
+    workflow_id       TEXT NOT NULL REFERENCES review_workflows(workflow_id),
+    batch_id          TEXT NOT NULL REFERENCES review_workflow_batches(batch_id),
+    job_type          TEXT NOT NULL CHECK(job_type IN ('CODE_REVIEW', 'FINAL_AUDIT', 'VERIFICATION')),
+    command_id        TEXT NOT NULL UNIQUE,
+    expected_receipt_json TEXT NOT NULL,
+    status            TEXT NOT NULL CHECK(status IN ('QUEUED', 'RUNNING', 'SUCCEEDED', 'FAILED', 'CANCELLED')),
+    attempt_count     INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count >= 0),
+    max_attempts      INTEGER NOT NULL CHECK(max_attempts > 0),
+    payload_json      TEXT NOT NULL,
+    result_json       TEXT,
+    error_code        TEXT,
+    error_message     TEXT,
+    worker_id         TEXT,
+    lease_expires_at  TEXT,
+    created_at        TEXT NOT NULL,
+    updated_at        TEXT NOT NULL
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_review_workflow_jobs_claimable
+    ON review_workflow_jobs(status, created_at)`,
+  `CREATE INDEX IF NOT EXISTS idx_review_workflow_jobs_workflow
+    ON review_workflow_jobs(workflow_id, created_at)`,
+
+  `CREATE TABLE IF NOT EXISTS review_workflow_event_cursors (
+    cursor_id      TEXT PRIMARY KEY,
+    workflow_id    TEXT NOT NULL REFERENCES review_workflows(workflow_id),
+    last_event_id  INTEGER NOT NULL DEFAULT 0 CHECK(last_event_id >= 0),
+    updated_at     TEXT NOT NULL
+  )`,
+
   `CREATE TABLE IF NOT EXISTS review_workflow_review_range_evidence (
     review_range_evidence_id  TEXT PRIMARY KEY,
     workflow_id               TEXT NOT NULL REFERENCES review_workflows(workflow_id),
