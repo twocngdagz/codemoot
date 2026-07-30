@@ -25,6 +25,10 @@ describe('openDatabase', () => {
     expect(names).toContain('review_workflow_handoff_transcripts');
     expect(names).toContain('review_workflow_structured_reviews');
     expect(names).toContain('review_workflow_verification_attestations');
+    expect(names).toContain('review_workflow_verification_baselines');
+    expect(names).toContain('review_workflow_verification_baseline_approvals');
+    expect(names).toContain('review_workflow_verification_baseline_comparisons');
+    expect(names).toContain('review_workflow_baseline_comparison_attestations');
     db.close();
   });
 
@@ -70,7 +74,7 @@ describe('openDatabase', () => {
   it('sets schema version', () => {
     const db = openDatabase(':memory:');
     const version = getSchemaVersion(db);
-    expect(version).toBe('10');
+    expect(version).toBe('11');
     db.close();
   });
 
@@ -79,11 +83,11 @@ describe('openDatabase', () => {
     // Run migrations again -- should be idempotent
     runMigrations(db);
     const version = getSchemaVersion(db);
-    expect(version).toBe('10');
+    expect(version).toBe('11');
     db.close();
   });
 
-  it('upgrades a v9 database additively without changing legacy rows', () => {
+  it('upgrades a v10 database additively without changing legacy rows', () => {
     const db = new Database(':memory:');
     db.pragma('foreign_keys = ON');
     db.exec(`
@@ -91,7 +95,7 @@ describe('openDatabase', () => {
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL
       );
-      INSERT INTO schema_meta(key, value) VALUES ('version', '9');
+      INSERT INTO schema_meta(key, value) VALUES ('version', '10');
       CREATE TABLE legacy_sentinel (
         id TEXT PRIMARY KEY,
         value TEXT NOT NULL
@@ -101,7 +105,7 @@ describe('openDatabase', () => {
 
     runMigrations(db);
 
-    expect(getSchemaVersion(db)).toBe('10');
+    expect(getSchemaVersion(db)).toBe('11');
     expect(
       db.prepare('SELECT value FROM legacy_sentinel WHERE id = ?').pluck().get('legacy-1'),
     ).toBe('preserve-me');
@@ -120,13 +124,15 @@ describe('openDatabase', () => {
            FROM sqlite_master
            WHERE type = 'table'
              AND name IN (
-               'review_workflow_handoff_transcripts',
-               'review_workflow_structured_reviews'
+               'review_workflow_verification_baselines',
+               'review_workflow_verification_baseline_approvals',
+               'review_workflow_verification_baseline_comparisons',
+               'review_workflow_baseline_comparison_attestations'
              )`,
         )
         .pluck()
         .get(),
-    ).toBe(2);
+    ).toBe(4);
     db.close();
   });
 });

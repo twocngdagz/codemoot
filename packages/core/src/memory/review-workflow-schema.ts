@@ -417,6 +417,92 @@ export const REVIEW_WORKFLOW_MIGRATIONS = [
   `CREATE INDEX IF NOT EXISTS idx_review_workflow_attestations_record
     ON review_workflow_verification_attestations(verification_record_id, decision)`,
 
+  `CREATE TABLE IF NOT EXISTS review_workflow_verification_baselines (
+    baseline_id                    TEXT PRIMARY KEY,
+    workflow_id                    TEXT NOT NULL REFERENCES review_workflows(workflow_id),
+    capture_batch_id               TEXT NOT NULL REFERENCES review_workflow_batches(batch_id),
+    verification_record_id         TEXT NOT NULL UNIQUE
+                                   REFERENCES review_workflow_verification_records(
+                                     verification_record_id
+                                   ),
+    tool_name                      TEXT NOT NULL,
+    tool_version                   TEXT NOT NULL,
+    baseline_commit_sha            TEXT NOT NULL,
+    configuration_hash             TEXT NOT NULL,
+    normalizer_id                  TEXT NOT NULL,
+    normalization_schema_version   INTEGER NOT NULL
+                                   CHECK(normalization_schema_version > 0),
+    finding_count                  INTEGER NOT NULL CHECK(finding_count >= 0),
+    payload_json                   TEXT NOT NULL,
+    record_hash                    TEXT NOT NULL,
+    created_at                     TEXT NOT NULL
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_review_workflow_baselines_workflow
+    ON review_workflow_verification_baselines(workflow_id, tool_name, created_at)`,
+
+  `CREATE TABLE IF NOT EXISTS review_workflow_verification_baseline_approvals (
+    baseline_approval_id          TEXT PRIMARY KEY,
+    baseline_id                   TEXT NOT NULL
+                                  REFERENCES review_workflow_verification_baselines(baseline_id),
+    workflow_id                   TEXT NOT NULL REFERENCES review_workflows(workflow_id),
+    decision                      TEXT NOT NULL CHECK(decision IN ('ACCEPTED', 'REJECTED')),
+    reviewer_actor_execution_id   TEXT NOT NULL,
+    payload_json                  TEXT NOT NULL,
+    record_hash                   TEXT NOT NULL,
+    created_at                    TEXT NOT NULL
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_review_workflow_baseline_approvals
+    ON review_workflow_verification_baseline_approvals(baseline_id, decision, created_at)`,
+
+  `CREATE TABLE IF NOT EXISTS review_workflow_verification_baseline_comparisons (
+    comparison_id                  TEXT PRIMARY KEY,
+    workflow_id                    TEXT NOT NULL REFERENCES review_workflows(workflow_id),
+    batch_id                       TEXT NOT NULL REFERENCES review_workflow_batches(batch_id),
+    baseline_id                    TEXT NOT NULL
+                                   REFERENCES review_workflow_verification_baselines(baseline_id),
+    baseline_approval_id           TEXT NOT NULL
+                                   REFERENCES review_workflow_verification_baseline_approvals(
+                                     baseline_approval_id
+                                   ),
+    current_verification_record_id TEXT NOT NULL
+                                   REFERENCES review_workflow_verification_records(
+                                     verification_record_id
+                                   ),
+    result                         TEXT NOT NULL
+                                   CHECK(result IN ('PASSED', 'FAILED', 'INCOMPARABLE')),
+    current_commit_sha             TEXT NOT NULL,
+    introduced_count               INTEGER,
+    resolved_count                 INTEGER,
+    unchanged_count                INTEGER,
+    payload_json                   TEXT NOT NULL,
+    record_hash                    TEXT NOT NULL,
+    created_at                     TEXT NOT NULL
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_review_workflow_baseline_comparisons
+    ON review_workflow_verification_baseline_comparisons(
+      batch_id,
+      current_commit_sha,
+      result
+    )`,
+
+  `CREATE TABLE IF NOT EXISTS review_workflow_baseline_comparison_attestations (
+    comparison_attestation_id     TEXT PRIMARY KEY,
+    comparison_id                 TEXT NOT NULL
+                                  REFERENCES review_workflow_verification_baseline_comparisons(
+                                    comparison_id
+                                  ),
+    workflow_id                   TEXT NOT NULL REFERENCES review_workflows(workflow_id),
+    batch_id                      TEXT NOT NULL REFERENCES review_workflow_batches(batch_id),
+    decision                      TEXT NOT NULL CHECK(decision IN ('ACCEPTED', 'REJECTED')),
+    reviewer_actor_execution_id   TEXT NOT NULL,
+    reviewed_commit_sha           TEXT NOT NULL,
+    payload_json                  TEXT NOT NULL,
+    record_hash                   TEXT NOT NULL,
+    created_at                    TEXT NOT NULL
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_review_workflow_baseline_comparison_attestations
+    ON review_workflow_baseline_comparison_attestations(comparison_id, decision, created_at)`,
+
   `CREATE TABLE IF NOT EXISTS review_workflow_review_range_evidence (
     review_range_evidence_id  TEXT PRIMARY KEY,
     workflow_id               TEXT NOT NULL REFERENCES review_workflows(workflow_id),
@@ -443,6 +529,10 @@ export const REVIEW_WORKFLOW_MIGRATIONS = [
     'review_workflow_handoff_transcripts',
     'review_workflow_structured_reviews',
     'review_workflow_verification_records',
+    'review_workflow_verification_baselines',
+    'review_workflow_verification_baseline_approvals',
+    'review_workflow_verification_baseline_comparisons',
+    'review_workflow_baseline_comparison_attestations',
     'review_workflow_review_range_evidence',
   ].flatMap((table) => [
     `CREATE TRIGGER IF NOT EXISTS ${table}_immutable_update
