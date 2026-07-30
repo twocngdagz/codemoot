@@ -36,6 +36,18 @@ export {
   reviewOutputSchema,
   debateOutputSchema,
 } from './mcp.js';
+export {
+  workflowEventsInputSchema,
+  workflowGateInputSchema,
+  workflowJobsInputSchema,
+  workflowStatusInputSchema,
+} from './mcp.js';
+export type {
+  WorkflowEventsInput,
+  WorkflowGateInput,
+  WorkflowJobsInput,
+  WorkflowStatusInput,
+} from './mcp.js';
 export type {
   ResultStatus,
   MeteringSource,

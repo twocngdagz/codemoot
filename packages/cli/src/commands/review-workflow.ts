@@ -1315,16 +1315,16 @@ export async function reviewWorkflowBatchMarkMergedCommand(
     const runtime = createRuntime(db, projectDir);
     resolveRuntimeContext(runtime.store, workflowId, projectDir);
     const batch = requireBatchByOrdinal(runtime.store, workflowId, ordinal);
-    const recorder = persistCliActor(runtime.store, {
-      actorExecutionId: `${batch.batchId}:merge-recorder:${generateId('execution')}`,
-      actorType: 'HUMAN',
-      authorities: ['MERGE_RECORDER'],
-    });
+    // The recorder identity is persisted by the coordinator when the command is reserved —
+    // pre-persisting a variant here would conflict with that immutable record.
     const merged = runtime.gateService.markMerged({
       workflowId,
       batchId: batch.batchId,
       mergeCommitSha: options.mergeSha,
-      recorder: { actorExecutionId: recorder.actorExecutionId, actorType: 'HUMAN' },
+      recorder: {
+        actorExecutionId: `${options.id ?? `${batch.batchId}:mark-merged`}:recorder`,
+        actorType: 'HUMAN',
+      },
       commandId: options.id ?? `${batch.batchId}:mark-merged`,
       ...(options.expectedVersion === undefined
         ? {}

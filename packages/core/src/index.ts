@@ -108,6 +108,16 @@ export {
   costInputSchema,
   reviewOutputSchema,
   debateOutputSchema,
+  workflowEventsInputSchema,
+  workflowGateInputSchema,
+  workflowJobsInputSchema,
+  workflowStatusInputSchema,
+} from './types/index.js';
+export type {
+  WorkflowEventsInput,
+  WorkflowGateInput,
+  WorkflowJobsInput,
+  WorkflowStatusInput,
 } from './types/index.js';
 
 // Utilities

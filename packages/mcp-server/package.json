@@ -12,7 +12,9 @@
   "homepage": "https://github.com/katarmal-ram/codemoot#readme",
   "bugs": "https://github.com/katarmal-ram/codemoot/issues",
   "keywords": ["mcp", "ai", "code-review", "multi-model", "model-context-protocol"],
-  "engines": { "node": ">=20.0.0" },
+  "engines": {
+    "node": ">=20.0.0"
+  },
   "files": ["dist"],
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -25,7 +27,9 @@
   "bin": {
     "codemoot-mcp": "./dist/index.js"
   },
-  "publishConfig": { "access": "public" },
+  "publishConfig": {
+    "access": "public"
+  },
   "scripts": {
     "build": "tsup",
     "dev": "tsup --watch",
@@ -45,6 +49,7 @@
     "tsup": "^8.3.0",
     "tsx": "^4.21.0",
     "typescript": "^5.7.0",
-    "vitest": "^3.0.0"
+    "vitest": "^3.0.0",
+    "ajv": "^8.17.1"
   }
 }

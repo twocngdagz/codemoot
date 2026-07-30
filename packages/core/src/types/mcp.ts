@@ -1,7 +1,12 @@
 // packages/core/src/types/mcp.ts — MCP tool types from approved architecture
 
 import { z } from 'zod';
-import { DEFAULT_TIMEOUT_SEC, MCP_CONTENT_MAX_LENGTH, MCP_TASK_MAX_LENGTH, MCP_TIMEOUT_MAX } from '../utils/constants.js';
+import {
+  DEFAULT_TIMEOUT_SEC,
+  MCP_CONTENT_MAX_LENGTH,
+  MCP_TASK_MAX_LENGTH,
+  MCP_TIMEOUT_MAX,
+} from '../utils/constants.js';
 
 // -- Error codes from MCP_ARCHITECTURE_APPROVED §12 --
 export enum ErrorCode {
@@ -170,3 +175,122 @@ export const debateOutputSchema = z.object({
   partialFailure: z.boolean().optional(),
   egressControl: z.enum(['codemoot-enforced', 'cli-managed']),
 });
+
+// -- Zod schemas for additive review-workflow MCP tools (Batch 14) --
+// Every state-changing action validates its identity and idempotency inputs: an explicit
+// command ID (same-ID retries replay the durable receipt) and an optional expected batch
+// aggregate version enforced at reservation.
+
+const workflowIdSchema = z.string().min(1);
+const commandIdSchema = z.string().min(1);
+const ordinalSchema = z.number().int().positive();
+const expectedVersionSchema = z.number().int().nonnegative();
+// The established domain Git-SHA vocabulary: 40- or 64-hex, case-insensitive.
+const gitShaInputSchema = z.string().regex(/^([0-9a-f]{40}|[0-9a-f]{64})$/i);
+
+export const workflowStatusInputSchema = z
+  .object({
+    workflowId: workflowIdSchema,
+  })
+  .strict();
+export type WorkflowStatusInput = z.infer<typeof workflowStatusInputSchema>;
+
+export const workflowEventsInputSchema = z
+  .object({
+    workflowId: workflowIdSchema,
+    after: z.number().int().nonnegative().optional().default(0),
+    limit: z.number().int().positive().max(500).optional().default(100),
+    cursorId: z.string().min(1).optional(),
+    acknowledge: z.boolean().optional().default(false),
+  })
+  .strict()
+  .superRefine((value, context) => {
+    if (value.acknowledge && value.cursorId === undefined) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['acknowledge'],
+        message: 'Acknowledging requires a named cursor',
+      });
+    }
+  });
+export type WorkflowEventsInput = z.infer<typeof workflowEventsInputSchema>;
+
+export const workflowGateInputSchema = z.discriminatedUnion('action', [
+  z
+    .object({
+      action: z.literal('evaluate'),
+      workflowId: workflowIdSchema,
+      ordinal: ordinalSchema,
+      commandId: commandIdSchema,
+      expectedVersion: expectedVersionSchema.optional(),
+    })
+    .strict(),
+  z
+    .object({
+      action: z.literal('reconcile_stale'),
+      workflowId: workflowIdSchema,
+      ordinal: ordinalSchema,
+      commandId: commandIdSchema,
+      expectedVersion: expectedVersionSchema.optional(),
+    })
+    .strict(),
+  z
+    .object({
+      action: z.literal('mark_merged'),
+      workflowId: workflowIdSchema,
+      ordinal: ordinalSchema,
+      commandId: commandIdSchema,
+      expectedVersion: expectedVersionSchema.optional(),
+      mergeCommitSha: gitShaInputSchema,
+      recorderActorType: z.enum(['HUMAN', 'CI']).optional().default('CI'),
+    })
+    .strict(),
+]);
+export type WorkflowGateInput = z.infer<typeof workflowGateInputSchema>;
+
+const enqueueBaseShape = {
+  action: z.literal('enqueue'),
+  workflowId: workflowIdSchema,
+  ordinal: ordinalSchema,
+  timeout: z.number().int().positive().optional().default(1800),
+  maxAttempts: z.number().int().positive().max(10).optional(),
+};
+
+// A plain union (not a discriminated union) so each job type carries exactly its own
+// fields: verification REQUIRES the plan command index, and code_review accepts no
+// expectedVersion — the code-review coordinator derives its reservation version itself, so
+// a caller-supplied pin would be silently ignored and is rejected instead.
+export const workflowJobsInputSchema = z.union([
+  z
+    .object({
+      ...enqueueBaseShape,
+      jobType: z.literal('verification'),
+      command: z.number().int().positive(),
+      toolVersion: z.string().min(1).optional(),
+      expectedVersion: expectedVersionSchema.optional(),
+    })
+    .strict(),
+  z
+    .object({
+      ...enqueueBaseShape,
+      jobType: z.literal('final_audit'),
+      expectedVersion: expectedVersionSchema.optional(),
+    })
+    .strict(),
+  z
+    .object({
+      ...enqueueBaseShape,
+      jobType: z.literal('code_review'),
+    })
+    .strict(),
+  z
+    .object({
+      action: z.literal('list'),
+      workflowId: workflowIdSchema,
+      status: z.enum(['QUEUED', 'RUNNING', 'SUCCEEDED', 'FAILED', 'CANCELLED']).optional(),
+    })
+    .strict(),
+  z.object({ action: z.literal('show'), jobId: z.string().min(1) }).strict(),
+  z.object({ action: z.literal('cancel'), jobId: z.string().min(1) }).strict(),
+]);
+export type WorkflowJobsInput = z.infer<typeof workflowJobsInputSchema>;

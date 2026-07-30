@@ -4,11 +4,11 @@ import { join } from 'node:path';
 import {
   CancellationToken,
   CostStore,
+  MCP_CONTENT_MAX_LENGTH,
+  MCP_TASK_MAX_LENGTH,
   MemoryStore,
   ModelRegistry,
   Orchestrator,
-  MCP_CONTENT_MAX_LENGTH,
-  MCP_TASK_MAX_LENGTH,
   loadConfig,
   openDatabase,
 } from '@codemoot/core';
@@ -17,8 +17,17 @@ import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import { handleCost, handleDebate, handleMemory, handlePlan, handleReview } from './tools/index.js';
+import {
+  WORKFLOW_TOOL_DEFINITIONS,
+  createWorkflowToolRuntime,
+  handleWorkflowEvents,
+  handleWorkflowGate,
+  handleWorkflowJobs,
+  handleWorkflowStatus,
+  runWorkflowTool,
+} from './tools/workflow.js';
 
-const TOOL_DEFINITIONS = [
+export const TOOL_DEFINITIONS = [
   {
     name: 'codemoot_review',
     description:
@@ -47,7 +56,12 @@ const TOOL_DEFINITIONS = [
     inputSchema: {
       type: 'object' as const,
       properties: {
-        task: { type: 'string', description: 'Task to plan', minLength: 1, maxLength: MCP_TASK_MAX_LENGTH },
+        task: {
+          type: 'string',
+          description: 'Task to plan',
+          minLength: 1,
+          maxLength: MCP_TASK_MAX_LENGTH,
+        },
         maxRounds: { type: 'integer', description: 'Max review rounds', default: 3 },
         stream: { type: 'boolean', description: 'Enable streaming', default: false },
         timeout: { type: 'number', description: 'Timeout in seconds', default: 600 },
@@ -159,9 +173,9 @@ export async function startServer(): Promise<void> {
     { capabilities: { tools: {} } },
   );
 
-  // Register tool listing handler
+  // Register tool listing handler (the original five tools plus the additive workflow tools)
   server.setRequestHandler(ListToolsRequestSchema, async () => {
-    return { tools: TOOL_DEFINITIONS };
+    return { tools: [...TOOL_DEFINITIONS, ...WORKFLOW_TOOL_DEFINITIONS] };
   });
 
   // Register tool call handler
@@ -186,6 +200,30 @@ export async function startServer(): Promise<void> {
         }
         case 'codemoot_cost': {
           return await handleCost(costStore, args);
+        }
+        // Workflow tools build their runtime lazily (the Git repository handle is only
+        // valid inside a repository) and return STRUCTURED errors so programmatic clients
+        // can distinguish replay conflicts, invalid state, and missing records. Legacy
+        // tools keep their original unstructured error behavior.
+        case 'codemoot_workflow_status': {
+          return await runWorkflowTool(() =>
+            handleWorkflowStatus(createWorkflowToolRuntime(db, projectDir), args),
+          );
+        }
+        case 'codemoot_workflow_events': {
+          return await runWorkflowTool(() =>
+            handleWorkflowEvents(createWorkflowToolRuntime(db, projectDir), args),
+          );
+        }
+        case 'codemoot_workflow_gate': {
+          return await runWorkflowTool(() =>
+            handleWorkflowGate(createWorkflowToolRuntime(db, projectDir), args),
+          );
+        }
+        case 'codemoot_workflow_jobs': {
+          return await runWorkflowTool(() =>
+            handleWorkflowJobs(createWorkflowToolRuntime(db, projectDir), args),
+          );
         }
         default: {
           return {
