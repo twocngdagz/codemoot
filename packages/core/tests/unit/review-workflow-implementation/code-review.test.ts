@@ -640,6 +640,16 @@ describe('ReviewWorkflowCodeReviewService', () => {
   });
 
   it('escalates an unresolved final round to a human decision instead of a third review', async () => {
+    db.close();
+    db = openDatabase(':memory:');
+    build(
+      configuration({
+        maxCodeReviewRounds: 2,
+        maxCorrectionPasses: 1,
+        deferNonBlockingFindings: true,
+        unresolvedAfterFinalReview: 'human_decision_required',
+      }),
+    );
     await reachImplementationComplete(1, 'implemented\n');
     const round1 = await runReview(1, 'NEEDS_REVISION', [{ key: 'high-defect', severity: 'high' }]);
     expect(round1.status).toBe('NEEDS_REVISION');
@@ -916,6 +926,16 @@ describe('ReviewWorkflowCodeReviewService', () => {
   });
 
   it('rejects a second correction pass after the single permitted attempt', async () => {
+    db.close();
+    db = openDatabase(':memory:');
+    build(
+      configuration({
+        maxCodeReviewRounds: 2,
+        maxCorrectionPasses: 1,
+        deferNonBlockingFindings: true,
+        unresolvedAfterFinalReview: 'human_decision_required',
+      }),
+    );
     await reachImplementationComplete(1, 'implemented\n');
     const round1 = await runReview(1, 'NEEDS_REVISION', [{ key: 'high-defect', severity: 'high' }]);
     expect(round1.status).toBe('NEEDS_REVISION');

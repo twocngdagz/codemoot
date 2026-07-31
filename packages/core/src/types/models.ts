@@ -30,6 +30,8 @@ export interface ModelCallResult {
   meteringSource?: MeteringSource;
   /** Codex thread ID for session resume. */
   sessionId?: string;
+  /** Complete raw CLI stdout (capped), for the immutable invocation audit. */
+  rawOutput?: string;
 }
 
 export interface FallbackConfig {

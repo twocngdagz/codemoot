@@ -1,5 +1,7 @@
+import { createHash } from 'node:crypto';
 import type {
   BatchRoleSession,
+  InvocationAuditRecord,
   ReviewWorkflowStore,
   SessionContinuityEvidence,
 } from '../memory/review-workflow-store.js';
@@ -69,6 +71,24 @@ export class RoleInvocationError extends Error {
   }
 }
 
+/** Complete-capture boundary for adapter stderr; exceeding it fails the invocation. */
+export const STDERR_CAPTURE_LIMIT = 5_000_000;
+
+const AUTHENTICATION_FAILURE_PATTERN =
+  /not logged in|login required|log in|unauthorized|401|403|invalid api key|api key|authentication|credential|billing|expired token/i;
+const TIMEOUT_FAILURE_PATTERN = /timeout|ETIMEDOUT/i;
+
+/** Stable classification of a failed agent invocation, derived from the adapter error. */
+export function classifyInvocationFailure(message: string): 'AUTHENTICATION' | 'TIMEOUT' | 'OTHER' {
+  if (AUTHENTICATION_FAILURE_PATTERN.test(message)) return 'AUTHENTICATION';
+  if (TIMEOUT_FAILURE_PATTERN.test(message)) return 'TIMEOUT';
+  return 'OTHER';
+}
+
+export function isAuthenticationFailure(error: unknown): error is Error {
+  return error instanceof Error && classifyInvocationFailure(error.message) === 'AUTHENTICATION';
+}
+
 /**
  * Binds this invocation to the batch role-session registry: exactly one active vendor
  * session per (batch, role). The first bound invocation creates and persists it; every
@@ -94,6 +114,8 @@ export interface RoleInvocationInput {
   readonly previousSessionIdentityId?: string;
   readonly additionalAuthorities?: readonly Authority[];
   readonly sessionBinding?: RoleSessionBinding;
+  /** Recorded in the immutable invocation audit (e.g. IMPLEMENTATION, CODE_REVIEW). */
+  readonly auditPhase?: string;
 }
 
 export interface RoleInvocationResult {
@@ -108,11 +130,15 @@ export type PreparedRoleInvocation = RoleInvocationResult & {
   readonly assignment: ResolvedRoleAdapter['assignment'];
   /** Present when the invocation ran under a batch role-session binding. */
   readonly continuity?: SessionContinuityEvidence;
+  /** Immutable full prompt/response audit, persisted atomically with the invocation. */
+  readonly audit: InvocationAuditRecord;
 };
 
 const ROLE_AUTHORITIES: Readonly<Record<ResolvedRoleAdapter['role'], readonly Authority[]>> = {
   implementer: ['IMPLEMENTER', 'PLAN_REFINER', 'COMMIT_CREATOR'],
-  reviewer: ['REVIEWER'],
+  // Reviewer-judged verification acceptance requires the attestor authority on the
+  // reviewer's own execution (the verification service still enforces independence).
+  reviewer: ['REVIEWER', 'VERIFICATION_ATTESTOR'],
 };
 
 /**
@@ -121,8 +147,32 @@ const ROLE_AUTHORITIES: Readonly<Record<ResolvedRoleAdapter['role'], readonly Au
  * The service only accepts a RoleManager resolution, never an alias supplied with the request.
  * Runtime evidence is taken from the bridge result and checked against the immutable assignment.
  */
+/** Live-monitoring hook: called when an agent invocation starts and when it settles. */
+export interface InvocationObserver {
+  onStart(info: {
+    readonly workflowId: string;
+    readonly invocationId: string;
+    readonly role?: 'IMPLEMENTER' | 'REVIEWER';
+    readonly adapterKind: string;
+    readonly model: string;
+    readonly phase?: string;
+    readonly startedAt: string;
+  }): void;
+  onSettle(workflowId: string, invocationId: string): void;
+}
+
+export interface RepositoryStateCollector {
+  collect(): { branch: string; headSha: string; clean: boolean; changedFiles: readonly string[] };
+  /** Files changed by the commits between two SHAs (exclusive..inclusive). */
+  changedBetween(beforeSha: string, afterSha: string): readonly string[];
+}
+
 export class RoleInvocationService {
-  constructor(private readonly store: ReviewWorkflowStore) {}
+  constructor(
+    private readonly store: ReviewWorkflowStore,
+    private readonly repositoryState?: RepositoryStateCollector,
+    private readonly observer?: InvocationObserver,
+  ) {}
 
   async invoke(input: RoleInvocationInput): Promise<RoleInvocationResult> {
     const prepared = await this.prepare(input);
@@ -137,6 +187,179 @@ export class RoleInvocationService {
    * actor, while the invocation row itself must reference that receipt.
    */
   async prepare(input: RoleInvocationInput): Promise<PreparedRoleInvocation> {
+    const prepareStartedAt = new Date();
+    // Adapter stderr is surfaced only through the progress callback; collect it (capped)
+    // so both failed and successful invocations audit it.
+    let stderrCaptured = '';
+    let stderrOverflowed = false;
+    const chainedOnStderr = input.options?.onStderr;
+    const options: BridgeOptions = {
+      ...input.options,
+      onStderr: (chunk) => {
+        // The audit requires the COMPLETE stream: capture everything up to the explicit
+        // limit; exceeding it fails the invocation closed rather than truncating silently.
+        if (stderrCaptured.length + chunk.length > STDERR_CAPTURE_LIMIT) {
+          stderrOverflowed = true;
+          stderrCaptured += chunk.slice(
+            0,
+            Math.max(0, STDERR_CAPTURE_LIMIT - stderrCaptured.length),
+          );
+        } else {
+          stderrCaptured += chunk;
+        }
+        chainedOnStderr?.(chunk);
+      },
+    };
+    const gitBefore = this.collectRepositoryState();
+    // Fail closed: if the durable active-invocation record cannot be written, the external
+    // agent process must not start at all.
+    this.observer?.onStart({
+      workflowId: input.workflowId,
+      invocationId: input.invocationId,
+      ...(input.sessionBinding === undefined ? {} : { role: input.sessionBinding.role }),
+      adapterKind: input.resolution.assignment.expectedAdapterKind,
+      model: input.resolution.assignment.configuredModel,
+      ...(input.auditPhase === undefined ? {} : { phase: input.auditPhase }),
+      startedAt: prepareStartedAt.toISOString(),
+    });
+    try {
+      const prepared = await this.prepareChecked(
+        { ...input, options },
+        () => stderrCaptured,
+        gitBefore,
+      );
+      if (stderrOverflowed) {
+        throw new Error(
+          `Adapter stderr exceeded the ${STDERR_CAPTURE_LIMIT}-character capture limit; the invocation fails closed so the audit stays complete`,
+        );
+      }
+      // Fail closed: a settlement-persistence failure surfaces as a durable runner failure.
+      this.observer?.onSettle(input.workflowId, input.invocationId);
+      return prepared;
+    } catch (error) {
+      // Every FAILED invocation attempt is audited (and therefore budget-counted) too. If
+      // even the failure audit cannot persist, that inability stays visible in the error.
+      const persistFailure = this.recordFailureAudit(
+        input,
+        stderrCaptured,
+        error,
+        prepareStartedAt,
+        gitBefore,
+      );
+      let settleFailure: string | undefined;
+      try {
+        this.observer?.onSettle(input.workflowId, input.invocationId);
+      } catch (settleError) {
+        settleFailure = settleError instanceof Error ? settleError.message : String(settleError);
+      }
+      if (settleFailure !== undefined) {
+        const combined = `${error instanceof Error ? error.message : String(error)} (ADDITIONALLY: active-invocation settlement could not be persisted: ${settleFailure})`;
+        throw error instanceof RoleInvocationError
+          ? new RoleInvocationError(error.code, combined)
+          : new Error(combined);
+      }
+      if (persistFailure !== undefined) {
+        const combined = `${error instanceof Error ? error.message : String(error)} (ADDITIONALLY: the mandatory failure audit could not be persisted: ${persistFailure})`;
+        throw error instanceof RoleInvocationError
+          ? new RoleInvocationError(error.code, combined)
+          : new Error(combined);
+      }
+      throw error;
+    }
+  }
+
+  private deriveChangedFiles(
+    before?: { headSha: string; changedFiles: readonly string[] },
+    after?: { headSha: string; changedFiles: readonly string[] },
+  ): readonly string[] | undefined {
+    if (before === undefined || after === undefined) return undefined;
+    try {
+      if (before.headSha !== after.headSha && this.repositoryState !== undefined) {
+        return this.repositoryState.changedBetween(before.headSha, after.headSha);
+      }
+    } catch {
+      // fall through to the dirty-file delta
+    }
+    return after.changedFiles.filter((file) => !before.changedFiles.includes(file));
+  }
+
+  private collectRepositoryState():
+    | { branch: string; headSha: string; clean: boolean; changedFiles: readonly string[] }
+    | undefined {
+    try {
+      return this.repositoryState?.collect();
+    } catch {
+      return undefined;
+    }
+  }
+
+  private recordFailureAudit(
+    input: RoleInvocationInput,
+    stderr: string,
+    error: unknown,
+    startedAt: Date,
+    gitBefore?: {
+      branch: string;
+      headSha: string;
+      clean: boolean;
+      changedFiles: readonly string[];
+    },
+  ): string | undefined {
+    const finished = new Date();
+    const message = error instanceof Error ? error.message : String(error);
+    const { text: redactedPrompt, redactions: promptRedactions } = redactSecrets(input.prompt);
+    const { text: redactedStderr, redactions: stderrRedactions } = redactSecrets(stderr);
+    try {
+      this.store.recordInvocationAudit({
+        invocationId: `${input.invocationId}:failure:${finished.toISOString()}`,
+        workflowId: input.workflowId,
+        ...(input.sessionBinding === undefined ? {} : { batchId: input.sessionBinding.batchId }),
+        ...(input.auditPhase === undefined ? {} : { phase: input.auditPhase }),
+        commandId: input.commandId,
+        ...(input.sessionBinding === undefined ? {} : { role: input.sessionBinding.role }),
+        actorExecutionId: input.actorExecutionId,
+        adapterKind: input.resolution.assignment.expectedAdapterKind,
+        configuredModel: input.resolution.assignment.configuredModel,
+        vendorSessionId: 'unknown',
+        sessionOutcome: 'NONE',
+        prompt: redactedPrompt,
+        promptHash: sha256(input.prompt),
+        response: '',
+        responseHash: sha256(''),
+        redactionCount: promptRedactions + stderrRedactions,
+        ...(redactedStderr.length === 0 ? {} : { rawStderr: redactedStderr }),
+        failure: { classification: classifyInvocationFailure(message), message },
+        ...(gitBefore === undefined
+          ? {}
+          : {
+              gitBefore: {
+                branch: gitBefore.branch,
+                headSha: gitBefore.headSha,
+                clean: gitBefore.clean,
+              },
+            }),
+        startedAt: startedAt.toISOString(),
+        finishedAt: finished.toISOString(),
+        durationMs: finished.getTime() - startedAt.getTime(),
+        resultStatus: 'FAILED',
+        createdAt: finished.toISOString(),
+      });
+      return undefined;
+    } catch (persistError) {
+      return persistError instanceof Error ? persistError.message : String(persistError);
+    }
+  }
+
+  private async prepareChecked(
+    input: RoleInvocationInput,
+    readStderr: () => string,
+    gitBefore?: {
+      branch: string;
+      headSha: string;
+      clean: boolean;
+      changedFiles: readonly string[];
+    },
+  ): Promise<PreparedRoleInvocation> {
     const { assignment, adapter } = input.resolution;
     const expectedRole = input.resolution.role === 'implementer' ? 'IMPLEMENTER' : 'REVIEWER';
     if (assignment.assignedRole !== expectedRole || assignment.workflowId !== input.workflowId) {
@@ -295,6 +518,66 @@ export class RoleInvocationService {
       finishedAt: invocation.finishedAt,
     });
 
+    const { text: redactedPrompt, redactions: promptRedactions } = redactSecrets(input.prompt);
+    const { text: redactedResponse, redactions: responseRedactions } = redactSecrets(call.text);
+    const { text: redactedStderr, redactions: stderrRedactions } = redactSecrets(readStderr());
+    const { text: redactedStdout, redactions: stdoutRedactions } = redactSecrets(
+      call.rawOutput ?? '',
+    );
+    const gitAfter = this.collectRepositoryState();
+    const changedFiles = this.deriveChangedFiles(gitBefore, gitAfter);
+    const audit: InvocationAuditRecord = {
+      invocationId: invocation.invocationId,
+      workflowId: input.workflowId,
+      ...(input.sessionBinding === undefined ? {} : { batchId: input.sessionBinding.batchId }),
+      ...(input.auditPhase === undefined ? {} : { phase: input.auditPhase }),
+      commandId: input.commandId,
+      ...(input.sessionBinding === undefined ? {} : { role: input.sessionBinding.role }),
+      actorExecutionId: execution.actorExecutionId,
+      adapterKind: invocation.adapterKind ?? assignment.expectedAdapterKind,
+      configuredModel: invocation.configuredModel ?? assignment.configuredModel,
+      ...(invocation.reportedModel === undefined
+        ? {}
+        : { reportedModel: invocation.reportedModel }),
+      vendorSessionId: session.vendorSessionId,
+      sessionOutcome: resumed ? 'RESUMED' : 'CREATED',
+      prompt: redactedPrompt,
+      promptHash: sha256(input.prompt),
+      response: redactedResponse,
+      responseHash: sha256(call.text),
+      redactionCount: promptRedactions + responseRedactions + stderrRedactions + stdoutRedactions,
+      ...(redactedStderr.length === 0 ? {} : { rawStderr: redactedStderr }),
+      ...(redactedStdout.length === 0 ? {} : { rawStdout: redactedStdout }),
+      ...(gitBefore === undefined
+        ? {}
+        : {
+            gitBefore: {
+              branch: gitBefore.branch,
+              headSha: gitBefore.headSha,
+              clean: gitBefore.clean,
+            },
+          }),
+      ...(gitAfter === undefined
+        ? {}
+        : {
+            gitAfter: {
+              branch: gitAfter.branch,
+              headSha: gitAfter.headSha,
+              clean: gitAfter.clean,
+            },
+          }),
+      ...(changedFiles === undefined || changedFiles.length === 0 ? {} : { changedFiles }),
+      ...(call.usage.inputTokens === undefined ? {} : { inputTokens: call.usage.inputTokens }),
+      ...(call.usage.outputTokens === undefined ? {} : { outputTokens: call.usage.outputTokens }),
+      ...(call.usage.totalTokens === undefined ? {} : { totalTokens: call.usage.totalTokens }),
+      ...(call.usage.costUsd === undefined ? {} : { costUsd: call.usage.costUsd }),
+      startedAt: invocation.startedAt,
+      finishedAt: invocation.finishedAt ?? invocation.startedAt,
+      durationMs: call.durationMs,
+      resultStatus: invocation.resultStatus,
+      createdAt: invocation.finishedAt ?? invocation.startedAt,
+    };
+
     const continuity: SessionContinuityEvidence | undefined =
       binding === null
         ? undefined
@@ -319,6 +602,7 @@ export class RoleInvocationService {
       session,
       resumed,
       assignment,
+      audit,
       ...(continuity === undefined ? {} : { continuity }),
     };
   }
@@ -353,6 +637,9 @@ export class RoleInvocationService {
       }
       this.store.recordSessionContinuity(prepared.continuity);
     }
+    // Full prompt/response audit is mandatory: if this write fails, persistPrepared throws
+    // and the workflow does not advance.
+    this.store.recordInvocationAudit(prepared.audit);
   }
 
   private assertSessionBelongsToRole(session: SessionIdentity, input: RoleInvocationInput): void {
@@ -637,4 +924,27 @@ function buildObservedEvidence(
           },
         ]),
   ];
+}
+
+function sha256(value: string): string {
+  return createHash('sha256').update(value).digest('hex');
+}
+
+/**
+ * Redacts configured secret values (environment variables whose names look like credentials)
+ * before audit storage. The redaction marker carries a value hash so evidence remains
+ * correlatable without storing the secret.
+ */
+export function redactSecrets(text: string): { text: string; redactions: number } {
+  let redacted = text;
+  let redactions = 0;
+  for (const [name, value] of Object.entries(process.env)) {
+    if (value === undefined || value.length < 8) continue;
+    if (!/(KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL)/i.test(name)) continue;
+    if (!redacted.includes(value)) continue;
+    const marker = `[REDACTED:${name}:${sha256(value).slice(0, 8)}]`;
+    redacted = redacted.split(value).join(marker);
+    redactions += 1;
+  }
+  return { text: redacted, redactions };
 }

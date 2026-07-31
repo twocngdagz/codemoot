@@ -106,11 +106,30 @@ export interface ReviewGatedPacingConfig {
   unresolvedAfterFinalReview: 'human_decision_required';
 }
 
+export interface ReviewGatedAutonomousConfig {
+  maxPlanReviewRoundsPerBatch: number;
+  maxCodeReviewRoundsPerBatch: number;
+  maxCorrectionPassesPerBatch: number;
+  maxVerificationAttemptsPerCommand: number;
+  maxFinalAuditsPerBatch: number;
+  maxAgentInvocationsPerBatch: number;
+  maxTotalAgentInvocations: number;
+  maxBatchRuntimeMinutes: number;
+  maxWorkflowRuntimeMinutes: number;
+  maxConsecutiveNoProgressActions: number;
+  maxInputTokensPerBatch: number;
+  maxOutputTokensPerBatch: number;
+  maxCostUsdPerWorkflow: number;
+  heartbeatIntervalSeconds: number;
+  heartbeatExpirySeconds: number;
+}
+
 export interface ReviewGatedConfig {
   identity: ReviewGatedIdentityConfig;
   commit: ReviewGatedCommitConfig;
   gates: ReviewGatedGateConfig;
   pacing: ReviewGatedPacingConfig;
+  autonomous: ReviewGatedAutonomousConfig;
 }
 
 export interface ProjectConfig {

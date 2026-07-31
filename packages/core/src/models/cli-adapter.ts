@@ -61,6 +61,8 @@ export interface CliCallOptions extends ProgressCallbacks {
   idleTimeout?: number;
   maxOutputBytes?: number;
   envAllowlist?: string[];
+  /** Extra environment entries merged AFTER the allowlist filter (e.g. a guarded PATH). */
+  env?: Readonly<Record<string, string>>;
 }
 
 export interface ResumeCallOptions extends CliCallOptions {
@@ -222,7 +224,7 @@ export class CliAdapter implements CliBridge {
       ...(CLI_AUTH_VARS[this.cliName] ?? []),
       ...(options?.envAllowlist ?? []),
     ];
-    const env = buildFilteredEnv(allowlist);
+    const env = { ...buildFilteredEnv(allowlist), ...options?.env };
 
     const doCall = async (resumeId?: string): Promise<ModelCallResult> => {
       // Always use stdin ("-") for prompt delivery:
@@ -260,6 +262,7 @@ export class CliAdapter implements CliBridge {
         finishReason: 'stop',
         durationMs,
         sessionId: parsed.sessionId,
+        rawOutput: stdout,
       };
     };
 

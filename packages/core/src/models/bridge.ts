@@ -25,6 +25,8 @@ export interface BridgeOptions extends ProgressCallbacks {
   maxOutputBytes?: number;
   idleTimeout?: number;
   signal?: AbortSignal;
+  /** Extra environment entries for the CLI subprocess (e.g. a guarded PATH). */
+  env?: Readonly<Record<string, string>>;
   /**
    * Forbids any fallback to a fresh session when a resume fails. Mandatory role-session
    * continuity sets this: a failed resume must surface as a failure, never as a silently

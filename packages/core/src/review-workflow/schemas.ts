@@ -1051,6 +1051,18 @@ export const transitionCommandSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('RESUME_BATCH') }).strict(),
   z
     .object({
+      type: z.literal('ACCEPT_FINDINGS_RISK'),
+      evidence: z
+        .object({
+          decisionId: idSchema,
+          findingIds: z.array(idSchema).min(1),
+          acceptedCommitSha: gitShaSchema,
+        })
+        .strict(),
+    })
+    .strict(),
+  z
+    .object({
       type: z.literal('CANCEL_BATCH'),
       reason: z.string().min(1),
     })

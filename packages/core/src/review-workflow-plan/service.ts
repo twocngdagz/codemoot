@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { z } from 'zod';
 import type { ReviewWorkflowCommandStore } from '../memory/review-workflow-command-store.js';
 import type { ReviewWorkflowSideEffectKind } from '../memory/review-workflow-command-store.js';
 import {
@@ -9,12 +10,15 @@ import {
   type ReviewWorkflowContractService,
   parseRefinementResult,
 } from '../review-workflow-contracts/index.js';
+import { batchPlanDraftSchema } from '../review-workflow-contracts/schemas.js';
 import type { RepositoryAuditRequest } from '../review-workflow-git/types.js';
 import type { ReviewWorkflowConfigurationSnapshot } from '../review-workflow-identity/types.js';
 import { transitionBatch } from '../review-workflow/state-machine.js';
 import type {
+  AcceptanceCriterion,
   ActorExecutionIdentity,
   AllowedTransition,
+  BatchPlanVersion,
   FindingSeverity,
   IdentityEvidence,
   RepositoryAudit,
@@ -38,6 +42,7 @@ export const REVIEW_WORKFLOW_PLAN_ERROR_CODES = [
   'REFINEMENT_COMMAND_MISMATCH',
   'ROLE_INVOCATION_SERVICE_REQUIRED',
   'PLAN_REVIEW_POLICY_MISMATCH',
+  'PLAN_REVISION_INVALID',
   'TRANSITION_REJECTED',
 ] as const;
 
@@ -99,6 +104,50 @@ export interface CapturePlanReviewResult {
   readonly state: ReviewWorkflowBatch['persistedState'];
   readonly blockingFindingCount: number;
 }
+
+export interface CapturePlanRevisionInput {
+  readonly workflowId: string;
+  readonly batchId: string;
+  readonly revisionRound: number;
+  readonly actor: ActorExecutionIdentity;
+  readonly rawTranscript: string;
+  readonly createdAt: string;
+  readonly preparedInvocation?: PreparedRoleInvocation;
+}
+
+export interface CapturePlanRevisionResult {
+  readonly batch: ReviewWorkflowBatch;
+  readonly revisedPlanVersionId: string;
+  readonly findingCount: number;
+  readonly dispositionCount: number;
+}
+
+/**
+ * The implementer-authored plan-revision handoff: exactly one JSON value containing the
+ * complete revised batch plan plus one response per open plan finding. Nothing here is
+ * synthesized — the parse fails closed on any missing or extra finding response.
+ */
+const planRevisionContractSchema = z
+  .object({
+    schemaVersion: z.literal(1),
+    contractKind: z.literal('PLAN_REVISION_RESULT'),
+    batchId: z.string().min(1),
+    previousPlanVersionId: z.string().min(1),
+    summary: z.string().min(1),
+    revisedPlan: batchPlanDraftSchema,
+    findingResponses: z
+      .array(
+        z
+          .object({
+            findingId: z.string().min(1),
+            response: z.enum(['REVISED', 'NO_CHANGE_WITH_EVIDENCE']),
+            explanation: z.string().min(1),
+          })
+          .strict(),
+      )
+      .min(0),
+  })
+  .strict();
 
 export interface ReviewWorkflowPlanStatus {
   readonly workflow: WorkflowRun;
@@ -469,6 +518,222 @@ export class ReviewWorkflowPlanService {
         capture,
         state: decisionTransition.nextState,
         blockingFindingCount,
+      };
+    });
+  }
+
+  /**
+   * Captures an implementer-authored revised batch plan after a NEEDS_REVISION plan review:
+   * persists the new immutable plan version, requires one response per open plan finding,
+   * and emits SUBMIT_REVISED_PLAN so the kernel repoints the batch plan and returns to DRAFT.
+   */
+  capturePlanRevision(input: CapturePlanRevisionInput): CapturePlanRevisionResult {
+    const batch = this.requireBatch(input.batchId);
+    if (batch.persistedState !== 'PLAN_NEEDS_REVISION') {
+      throw new ReviewWorkflowPlanError(
+        'TRANSITION_REJECTED',
+        `Batch ${input.batchId} cannot submit a revised plan from ${batch.persistedState}`,
+      );
+    }
+    const previousPlan = this.store.getBatchPlan(batch.currentPlanVersionId);
+    if (previousPlan === null) {
+      throw new ReviewWorkflowPlanError(
+        'BATCH_NOT_FOUND',
+        `Batch ${input.batchId} has no current plan version`,
+      );
+    }
+    const openFindings = this.store
+      .listPlanFindings(input.batchId)
+      .filter((finding) => finding.status === 'OPEN');
+
+    let decoded: unknown;
+    try {
+      decoded = JSON.parse(input.rawTranscript);
+    } catch {
+      throw new ReviewWorkflowPlanError(
+        'PLAN_REVISION_INVALID',
+        'The plan revision handoff must contain exactly one valid JSON value',
+      );
+    }
+    const parsed = planRevisionContractSchema.safeParse(decoded);
+    if (!parsed.success) {
+      const issue = parsed.error.issues[0];
+      throw new ReviewWorkflowPlanError(
+        'PLAN_REVISION_INVALID',
+        `Plan revision failed schema validation at ${issue?.path.join('.') ?? 'root'}: ${issue?.message ?? 'unknown'}`,
+      );
+    }
+    const contract = parsed.data;
+    if (contract.batchId !== input.batchId || contract.revisedPlan.batchId !== input.batchId) {
+      throw new ReviewWorkflowPlanError(
+        'PLAN_REVISION_INVALID',
+        'The plan revision must target the batch under revision',
+      );
+    }
+    if (contract.previousPlanVersionId !== batch.currentPlanVersionId) {
+      throw new ReviewWorkflowPlanError(
+        'PLAN_REVISION_INVALID',
+        'The plan revision must supersede the current plan version',
+      );
+    }
+    const expectedVersionId = deriveBatchPlanVersionId(input.batchId, previousPlan.version + 1);
+    if (contract.revisedPlan.batchPlanVersionId !== expectedVersionId) {
+      throw new ReviewWorkflowPlanError(
+        'PLAN_REVISION_INVALID',
+        `A revised plan must use the authoritative version ID ${expectedVersionId}`,
+      );
+    }
+    // Rerun the refinement-grade semantic invariants on the revised plan: requirement
+    // references, verification-command links, and dependency validity must all hold.
+    const workflow = this.requireWorkflow(input.workflowId);
+    const requirementIds = new Set(
+      this.store
+        .listRequirements(workflow.generalPlanVersionId)
+        .map((requirement) => requirement.requirementId),
+    );
+    const declaredCriterionIds = new Set(
+      contract.revisedPlan.acceptanceCriteria.map((criterion) => criterion.acceptanceCriterionId),
+    );
+    for (const criterion of contract.revisedPlan.acceptanceCriteria) {
+      if (criterion.sourceRequirementIds.some((id) => !requirementIds.has(id))) {
+        throw new ReviewWorkflowPlanError(
+          'PLAN_REVISION_INVALID',
+          `Criterion ${criterion.acceptanceCriterionId} references an unknown requirement`,
+        );
+      }
+    }
+    for (const command of contract.revisedPlan.verificationCommands) {
+      if (command.relatedCriterionIds.some((id) => !declaredCriterionIds.has(id))) {
+        throw new ReviewWorkflowPlanError(
+          'PLAN_REVISION_INVALID',
+          'A verification command references an undeclared acceptance criterion',
+        );
+      }
+    }
+    const earlierBatchIds = new Set(
+      this.store
+        .listBatches(input.workflowId)
+        .filter((candidate) => candidate.ordinal < batch.ordinal)
+        .map((candidate) => candidate.batchId),
+    );
+    if (contract.revisedPlan.dependencies.some((dependency) => !earlierBatchIds.has(dependency))) {
+      throw new ReviewWorkflowPlanError(
+        'PLAN_REVISION_INVALID',
+        'A revised plan may depend only on earlier batches',
+      );
+    }
+    const respondedIds = contract.findingResponses.map((response) => response.findingId);
+    const openIds = openFindings.map((finding) => finding.findingId);
+    const missing = openIds.filter((id) => !respondedIds.includes(id));
+    const unknown = respondedIds.filter((id) => !openIds.includes(id));
+    if (
+      missing.length > 0 ||
+      unknown.length > 0 ||
+      new Set(respondedIds).size !== respondedIds.length
+    ) {
+      throw new ReviewWorkflowPlanError(
+        'PLAN_REVISION_INVALID',
+        `The plan revision must address every open plan finding exactly once (missing: ${missing.join(', ') || 'none'}; unknown: ${unknown.join(', ') || 'none'})`,
+      );
+    }
+
+    const audit = this.store.getLatestRepositoryAudit(input.workflowId);
+    if (audit === null) {
+      throw new ReviewWorkflowPlanError(
+        'REPOSITORY_AUDIT_INVALID',
+        `Workflow ${input.workflowId} has no repository audit`,
+      );
+    }
+    const draft = contract.revisedPlan;
+    const revisedPlan: BatchPlanVersion = {
+      batchPlanVersionId: draft.batchPlanVersionId,
+      workflowId: input.workflowId,
+      batchId: input.batchId,
+      version: previousPlan.version + 1,
+      supersedesVersionId: previousPlan.batchPlanVersionId,
+      contentHash: hashValue(draft),
+      repositoryContextSha: audit.headSha,
+      objective: draft.objective,
+      currentRepositoryEvidence: draft.currentRepositoryEvidence,
+      dependencies: draft.dependencies,
+      candidateFiles: draft.candidateFiles,
+      technicalImplementation: draft.technicalImplementation,
+      userJourney: draft.userJourney,
+      expectedBehaviour: draft.expectedBehaviour,
+      technicalAcceptanceCriteria: draft.technicalAcceptanceCriteria,
+      userFacingAcceptanceCriteria: draft.userFacingAcceptanceCriteria,
+      cliAcceptanceCriteria: draft.cliAcceptanceCriteria,
+      browserAcceptanceCriteria: draft.browserAcceptanceCriteria,
+      verificationCommands: draft.verificationCommands,
+      manualVerification: draft.manualVerification,
+      documentationChanges: draft.documentationChanges,
+      outOfScope: draft.outOfScope,
+      rollbackBoundary: draft.rollbackBoundary,
+      addressedFindingIds: [...openIds],
+      actorExecutionId: input.actor.actorExecutionId,
+      createdAt: input.createdAt,
+    };
+    const acceptanceCriteria: readonly AcceptanceCriterion[] = draft.acceptanceCriteria.map(
+      (criterion) => ({
+        acceptanceCriterionId: criterion.acceptanceCriterionId,
+        batchPlanVersionId: draft.batchPlanVersionId,
+        kind: criterion.kind,
+        statement: criterion.statement,
+        required: criterion.required,
+        passCondition: criterion.passCondition,
+        status: 'PENDING',
+        sourceRequirementIds: criterion.sourceRequirementIds,
+        createdAt: input.createdAt,
+      }),
+    );
+
+    const command: TransitionCommand = {
+      type: 'SUBMIT_REVISED_PLAN',
+      evidence: {
+        previousPlanVersionId: previousPlan.batchPlanVersionId,
+        revisedPlanVersionId: revisedPlan.batchPlanVersionId,
+        revisedPlanContentHash: revisedPlan.contentHash,
+        dispositionCount: contract.findingResponses.length,
+        findingCount: openFindings.length,
+      },
+    };
+    return this.store.runAtomically(() => {
+      const commandId = derivePlanCommandId(input.batchId, `revise-${input.revisionRound}`);
+      this.reserveInvocationCommand(
+        {
+          commandId,
+          workflowId: input.workflowId,
+          batchId: input.batchId,
+          expectedAggregateVersion: batch.aggregateVersion,
+          requester: input.actor,
+          authorityExercised: 'PLAN_REFINER',
+          command,
+        },
+        input.preparedInvocation,
+      );
+      this.store.workflowStore.saveEntity({ kind: 'BATCH_PLAN_VERSION', value: revisedPlan });
+      for (const criterion of acceptanceCriteria) {
+        this.store.workflowStore.saveEntity({ kind: 'ACCEPTANCE_CRITERION', value: criterion });
+      }
+      const transition = requireAllowedTransition(batch.persistedState, command, input.actor);
+      this.commandStore.succeedWithTransition({
+        commandId,
+        transition,
+        eventType: 'BATCH_PLAN_REVISED',
+        eventPayload: {
+          previousPlanVersionId: previousPlan.batchPlanVersionId,
+          revisedPlanVersionId: revisedPlan.batchPlanVersionId,
+          revisionRound: input.revisionRound,
+          findingResponses: contract.findingResponses,
+        },
+        resultHash: hashValue(revisedPlan),
+        result: { revisedPlanVersionId: revisedPlan.batchPlanVersionId },
+      });
+      return {
+        batch: this.requireBatch(input.batchId),
+        revisedPlanVersionId: revisedPlan.batchPlanVersionId,
+        findingCount: openFindings.length,
+        dispositionCount: contract.findingResponses.length,
       };
     });
   }

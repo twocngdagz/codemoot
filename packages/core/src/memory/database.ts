@@ -4,7 +4,7 @@ import Database from 'better-sqlite3';
 import { DatabaseError } from '../utils/errors.js';
 import { REVIEW_WORKFLOW_MIGRATIONS } from './review-workflow-schema.js';
 
-const SCHEMA_VERSION = '13';
+const SCHEMA_VERSION = '14';
 
 const MIGRATIONS = [
   // Sessions

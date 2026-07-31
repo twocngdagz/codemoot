@@ -51,14 +51,20 @@ import {
   reviewWorkflowBatchReviewPlanCommand,
   reviewWorkflowBatchShowCommand,
   reviewWorkflowBatchVerifyCommand,
+  reviewWorkflowDecideCommand,
   reviewWorkflowEventsCommand,
+  reviewWorkflowExportCommand,
   reviewWorkflowJobsCancelCommand,
   reviewWorkflowJobsListCommand,
   reviewWorkflowJobsRunCommand,
   reviewWorkflowJobsShowCommand,
+  reviewWorkflowLogsCommand,
   reviewWorkflowRefineCommand,
+  reviewWorkflowRunCommand,
+  reviewWorkflowRunResumeCommand,
   reviewWorkflowStartCommand,
   reviewWorkflowStatusCommand,
+  reviewWorkflowWatchCommand,
 } from './commands/review-workflow.js';
 import { reviewCommand } from './commands/review.js';
 import { runCommand } from './commands/run.js';
@@ -455,6 +461,61 @@ reviewWorkflowJobsCommand
   .action(reviewWorkflowJobsCancelCommand);
 
 reviewWorkflow
+  .command('run')
+  .description('Autonomously run a complete review-gated workflow from a Markdown plan')
+  .requiredOption('--plan <file>', 'External Markdown plan file')
+  .option('--background', 'Run detached and return the workflow ID immediately')
+  .option('--timeout <seconds>', 'Per-invocation timeout in seconds', positiveInteger, 1800)
+  .option('--id <workflow-id>', 'Explicit workflow ID')
+  .action(reviewWorkflowRunCommand);
+
+reviewWorkflow
+  .command('run-resume')
+  .description('Resume an autonomous workflow (also used by the background worker)')
+  .argument('<workflow-id>', 'Review workflow ID')
+  .option('--timeout <seconds>', 'Per-invocation timeout in seconds', positiveInteger, 1800)
+  .option('--background', 'Resume detached', false)
+  .action((workflowId: string, options: { timeout: number; background?: boolean }) =>
+    reviewWorkflowRunResumeCommand(workflowId, options),
+  );
+
+reviewWorkflow
+  .command('watch')
+  .description('Stream durable runner progress until the workflow reaches a terminal state')
+  .argument('<workflow-id>', 'Review workflow ID')
+  .action(reviewWorkflowWatchCommand);
+
+reviewWorkflow
+  .command('logs')
+  .description('Read the immutable invocation audit (full prompts and responses)')
+  .argument('<workflow-id>', 'Review workflow ID')
+  .option('--batch <batch-id>', 'Filter by batch ID')
+  .option('--phase <phase>', 'Filter by phase')
+  .option('--invocation <invocation-id>', 'Filter by invocation ID')
+  .action(reviewWorkflowLogsCommand);
+
+reviewWorkflow
+  .command('export')
+  .description('Export the complete chronological workflow audit to a file')
+  .argument('<workflow-id>', 'Review workflow ID')
+  .requiredOption('--output <file>', 'Output file path')
+  .action(reviewWorkflowExportCommand);
+
+reviewWorkflow
+  .command('decide')
+  .description('Record the explicit human decision on a stopped autonomous workflow')
+  .argument('<workflow-id>', 'Review workflow ID')
+  .addOption(
+    new Option('--action <action>', 'Human decision')
+      .choices(['fix_again', 'accept_risk', 'cancel'])
+      .makeOptionMandatory(),
+  )
+  .requiredOption('--rationale <text>', 'Recorded decision rationale')
+  .option('--findings <ids>', 'Comma-separated finding IDs (accept_risk)')
+  .option('--actor <name>', 'Deciding human identity')
+  .action(reviewWorkflowDecideCommand);
+
+reviewWorkflow
   .command('events')
   .description('Read workflow events incrementally by event-ID cursor')
   .argument('<workflow-id>', 'Review workflow ID')
@@ -467,6 +528,7 @@ reviewWorkflow
   .option('--limit <n>', 'Maximum events to return', positiveInteger, 100)
   .option('--cursor <id>', 'Named durable cursor; reading starts after its last position')
   .option('--ack', 'Advance the named cursor past the returned events')
+  .option('--tail <count>', 'Return only the most recent events', positiveInteger)
   .action(reviewWorkflowEventsCommand);
 
 const debate = program.command('debate').description('Multi-model debate with session persistence');

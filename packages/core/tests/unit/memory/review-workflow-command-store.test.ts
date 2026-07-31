@@ -173,6 +173,64 @@ describe('ReviewWorkflowCommandStore', () => {
     db.close();
   });
 
+  it('reserves, persists, replays, and completes ACCEPT_FINDINGS_RISK end-to-end', () => {
+    // Regression net for the receipt-schema break: the human risk-acceptance command must
+    // survive the full reserve → read-back → replay → transition path through the REAL
+    // command store (get() parses every receipt through commandReceiptSchema).
+    const acceptCommand: TransitionCommand = {
+      type: 'ACCEPT_FINDINGS_RISK',
+      evidence: {
+        decisionId: 'workflow-1:decision:1',
+        findingIds: ['finding-1', 'finding-2'],
+        acceptedCommitSha: 'a'.repeat(40),
+      },
+    };
+    // The batch must be in a valid source state for the kernel transition.
+    const needsRevisionBatch = { ...BATCH, batchId: 'workflow-1:batch:risk', ordinal: 99 };
+    workflowStore.createBatch({ ...needsRevisionBatch, persistedState: 'NEEDS_REVISION' });
+    const request: StateChangingCommandRequest = {
+      commandId: 'command-accept-risk',
+      workflowId: WORKFLOW.workflowId,
+      batchId: needsRevisionBatch.batchId,
+      expectedAggregateVersion: 0,
+      canonicalRequestHash: 'hash-command-accept-risk',
+      requester: OWNER,
+      authorityExercised: 'WORKFLOW_OWNER',
+      command: acceptCommand,
+    };
+    const reserved = commandStore.reserve(request);
+    expect(reserved.replayed).toBe(false);
+    // The receipt reads back through the schema (this is where the stale enum failed).
+    const stored = commandStore.get('command-accept-risk');
+    expect(stored?.receipt.commandType).toBe('ACCEPT_FINDINGS_RISK');
+    expect(commandStore.reserve(request).replayed).toBe(true);
+    // The kernel transition completes it and the event carries the SHA-bound evidence.
+    const transition = transitionBatch({
+      currentState: 'NEEDS_REVISION',
+      command: acceptCommand,
+      actor: OWNER,
+    });
+    expect(transition.allowed).toBe(true);
+    if (!transition.allowed) return;
+    commandStore.succeedWithTransition({
+      commandId: 'command-accept-risk',
+      transition,
+      eventType: 'BATCH_FINDINGS_RISK_ACCEPTED',
+      eventPayload: {
+        decisionId: 'workflow-1:decision:1',
+        findingIds: ['finding-1', 'finding-2'],
+        acceptedCommitSha: 'a'.repeat(40),
+      },
+      resultHash: 'result-accept-risk',
+    });
+    expect(workflowStore.getBatch(needsRevisionBatch.batchId)?.persistedState).toBe('VERIFYING');
+    const event = workflowStore
+      .getEvents(needsRevisionBatch.batchId)
+      .find((candidate) => candidate.eventType === 'BATCH_FINDINGS_RISK_ACCEPTED');
+    expect(event?.payload.findingIds).toEqual(['finding-1', 'finding-2']);
+    expect(event?.payload.acceptedCommitSha).toBe('a'.repeat(40));
+  });
+
   it('reserves a command and replays the identical request', () => {
     const request = makeRequest('command-1');
 

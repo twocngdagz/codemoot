@@ -530,6 +530,97 @@ export const REVIEW_WORKFLOW_MIGRATIONS = [
   `CREATE INDEX IF NOT EXISTS idx_review_workflow_session_continuity_batch
     ON review_workflow_session_continuity(batch_id, created_at)`,
 
+  `CREATE TABLE IF NOT EXISTS review_workflow_runner_state (
+    workflow_id        TEXT PRIMARY KEY REFERENCES review_workflows(workflow_id),
+    status             TEXT NOT NULL CHECK(status IN (
+      'RUNNING', 'HUMAN_DECISION_REQUIRED', 'CANCELLED',
+      'READY_FOR_HUMAN_VERIFICATION', 'FAILED'
+    )),
+    branch             TEXT NOT NULL,
+    base_branch        TEXT NOT NULL,
+    base_sha           TEXT NOT NULL,
+    total_batches      INTEGER NOT NULL DEFAULT 0,
+    current_ordinal    INTEGER,
+    phase              TEXT,
+    review_round       INTEGER,
+    correction_pass    INTEGER,
+    phase_started_at   TEXT,
+    last_heartbeat_at  TEXT,
+    last_checkpoint    TEXT,
+    stop_reason        TEXT,
+    stop_details       TEXT,
+    notified           INTEGER NOT NULL DEFAULT 0,
+    worker_id          TEXT,
+    lease_expires_at   TEXT,
+    limits_json        TEXT,
+    active_invocation_json TEXT,
+    counters_json      TEXT NOT NULL,
+    started_at         TEXT NOT NULL,
+    updated_at         TEXT NOT NULL
+  )`,
+
+  `CREATE TABLE IF NOT EXISTS review_workflow_runner_log (
+    log_id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    workflow_id  TEXT NOT NULL,
+    batch_id     TEXT,
+    entry_type   TEXT NOT NULL CHECK(entry_type IN ('HEARTBEAT', 'CHECKPOINT', 'STOP', 'DECISION', 'NOTIFICATION')),
+    phase        TEXT,
+    message      TEXT NOT NULL,
+    payload_json TEXT,
+    created_at   TEXT NOT NULL
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_review_workflow_runner_log_workflow
+    ON review_workflow_runner_log(workflow_id, log_id)`,
+
+  `CREATE TABLE IF NOT EXISTS review_workflow_invocation_audit (
+    invocation_id     TEXT PRIMARY KEY,
+    workflow_id       TEXT NOT NULL,
+    batch_id          TEXT,
+    phase             TEXT,
+    command_id        TEXT NOT NULL,
+    role              TEXT,
+    actor_execution_id TEXT NOT NULL,
+    adapter_kind      TEXT NOT NULL,
+    configured_model  TEXT NOT NULL,
+    reported_model    TEXT,
+    vendor_session_id TEXT NOT NULL,
+    session_outcome   TEXT NOT NULL CHECK(session_outcome IN ('CREATED', 'RESUMED', 'NONE')),
+    prompt            TEXT NOT NULL,
+    prompt_hash       TEXT NOT NULL,
+    response          TEXT NOT NULL,
+    response_hash     TEXT NOT NULL,
+    redaction_count   INTEGER NOT NULL DEFAULT 0,
+    raw_stderr        TEXT,
+    raw_stdout        TEXT,
+    failure_json      TEXT,
+    git_before_json   TEXT,
+    git_after_json    TEXT,
+    changed_files_json TEXT,
+    input_tokens      INTEGER,
+    output_tokens     INTEGER,
+    total_tokens      INTEGER,
+    cost_usd          REAL,
+    started_at        TEXT NOT NULL,
+    finished_at       TEXT NOT NULL,
+    duration_ms       INTEGER NOT NULL,
+    result_status     TEXT NOT NULL,
+    created_at        TEXT NOT NULL
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_review_workflow_invocation_audit_workflow
+    ON review_workflow_invocation_audit(workflow_id, created_at)`,
+
+  `CREATE TABLE IF NOT EXISTS review_workflow_risk_decisions (
+    decision_id      TEXT PRIMARY KEY,
+    workflow_id      TEXT NOT NULL,
+    batch_id         TEXT,
+    action           TEXT NOT NULL CHECK(action IN ('FIX_AGAIN', 'ACCEPT_RISK_AND_CONTINUE', 'CANCEL_WORKFLOW')),
+    actor            TEXT NOT NULL,
+    finding_ids_json TEXT NOT NULL,
+    rationale        TEXT NOT NULL,
+    commit_sha       TEXT NOT NULL,
+    created_at       TEXT NOT NULL
+  )`,
+
   `CREATE TABLE IF NOT EXISTS review_workflow_jobs (
     job_id            TEXT PRIMARY KEY,
     workflow_id       TEXT NOT NULL REFERENCES review_workflows(workflow_id),
@@ -594,6 +685,9 @@ export const REVIEW_WORKFLOW_MIGRATIONS = [
     'review_workflow_review_range_evidence',
     'review_workflow_batch_role_sessions',
     'review_workflow_session_continuity',
+    'review_workflow_runner_log',
+    'review_workflow_invocation_audit',
+    'review_workflow_risk_decisions',
   ].flatMap((table) => [
     `CREATE TRIGGER IF NOT EXISTS ${table}_immutable_update
       BEFORE UPDATE ON ${table}

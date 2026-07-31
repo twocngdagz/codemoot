@@ -169,7 +169,10 @@ export class ClaudeCliAdapter implements CliBridge {
     resumeSessionId: string | undefined,
     options: ClaudeCallOptions | undefined,
   ): Promise<ClaudeCallResult> {
-    const env = buildClaudeEnvironment([...this.envAllowlist, ...(options?.envAllowlist ?? [])]);
+    const env = {
+      ...buildClaudeEnvironment([...this.envAllowlist, ...(options?.envAllowlist ?? [])]),
+      ...options?.env,
+    };
     const executable = await collectCliRuntimeEvidence(this.command, this.projectDir, env);
     const args = this.buildArgs(resumeSessionId);
     const maxOutputBytes = options?.maxOutputBytes ?? MAX_OUTPUT_BYTES;
@@ -221,6 +224,7 @@ export class ClaudeCliAdapter implements CliBridge {
       durationMs: processResult.durationMs,
       meteringSource: parsed.usage === undefined ? 'estimated' : 'sdk',
       sessionId: parsed.sessionId,
+      rawOutput: processResult.stdout,
       invocationEvidence: {
         adapterKind: 'CLAUDE',
         executablePath: executable.executablePath,

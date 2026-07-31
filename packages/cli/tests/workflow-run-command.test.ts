@@ -1,0 +1,354 @@
+// Real-command integration coverage for `codemoot workflow run`: a temporary Git project
+// with a remote, the REAL coordinators and SQLite store, and scripted adapter executables.
+// This is the regression net for the startup-order defect (the repository audit must be
+// captured on the workflow branch) and for failed-invocation auditing and classification.
+
+import { execFileSync } from 'node:child_process';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { openDatabase, reviewWorkflowPlan, reviewWorkflowRunner } from '@codemoot/core';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import {
+  installGitGuard,
+  reviewWorkflowRunCommand,
+  uninstallGitGuard,
+} from '../src/commands/review-workflow.js';
+import { getDbPath } from '../src/utils.js';
+
+const FAKE_CLAUDE = fileURLToPath(new URL('./fixtures/fake-claude-scripted.mjs', import.meta.url));
+const FAKE_CODEX = fileURLToPath(new URL('./fixtures/fake-codex-authfail.mjs', import.meta.url));
+
+const WORKFLOW_ID = 'workflow-auto-integration';
+const PLAN_CONTENT = '## Deliver the sample feature\n\nWrite the sample output file.\n';
+
+function git(projectDir: string, args: readonly string[]): string {
+  return execFileSync('git', [...args], { cwd: projectDir, encoding: 'utf8' }).trim();
+}
+
+function buildConfig(): string {
+  return JSON.stringify({
+    configVersion: 3,
+    workflow: 'review-gated-batches',
+    models: {
+      implementer: {
+        provider: 'anthropic',
+        model: 'claude-supported',
+        cliAdapter: {
+          kind: 'claude',
+          command: process.execPath,
+          args: [FAKE_CLAUDE],
+          timeout: 120,
+          envAllowlist: ['CODEMOOT_FAKE_RESPONSE_FILE'],
+        },
+      },
+      reviewer: {
+        provider: 'openai',
+        model: 'codex-supported',
+        cliAdapter: {
+          kind: 'codex',
+          command: FAKE_CODEX,
+          args: ['exec'],
+          timeout: 60,
+        },
+      },
+    },
+    roles: {
+      implementer: { model: 'implementer' },
+      reviewer: { model: 'reviewer' },
+    },
+    reviewGated: {
+      identity: {
+        minimumAssurance: 'process_attested',
+        requireDifferentAdapterKinds: true,
+        prohibitSharedSessions: true,
+      },
+      commit: { mode: 'either', agentMayCommit: true },
+      gates: {
+        planReview: 'required',
+        codeReview: 'required',
+        verification: 'required',
+        humanMerge: 'required',
+        blockingSeverities: ['critical', 'high'],
+        requireAllFindingResponses: true,
+        requireAcceptedAttestations: true,
+      },
+    },
+    debate: { enabled: false },
+  });
+}
+
+/** The exact lifecycle refinement contract the scripted implementer returns. */
+function buildRefinementContract(): string {
+  const imported = reviewWorkflowPlan.importGeneralPlan({
+    workflowId: WORKFLOW_ID,
+    content: PLAN_CONTENT,
+    sourceType: 'MARKDOWN_FILE',
+    authorEvidence: [
+      {
+        kind: 'LOCAL_CLI',
+        source: 'codemoot workflow run',
+        observedAt: '2026-08-02T12:00:00.000Z',
+      },
+    ],
+    createdAt: '2026-08-02T12:00:00.000Z',
+  });
+  const requirementId = imported.requirements[0]?.requirementId;
+  if (requirementId === undefined) throw new Error('Plan fixture produced no requirement');
+  const batchId = `${WORKFLOW_ID}:batch:1`;
+  const planVersionId = `${batchId}:plan:1`;
+  const criterionId = 'criterion-sample-output';
+  return JSON.stringify({
+    schemaVersion: 1,
+    contractKind: 'REFINEMENT_RESULT',
+    summary: 'One batch delivering the sample output file.',
+    refinedPlanContent: 'Refined plan: implement the sample output file in a single batch.',
+    batchPlanVersionIds: [planVersionId],
+    requirementCoverage: [
+      {
+        requirementId,
+        batchPlanVersionIds: [planVersionId],
+        acceptanceCriterionIds: [criterionId],
+      },
+    ],
+    batchPlans: [
+      {
+        batchPlanVersionId: planVersionId,
+        batchId,
+        ordinal: 1,
+        objective: 'Write the sample output file.',
+        currentRepositoryEvidence: [
+          { kind: 'FILE', location: 'README.md', description: 'Current repository entry point.' },
+        ],
+        dependencies: [],
+        candidateFiles: ['sample.txt'],
+        technicalImplementation: ['Create sample.txt with the expected content.'],
+        userJourney: ['The operator sees sample.txt after the batch lands.'],
+        expectedBehaviour: ['sample.txt exists with the expected content.'],
+        acceptanceCriteria: [
+          {
+            acceptanceCriterionId: criterionId,
+            kind: 'TECHNICAL',
+            statement: 'sample.txt exists.',
+            required: true,
+            passCondition: 'test -f sample.txt exits 0',
+            sourceRequirementIds: [requirementId],
+          },
+        ],
+        technicalAcceptanceCriteria: [criterionId],
+        userFacingAcceptanceCriteria: [],
+        cliAcceptanceCriteria: [],
+        browserAcceptanceCriteria: { applicability: 'NOT_APPLICABLE', reason: 'CLI-only change.' },
+        verificationCommands: [
+          {
+            executable: 'test',
+            arguments: ['-f', 'sample.txt'],
+            workingDirectory: '.',
+            verificationType: 'test',
+            relatedCriterionIds: [criterionId],
+          },
+        ],
+        manualVerification: [],
+        documentationChanges: [],
+        outOfScope: ['Everything else.'],
+        rollbackBoundary: 'Revert the batch commit.',
+      },
+    ],
+  });
+}
+
+describe('codemoot workflow run (real command, scripted adapters)', () => {
+  let projectDir: string;
+  let remoteDir: string;
+  let originalCwd: string;
+  let logSpy: ReturnType<typeof vi.spyOn>;
+  let errorSpy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    originalCwd = process.cwd();
+    projectDir = mkdtempSync(join(tmpdir(), 'codemoot-workflow-run-'));
+    remoteDir = mkdtempSync(join(tmpdir(), 'codemoot-workflow-remote-'));
+    execFileSync('git', ['init', '--bare'], { cwd: remoteDir });
+    git(projectDir, ['init', '-b', 'main']);
+    git(projectDir, ['config', 'user.email', 'test@example.com']);
+    git(projectDir, ['config', 'user.name', 'Test']);
+    writeFileSync(join(projectDir, 'README.md'), '# Sample project\n');
+    writeFileSync(join(projectDir, 'plan.md'), PLAN_CONTENT);
+    writeFileSync(join(projectDir, '.cowork.yml'), buildConfig());
+    writeFileSync(join(projectDir, '.gitignore'), '.cowork/\n');
+    const responseFile = join(projectDir, 'refinement-response.json');
+    writeFileSync(responseFile, buildRefinementContract());
+    process.env.CODEMOOT_FAKE_RESPONSE_FILE = responseFile;
+    git(projectDir, ['add', '-A']);
+    git(projectDir, ['commit', '-m', 'initial']);
+    git(projectDir, ['remote', 'add', 'origin', remoteDir]);
+    git(projectDir, ['push', '-u', 'origin', 'main']);
+    // A pre-existing custom push URL must survive the whole run untouched.
+    git(projectDir, ['config', 'remote.origin.pushurl', remoteDir]);
+    process.chdir(projectDir);
+    logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    process.chdir(originalCwd);
+    logSpy.mockRestore();
+    errorSpy.mockRestore();
+    process.env.CODEMOOT_FAKE_RESPONSE_FILE = undefined;
+    rmSync(projectDir, { recursive: true, force: true });
+    rmSync(remoteDir, { recursive: true, force: true });
+  });
+
+  it(
+    'creates the workflow branch before the audit, completes refinement, audits the failed reviewer invocation, and stops with a stable reason',
+    { timeout: 60_000 },
+    async () => {
+      const baseShaBefore = git(projectDir, ['rev-parse', 'main']);
+      await reviewWorkflowRunCommand({ plan: 'plan.md', timeout: 60, id: WORKFLOW_ID });
+
+      const db = openDatabase(getDbPath(projectDir));
+      try {
+        const runnerStore = new reviewWorkflowRunner.ReviewWorkflowRunnerStore(db);
+        const state = runnerStore.require(WORKFLOW_ID);
+        const planStore = new reviewWorkflowPlan.ReviewWorkflowPlanStore(db);
+
+        // AWR-001 regression: refinement ran on the workflow branch — startup never
+        // invalidates its own repository audit, and the frozen batch count is recorded.
+        expect(state.stopDetails ?? '').not.toContain('Repository state changed');
+        expect(state.branch.startsWith('codemoot/plan-')).toBe(true);
+        expect(state.totalBatches).toBe(1);
+        const batches = planStore.listBatches(WORKFLOW_ID);
+        expect(batches).toHaveLength(1);
+        expect(batches[0]?.batchId).toBe(`${WORKFLOW_ID}:batch:1`);
+
+        // Branch lifecycle: the worktree is on the workflow branch and the base branch is
+        // exactly where it started, locally and on the remote.
+        expect(git(projectDir, ['rev-parse', '--abbrev-ref', 'HEAD'])).toBe(state.branch);
+        expect(state.baseBranch).toBe('main');
+        expect(git(projectDir, ['rev-parse', 'main'])).toBe(baseShaBefore);
+        expect(state.baseSha).toBe(baseShaBefore);
+
+        // The successful refinement invocation is fully audited with hashes and tokens.
+        const audit = planStore.workflowStore.listInvocationAudit(WORKFLOW_ID);
+        const refinementRows = audit.filter((row) => row.phase === 'PLAN_REFINEMENT');
+        expect(refinementRows.length).toBeGreaterThanOrEqual(1);
+        expect(refinementRows[0]?.responseHash).toMatch(/^[0-9a-f]{64}$/);
+        expect(refinementRows[0]?.inputTokens).toBeGreaterThan(0);
+
+        // The reviewer CLI failure is audited too (FAILED row, stderr captured, classified)
+        // and consumes the invocation budget rather than vanishing.
+        const failedRows = audit.filter((row) => row.resultStatus === 'FAILED');
+        expect(failedRows.length).toBeGreaterThanOrEqual(1);
+        expect(failedRows[0]?.failure?.classification).toBe('AUTHENTICATION');
+        expect(failedRows[0]?.failure?.message ?? '').toContain('not logged in');
+
+        // The refinement audit row carries the full raw stdout and repository before/after
+        // state — the invocation-layer audit contract, proven through the real path.
+        expect(refinementRows[0]?.rawStdout ?? '').toContain('"type":"result"');
+        expect(refinementRows[0]?.gitBefore?.branch).toBe(state.branch);
+        expect(refinementRows[0]?.gitAfter?.headSha).toMatch(/^[0-9a-f]{40}$/);
+
+        // The frozen limits are persisted in the runner state — later config edits can
+        // never change enforcement.
+        expect(state.limits?.maxCodeReviewRoundsPerBatch).toBe(3);
+        expect(state.limits?.maxCorrectionPassesPerBatch).toBe(2);
+
+        // The git guard is deny-by-default and parses global options, so option-prefixed
+        // bypasses and plumbing mutations are refused too; allowed reads pass through.
+        const guardPath = join(projectDir, '.cowork', 'git-guard', 'git');
+        for (const attempt of [
+          ['push'],
+          ['reset', '--hard'],
+          ['-C', '.', 'push'],
+          ['-c', 'user.name=x', 'push', 'origin'],
+          ['update-ref', 'refs/heads/main', 'HEAD'],
+          ['symbolic-ref', 'HEAD', 'refs/heads/main'],
+          ['cherry-pick', 'HEAD'],
+          ['stash'],
+          ['checkout', '-b', 'escape'],
+        ]) {
+          expect(
+            () => execFileSync(guardPath, attempt, { cwd: projectDir }),
+            attempt.join(' '),
+          ).toThrow();
+        }
+        expect(
+          execFileSync(guardPath, ['rev-parse', 'HEAD'], {
+            cwd: projectDir,
+            encoding: 'utf8',
+          }).trim(),
+        ).toMatch(/^[0-9a-f]{40}$/);
+        expect(
+          execFileSync(guardPath, ['-C', '.', 'status', '--porcelain'], {
+            cwd: projectDir,
+            encoding: 'utf8',
+          }),
+        ).toBeDefined();
+
+        // The run restored the user's ORIGINAL custom push URL when it ended.
+        expect(git(projectDir, ['config', '--get', 'remote.origin.pushurl'])).toBe(remoteDir);
+
+        // While the guard is installed, even an ABSOLUTE-PATH git cannot push: origin's
+        // push URL is sentinel-blocked; uninstalling restores the preserved original.
+        installGitGuard(projectDir);
+        expect(git(projectDir, ['config', '--get', 'remote.origin.pushurl'])).toBe(
+          'file:///codemoot-push-blocked',
+        );
+        expect(() =>
+          execFileSync('git', ['push', 'origin', 'HEAD'], { cwd: projectDir, stdio: 'pipe' }),
+        ).toThrow();
+        uninstallGitGuard(projectDir);
+        expect(git(projectDir, ['config', '--get', 'remote.origin.pushurl'])).toBe(remoteDir);
+
+        // The stop is durable, machine-readable, and notified durably (NOTIFICATION log).
+        expect(state.status).toBe('HUMAN_DECISION_REQUIRED');
+        expect(state.stopReason).toBe('AUTHENTICATION_REQUIRED');
+        const notifications = runnerStore.listLog(WORKFLOW_ID, { types: ['NOTIFICATION'] });
+        expect(notifications).toHaveLength(1);
+      } finally {
+        db.close();
+      }
+    },
+  );
+
+  it('never touches the push URL when startup validation fails on a dirty worktree', async () => {
+    writeFileSync(join(projectDir, 'dirty.txt'), 'uncommitted\n');
+    await expect(
+      reviewWorkflowRunCommand({ plan: 'plan.md', timeout: 60, id: `${WORKFLOW_ID}-dirty` }),
+    ).rejects.toThrow(/clean worktree/);
+    // The custom push URL is exactly as configured — no sentinel was ever installed.
+    expect(git(projectDir, ['config', '--get', 'remote.origin.pushurl'])).toBe(remoteDir);
+  });
+
+  it('restores the push URL when initialization fails after guard installation', async () => {
+    await expect(
+      reviewWorkflowRunCommand({
+        plan: 'missing-plan.md',
+        timeout: 60,
+        id: `${WORKFLOW_ID}-noplan`,
+      }),
+    ).rejects.toThrow();
+    expect(git(projectDir, ['config', '--get', 'remote.origin.pushurl'])).toBe(remoteDir);
+  });
+
+  it('blocks SSH pushes from the agent environment regardless of ~/.ssh keys', () => {
+    // The exact variables injected into every agent subprocess.
+    const agentEnv = {
+      ...process.env,
+      GIT_CONFIG_GLOBAL: '/dev/null',
+      GIT_CONFIG_SYSTEM: '/dev/null',
+      GIT_TERMINAL_PROMPT: '0',
+      GIT_ASKPASS: '/usr/bin/false',
+      GIT_SSH_COMMAND: '/usr/bin/false',
+    };
+    expect(() =>
+      execFileSync('git', ['push', 'ssh://git@localhost/nowhere.git', 'HEAD'], {
+        cwd: projectDir,
+        env: agentEnv,
+        stdio: 'pipe',
+        timeout: 15_000,
+      }),
+    ).toThrow();
+  });
+});

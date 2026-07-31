@@ -55,7 +55,12 @@ class FakeBridge implements CliBridge {
     };
   }
 
+  stderrToEmit = '';
+
   async send(_prompt: string, _options?: BridgeOptions): Promise<BridgeCallResult> {
+    if (this.stderrToEmit.length > 0) {
+      _options?.onStderr?.(this.stderrToEmit);
+    }
     this.calls.push({ kind: 'send' });
     this.counter += 1;
     const vendorId = this.nextVendorId ?? `${this.name}-thread-${this.counter}`;
@@ -238,6 +243,41 @@ describe('mandatory role-session continuity', () => {
 
   afterEach(() => {
     db.close();
+  });
+
+  it('persists the full prompt/response audit with redacted secrets for every invocation', async () => {
+    process.env.CODEMOOT_TEST_FAKE_KEY = 'super-secret-value-123';
+    try {
+      const bound = input('implementer', { batchId: BATCH_A, role: 'IMPLEMENTER' });
+      await invokeAndPersist({
+        ...bound,
+        prompt: 'do the work using super-secret-value-123',
+        auditPhase: 'IMPLEMENTATION',
+      });
+      const audit = store.listInvocationAudit(WORKFLOW_ID);
+      expect(audit).toHaveLength(1);
+      const row = audit[0];
+      expect(row).toMatchObject({
+        workflowId: WORKFLOW_ID,
+        batchId: BATCH_A,
+        phase: 'IMPLEMENTATION',
+        role: 'IMPLEMENTER',
+        adapterKind: 'CLAUDE',
+        sessionOutcome: 'CREATED',
+        vendorSessionId: 'claude-thread-1',
+        redactionCount: 1,
+        inputTokens: 10,
+        outputTokens: 5,
+      });
+      // The secret never reaches storage; hashes cover the ORIGINAL content.
+      expect(row?.prompt).not.toContain('super-secret-value-123');
+      expect(row?.prompt).toContain('[REDACTED:CODEMOOT_TEST_FAKE_KEY:');
+      expect(row?.promptHash).toMatch(/^[0-9a-f]{64}$/);
+      expect(row?.responseHash).toMatch(/^[0-9a-f]{64}$/);
+      expect(row?.response).toBe('ok');
+    } finally {
+      process.env.CODEMOOT_TEST_FAKE_KEY = undefined;
+    }
   });
 
   it('creates and persists exactly one role session on the first bound invocation', async () => {
@@ -451,5 +491,43 @@ describe('mandatory role-session continuity', () => {
     } catch (error) {
       expect(error).toBeInstanceOf(RoleInvocationError);
     }
+  });
+
+  it(
+    'fails the invocation closed when adapter stderr exceeds the capture limit',
+    { timeout: 30_000 },
+    async () => {
+      implementerBridge.stderrToEmit = 'x'.repeat(5_000_001);
+      const request = input('implementer', { batchId: BATCH_A, role: 'IMPLEMENTER' });
+      await expect(service.prepare(request)).rejects.toThrow(/capture limit/);
+      // The failure itself is audited — nothing disappears.
+      const failed = store
+        .listInvocationAudit(WORKFLOW_ID)
+        .filter((row) => row.resultStatus === 'FAILED');
+      expect(failed.length).toBeGreaterThanOrEqual(1);
+    },
+  );
+
+  it('never starts the agent when the active-invocation record cannot be persisted', async () => {
+    const failing = new RoleInvocationService(store, undefined, {
+      onStart: () => {
+        throw new Error('runner state unavailable');
+      },
+      onSettle: () => {},
+    });
+    const request = input('implementer', { batchId: BATCH_A, role: 'IMPLEMENTER' });
+    await expect(failing.prepare(request)).rejects.toThrow(/runner state unavailable/);
+    expect(implementerBridge.calls).toHaveLength(0);
+  });
+
+  it('surfaces settlement-persistence failures as durable invocation failures', async () => {
+    const failing = new RoleInvocationService(store, undefined, {
+      onStart: () => {},
+      onSettle: () => {
+        throw new Error('settlement write failed');
+      },
+    });
+    const request = input('implementer', { batchId: BATCH_A, role: 'IMPLEMENTER' });
+    await expect(failing.prepare(request)).rejects.toThrow(/settlement/);
   });
 });

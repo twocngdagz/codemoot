@@ -189,6 +189,14 @@ const COMMAND_FIXTURES = {
       findingCount: 2,
     },
   },
+  ACCEPT_FINDINGS_RISK: {
+    type: 'ACCEPT_FINDINGS_RISK',
+    evidence: {
+      decisionId: 'workflow-1:decision:1',
+      findingIds: ['finding-1', 'finding-2'],
+      acceptedCommitSha: SHA_A,
+    },
+  },
   START_IMPLEMENTATION: {
     type: 'START_IMPLEMENTATION',
     evidence: {
@@ -484,6 +492,34 @@ describe('transitionBatch allowed transitions', () => {
       },
       HUMAN_COMMITTER,
       'IMPLEMENTATION_COMPLETE',
+    );
+  });
+
+  it('accepts ACCEPT_FINDINGS_RISK only from the human owner on revision states', () => {
+    // Allowed sources: NEEDS_REVISION and IMPLEMENTATION_COMPLETE, both to VERIFYING.
+    expectAllowed('NEEDS_REVISION', COMMAND_FIXTURES.ACCEPT_FINDINGS_RISK, OWNER, 'VERIFYING');
+    expectAllowed(
+      'IMPLEMENTATION_COMPLETE',
+      COMMAND_FIXTURES.ACCEPT_FINDINGS_RISK,
+      OWNER,
+      'VERIFYING',
+    );
+    // Every other state is an invalid source.
+    expectRejected('VERIFYING', COMMAND_FIXTURES.ACCEPT_FINDINGS_RISK, OWNER, 'INVALID_TRANSITION');
+    expectRejected('DRAFT', COMMAND_FIXTURES.ACCEPT_FINDINGS_RISK, OWNER, 'INVALID_TRANSITION');
+    // Agents can never accept risk, whatever authority they claim.
+    expectRejected(
+      'NEEDS_REVISION',
+      COMMAND_FIXTURES.ACCEPT_FINDINGS_RISK,
+      makeActor('AGENT', ['WORKFLOW_OWNER']),
+      'ACTOR_TYPE_NOT_ALLOWED',
+    );
+    // A human without the owner authority is refused too.
+    expectRejected(
+      'NEEDS_REVISION',
+      COMMAND_FIXTURES.ACCEPT_FINDINGS_RISK,
+      HUMAN_COMMITTER,
+      'AUTHORITY_REQUIRED',
     );
   });
 

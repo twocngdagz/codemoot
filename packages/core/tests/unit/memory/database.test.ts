@@ -74,7 +74,7 @@ describe('openDatabase', () => {
   it('sets schema version', () => {
     const db = openDatabase(':memory:');
     const version = getSchemaVersion(db);
-    expect(version).toBe('13');
+    expect(version).toBe('14');
     db.close();
   });
 
@@ -83,7 +83,7 @@ describe('openDatabase', () => {
     // Run migrations again -- should be idempotent
     runMigrations(db);
     const version = getSchemaVersion(db);
-    expect(version).toBe('13');
+    expect(version).toBe('14');
     db.close();
   });
 
@@ -105,7 +105,7 @@ describe('openDatabase', () => {
 
     runMigrations(db);
 
-    expect(getSchemaVersion(db)).toBe('13');
+    expect(getSchemaVersion(db)).toBe('14');
     expect(
       db.prepare('SELECT value FROM legacy_sentinel WHERE id = ?').pluck().get('legacy-1'),
     ).toBe('preserve-me');

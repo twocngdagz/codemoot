@@ -277,6 +277,52 @@ const batchRoleSessionRowSchema = z.object({
   created_at: z.string().min(1),
 });
 
+const invocationAuditRowSchema = z.object({
+  invocation_id: z.string().min(1),
+  workflow_id: z.string().min(1),
+  batch_id: z.string().nullable(),
+  phase: z.string().nullable(),
+  command_id: z.string().min(1),
+  role: z.enum(['IMPLEMENTER', 'REVIEWER']).nullable(),
+  actor_execution_id: z.string().min(1),
+  adapter_kind: z.string().min(1),
+  configured_model: z.string().min(1),
+  reported_model: z.string().nullable(),
+  vendor_session_id: z.string().min(1),
+  session_outcome: z.enum(['CREATED', 'RESUMED', 'NONE']),
+  prompt: z.string(),
+  prompt_hash: z.string().min(1),
+  response: z.string(),
+  response_hash: z.string().min(1),
+  redaction_count: z.number().int().nonnegative(),
+  raw_stderr: z.string().nullable(),
+  raw_stdout: z.string().nullable(),
+  failure_json: z.string().nullable(),
+  git_before_json: z.string().nullable(),
+  git_after_json: z.string().nullable(),
+  changed_files_json: z.string().nullable(),
+  input_tokens: z.number().int().nullable(),
+  output_tokens: z.number().int().nullable(),
+  total_tokens: z.number().int().nullable(),
+  cost_usd: z.number().nullable(),
+  started_at: z.string().min(1),
+  finished_at: z.string().min(1),
+  duration_ms: z.number().int(),
+  result_status: z.string().min(1),
+  created_at: z.string().min(1),
+});
+
+const invocationFailureSchema = z.object({
+  classification: z.string().min(1),
+  message: z.string(),
+});
+
+const gitStateSchema = z.object({
+  branch: z.string().min(1),
+  headSha: z.string().min(1),
+  clean: z.boolean(),
+});
+
 const sessionContinuityRowSchema = z.object({
   invocation_id: z.string().min(1),
   workflow_id: z.string().min(1),
@@ -297,6 +343,53 @@ export interface BatchRoleSession {
   readonly sessionIdentityId: string;
   readonly providerOrAdapter: string;
   readonly vendorSessionId: string;
+  readonly createdAt: string;
+}
+
+export interface InvocationAuditRecord {
+  readonly invocationId: string;
+  readonly workflowId: string;
+  readonly batchId?: string;
+  readonly phase?: string;
+  readonly commandId: string;
+  readonly role?: 'IMPLEMENTER' | 'REVIEWER';
+  readonly actorExecutionId: string;
+  readonly adapterKind: string;
+  readonly configuredModel: string;
+  readonly reportedModel?: string;
+  readonly vendorSessionId: string;
+  readonly sessionOutcome: 'CREATED' | 'RESUMED' | 'NONE';
+  readonly prompt: string;
+  readonly promptHash: string;
+  readonly response: string;
+  readonly responseHash: string;
+  readonly redactionCount: number;
+  /** Adapter stderr captured during the invocation (secret-redacted, capped by the adapter). */
+  readonly rawStderr?: string;
+  /** Complete raw CLI stdout (secret-redacted, capped by the adapter). */
+  readonly rawStdout?: string;
+  /** Structured failure details for FAILED invocations (classification + message). */
+  readonly failure?: { readonly classification: string; readonly message: string };
+  /** Repository state immediately before/after the invocation, and the files it changed. */
+  readonly gitBefore?: {
+    readonly branch: string;
+    readonly headSha: string;
+    readonly clean: boolean;
+  };
+  readonly gitAfter?: {
+    readonly branch: string;
+    readonly headSha: string;
+    readonly clean: boolean;
+  };
+  readonly changedFiles?: readonly string[];
+  readonly inputTokens?: number;
+  readonly outputTokens?: number;
+  readonly totalTokens?: number;
+  readonly costUsd?: number;
+  readonly startedAt: string;
+  readonly finishedAt: string;
+  readonly durationMs: number;
+  readonly resultStatus: string;
   readonly createdAt: string;
 }
 
@@ -625,6 +718,133 @@ export class ReviewWorkflowStore {
       );
   }
 
+  /** Append-only, immutable invocation audit: full prompt and response before advancement. */
+  recordInvocationAudit(audit: InvocationAuditRecord): void {
+    this.db
+      .prepare(
+        `INSERT INTO review_workflow_invocation_audit (
+          invocation_id, workflow_id, batch_id, phase, command_id, role,
+          actor_execution_id, adapter_kind, configured_model, reported_model,
+          vendor_session_id, session_outcome, prompt, prompt_hash, response, response_hash,
+          redaction_count, raw_stderr, raw_stdout, failure_json,
+          git_before_json, git_after_json, changed_files_json,
+          input_tokens, output_tokens, total_tokens, cost_usd,
+          started_at, finished_at, duration_ms, result_status, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        audit.invocationId,
+        audit.workflowId,
+        audit.batchId ?? null,
+        audit.phase ?? null,
+        audit.commandId,
+        audit.role ?? null,
+        audit.actorExecutionId,
+        audit.adapterKind,
+        audit.configuredModel,
+        audit.reportedModel ?? null,
+        audit.vendorSessionId,
+        audit.sessionOutcome,
+        audit.prompt,
+        audit.promptHash,
+        audit.response,
+        audit.responseHash,
+        audit.redactionCount,
+        audit.rawStderr ?? null,
+        audit.rawStdout ?? null,
+        audit.failure === undefined ? null : JSON.stringify(audit.failure),
+        audit.gitBefore === undefined ? null : JSON.stringify(audit.gitBefore),
+        audit.gitAfter === undefined ? null : JSON.stringify(audit.gitAfter),
+        audit.changedFiles === undefined ? null : JSON.stringify(audit.changedFiles),
+        audit.inputTokens ?? null,
+        audit.outputTokens ?? null,
+        audit.totalTokens ?? null,
+        audit.costUsd ?? null,
+        audit.startedAt,
+        audit.finishedAt,
+        audit.durationMs,
+        audit.resultStatus,
+        audit.createdAt,
+      );
+  }
+
+  listInvocationAudit(
+    workflowId: string,
+    filters?: {
+      readonly batchId?: string;
+      readonly phase?: string;
+      readonly invocationId?: string;
+    },
+  ): readonly InvocationAuditRecord[] {
+    const conditions = ['workflow_id = ?'];
+    const values: unknown[] = [workflowId];
+    if (filters?.batchId !== undefined) {
+      conditions.push('batch_id = ?');
+      values.push(filters.batchId);
+    }
+    if (filters?.phase !== undefined) {
+      conditions.push('phase = ?');
+      values.push(filters.phase);
+    }
+    if (filters?.invocationId !== undefined) {
+      conditions.push('invocation_id = ?');
+      values.push(filters.invocationId);
+    }
+    return this.db
+      .prepare(
+        `SELECT * FROM review_workflow_invocation_audit
+         WHERE ${conditions.join(' AND ')} ORDER BY created_at, invocation_id`,
+      )
+      .all(...values)
+      .map((row) => {
+        const parsed = invocationAuditRowSchema.parse(row);
+        return {
+          invocationId: parsed.invocation_id,
+          workflowId: parsed.workflow_id,
+          ...(parsed.batch_id === null ? {} : { batchId: parsed.batch_id }),
+          ...(parsed.phase === null ? {} : { phase: parsed.phase }),
+          commandId: parsed.command_id,
+          ...(parsed.role === null ? {} : { role: parsed.role }),
+          actorExecutionId: parsed.actor_execution_id,
+          adapterKind: parsed.adapter_kind,
+          configuredModel: parsed.configured_model,
+          ...(parsed.reported_model === null ? {} : { reportedModel: parsed.reported_model }),
+          vendorSessionId: parsed.vendor_session_id,
+          sessionOutcome: parsed.session_outcome,
+          prompt: parsed.prompt,
+          promptHash: parsed.prompt_hash,
+          response: parsed.response,
+          responseHash: parsed.response_hash,
+          redactionCount: parsed.redaction_count,
+          ...(parsed.raw_stderr === null ? {} : { rawStderr: parsed.raw_stderr }),
+          ...(parsed.raw_stdout === null ? {} : { rawStdout: parsed.raw_stdout }),
+          ...(parsed.failure_json === null
+            ? {}
+            : {
+                failure: invocationFailureSchema.parse(JSON.parse(parsed.failure_json)),
+              }),
+          ...(parsed.git_before_json === null
+            ? {}
+            : { gitBefore: gitStateSchema.parse(JSON.parse(parsed.git_before_json)) }),
+          ...(parsed.git_after_json === null
+            ? {}
+            : { gitAfter: gitStateSchema.parse(JSON.parse(parsed.git_after_json)) }),
+          ...(parsed.changed_files_json === null
+            ? {}
+            : { changedFiles: z.array(z.string()).parse(JSON.parse(parsed.changed_files_json)) }),
+          ...(parsed.input_tokens === null ? {} : { inputTokens: parsed.input_tokens }),
+          ...(parsed.output_tokens === null ? {} : { outputTokens: parsed.output_tokens }),
+          ...(parsed.total_tokens === null ? {} : { totalTokens: parsed.total_tokens }),
+          ...(parsed.cost_usd === null ? {} : { costUsd: parsed.cost_usd }),
+          startedAt: parsed.started_at,
+          finishedAt: parsed.finished_at,
+          durationMs: parsed.duration_ms,
+          resultStatus: parsed.result_status,
+          createdAt: parsed.created_at,
+        };
+      });
+  }
+
   /** Append-only continuity evidence: one row per invocation attempt, including failures. */
   recordSessionContinuity(evidence: SessionContinuityEvidence): void {
     this.db
@@ -921,6 +1141,25 @@ export class ReviewWorkflowStore {
       if (review !== undefined) this.saveStructuredReview(review);
       for (const entity of input.entities) this.saveEntity(entity);
     })();
+  }
+
+  /** Every persisted handoff transcript (raw + parse status + artifact link) for export. */
+  listHandoffTranscripts(workflowId: string): readonly HandoffTranscript[] {
+    return this.db
+      .prepare(
+        `SELECT payload_json
+         FROM review_workflow_handoff_transcripts
+         WHERE workflow_id = ?
+         ORDER BY created_at, transcript_id`,
+      )
+      .all(workflowId)
+      .map((row) =>
+        parseStoredPayload(
+          payloadRowSchema.parse(row).payload_json,
+          handoffTranscriptSchema,
+          'HANDOFF_TRANSCRIPT',
+        ),
+      );
   }
 
   getHandoffTranscript(transcriptId: string): HandoffTranscript | null {

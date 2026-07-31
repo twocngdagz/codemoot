@@ -167,7 +167,14 @@ export class ReviewWorkflowCodeReviewService {
       .filter((event) => event.eventType === 'CODE_REVIEW_STARTED').length;
     const round = startedRounds + 1;
     const pacing = context.configuration.pacing;
-    if (round > pacing.maxCodeReviewRounds) {
+    // Every explicit human FIX_AGAIN resume (BATCH_RESUMED with grantsReviewRound) extends
+    // the contract by exactly one round — nothing extends silently.
+    const grantedRounds = this.store
+      .getEvents(input.batchId)
+      .filter(
+        (event) => event.eventType === 'BATCH_RESUMED' && event.payload.grantsReviewRound === true,
+      ).length;
+    if (round > pacing.maxCodeReviewRounds + grantedRounds) {
       throw new ReviewWorkflowImplementationError(
         'PACING_EXHAUSTED',
         `Batch ${input.batchId} has used all ${pacing.maxCodeReviewRounds} code-review rounds`,
@@ -305,6 +312,7 @@ export class ReviewWorkflowCodeReviewService {
           // Every round after the first must resume the initial reviewer session.
           expectExisting: round > 1,
         },
+        auditPhase: 'CODE_REVIEW',
         ...(input.options === undefined ? {} : { options: input.options }),
       });
     } catch (error) {
@@ -515,8 +523,15 @@ export class ReviewWorkflowCodeReviewService {
       const successfulAttempts = this.store
         .getEvents(input.batchId)
         .filter((event) => event.eventType === 'IMPLEMENTATION_READY').length;
+      const grantedPasses = this.store
+        .getEvents(input.batchId)
+        .filter(
+          (event) =>
+            event.eventType === 'BATCH_RESUMED' && event.payload.grantsCorrectionPass === true,
+        ).length;
       const correctionAvailable =
-        round < pacing.maxCodeReviewRounds && successfulAttempts < 1 + pacing.maxCorrectionPasses;
+        round < pacing.maxCodeReviewRounds + grantedRounds &&
+        successfulAttempts < 1 + pacing.maxCorrectionPasses + grantedPasses;
       if (correctionAvailable) {
         return {
           status: 'NEEDS_REVISION',

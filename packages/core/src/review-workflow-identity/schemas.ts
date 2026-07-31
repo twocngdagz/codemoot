@@ -65,15 +65,15 @@ export const reviewWorkflowConfigurationSnapshotSchema = z
     gates: reviewWorkflowGatePolicySnapshotSchema,
     pacing: z
       .object({
-        maxCodeReviewRounds: z.number().int().min(1).max(2),
-        maxCorrectionPasses: z.number().int().min(0).max(1),
+        maxCodeReviewRounds: z.number().int().min(1).max(5),
+        maxCorrectionPasses: z.number().int().min(0).max(4),
         deferNonBlockingFindings: z.literal(true),
         unresolvedAfterFinalReview: z.literal('human_decision_required'),
       })
       .strict()
       .default({
-        maxCodeReviewRounds: 2,
-        maxCorrectionPasses: 1,
+        maxCodeReviewRounds: 3,
+        maxCorrectionPasses: 2,
         deferNonBlockingFindings: true,
         unresolvedAfterFinalReview: 'human_decision_required',
       }),

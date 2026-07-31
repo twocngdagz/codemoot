@@ -123,6 +123,12 @@ const COMMAND_ACTOR_RULES: Record<TransitionCommand['type'], ActorRule> = {
     actorTypes: ['HUMAN', 'SYSTEM'],
     authorities: ['WORKFLOW_OWNER', 'SYSTEM_RECONCILER'],
   },
+  // An explicit, immutable human risk decision: the named blocking findings are accepted
+  // as-is on the exact commit and the batch proceeds to verification.
+  ACCEPT_FINDINGS_RISK: {
+    actorTypes: ['HUMAN'],
+    authorities: ['WORKFLOW_OWNER'],
+  },
   CANCEL_BATCH: {
     actorTypes: ['HUMAN'],
     authorities: ['WORKFLOW_OWNER'],
@@ -438,6 +444,9 @@ export function transitionBatch(input: TransitionInput): TransitionResult {
       return gateRejection ?? allow(currentState, command, 'APPROVED_FOR_MERGE');
     }
 
+    case 'ACCEPT_FINDINGS_RISK':
+      return allow(currentState, command, 'VERIFYING');
+
     case 'RECONCILE_STALE_APPROVAL':
       if (command.evidence.persistedApprovalSha === command.evidence.currentHeadSha) {
         return reject(
@@ -557,6 +566,8 @@ function expectedSourceStates(command: TransitionCommand): readonly (BatchState 
       return BLOCKABLE_BATCH_STATES;
     case 'RESUME_BATCH':
       return ['BLOCKED'];
+    case 'ACCEPT_FINDINGS_RISK':
+      return ['NEEDS_REVISION', 'IMPLEMENTATION_COMPLETE'];
     case 'CANCEL_BATCH':
       return [
         'DRAFT',

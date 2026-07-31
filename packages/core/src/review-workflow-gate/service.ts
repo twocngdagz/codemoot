@@ -255,6 +255,7 @@ export class ReviewWorkflowGateService {
         }),
         // The final audit must resume the batch's initial reviewer session.
         sessionBinding: { batchId: input.batchId, role: 'REVIEWER', expectExisting: true },
+        auditPhase: 'FINAL_AUDIT',
         ...(input.previousSessionIdentityId === undefined
           ? {}
           : { previousSessionIdentityId: input.previousSessionIdentityId }),
@@ -496,13 +497,31 @@ export class ReviewWorkflowGateService {
       this.store
         .listDispositionsForFinding(finding.findingId)
         .some((disposition) => disposition.reviewerDecision.decision === 'ACCEPTED');
-    const unresolved = criticalOrHigh.filter((finding) => !acceptedDispositionFor(finding));
+    // An explicit ACCEPT_FINDINGS_RISK decision (SHA-bound to the reviewed commit) resolves
+    // the named findings for gating purposes; the immutable decision record is the evidence.
+    const riskAcceptedIds = new Set(
+      this.store
+        .getEvents(input.batchId)
+        .filter(
+          (event) =>
+            event.eventType === 'BATCH_FINDINGS_RISK_ACCEPTED' &&
+            event.payload.acceptedCommitSha === reviewedCommitSha,
+        )
+        .flatMap((event) =>
+          Array.isArray(event.payload.findingIds) ? event.payload.findingIds.map(String) : [],
+        ),
+    );
+    const riskAcceptedFor = (finding: Finding): boolean => riskAcceptedIds.has(finding.findingId);
+    const unresolved = criticalOrHigh.filter(
+      (finding) => !acceptedDispositionFor(finding) && !riskAcceptedFor(finding),
+    );
     const incompleteDispositions = criticalOrHigh.filter(
       (finding) =>
         this.store
           .listDispositionsForFinding(finding.findingId)
           .some((disposition) => disposition.reviewerDecision.decision !== 'ACCEPTED') &&
-        !acceptedDispositionFor(finding),
+        !acceptedDispositionFor(finding) &&
+        !riskAcceptedFor(finding),
     );
 
     const manualOrBrowserCriteria = requiredCriteria.filter(

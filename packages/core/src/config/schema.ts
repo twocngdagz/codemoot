@@ -135,12 +135,31 @@ export const reviewGatedGateConfigSchema = z
   });
 
 export const reviewGatedPacingConfigSchema = z.object({
-  maxCodeReviewRounds: z.number().int().min(1).max(2).default(2),
-  maxCorrectionPasses: z.number().int().min(0).max(1).default(1),
+  maxCodeReviewRounds: z.number().int().min(1).max(5).default(3),
+  maxCorrectionPasses: z.number().int().min(0).max(4).default(2),
   deferNonBlockingFindings: z.literal(true).default(true),
   unresolvedAfterFinalReview: z
     .literal('human_decision_required')
     .default('human_decision_required'),
+});
+
+// Every autonomous limit is finite and validated: no unbounded loops, budgets, or runtimes.
+export const reviewGatedAutonomousConfigSchema = z.object({
+  maxPlanReviewRoundsPerBatch: z.number().int().min(1).max(5).default(2),
+  maxCodeReviewRoundsPerBatch: z.number().int().min(1).max(5).default(3),
+  maxCorrectionPassesPerBatch: z.number().int().min(0).max(4).default(2),
+  maxVerificationAttemptsPerCommand: z.number().int().min(1).max(5).default(2),
+  maxFinalAuditsPerBatch: z.number().int().min(1).max(1).default(1),
+  maxAgentInvocationsPerBatch: z.number().int().min(1).max(100).default(12),
+  maxTotalAgentInvocations: z.number().int().min(1).max(2000).default(100),
+  maxBatchRuntimeMinutes: z.number().int().min(1).max(10_080).default(240),
+  maxWorkflowRuntimeMinutes: z.number().int().min(1).max(20_160).default(1440),
+  maxConsecutiveNoProgressActions: z.number().int().min(1).max(10).default(2),
+  maxInputTokensPerBatch: z.number().int().min(1).default(500_000),
+  maxOutputTokensPerBatch: z.number().int().min(1).default(100_000),
+  maxCostUsdPerWorkflow: z.number().positive().finite().default(25),
+  heartbeatIntervalSeconds: z.number().int().min(5).max(300).default(30),
+  heartbeatExpirySeconds: z.number().int().min(30).max(3600).default(120),
 });
 
 export const reviewGatedConfigSchema = z.object({
@@ -148,6 +167,7 @@ export const reviewGatedConfigSchema = z.object({
   commit: reviewGatedCommitConfigSchema.default(COMPATIBILITY_REVIEW_GATED_CONFIG.commit),
   gates: reviewGatedGateConfigSchema.default(COMPATIBILITY_REVIEW_GATED_CONFIG.gates),
   pacing: reviewGatedPacingConfigSchema.default(COMPATIBILITY_REVIEW_GATED_CONFIG.pacing),
+  autonomous: reviewGatedAutonomousConfigSchema.default({}),
 });
 
 const memoryConfigSchema = z.object({

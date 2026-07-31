@@ -107,6 +107,7 @@ export class ReviewWorkflowImplementationService {
         sessionIdentityId: input.sessionIdentityId,
         prompt: input.prompt,
         sessionBinding: { batchId: input.batchId, role: 'IMPLEMENTER' },
+        auditPhase: 'IMPLEMENTATION',
         ...(input.options === undefined ? {} : { options: input.options }),
       }),
     );
@@ -191,6 +192,7 @@ export class ReviewWorkflowImplementationService {
         prompt: input.prompt,
         previousSessionIdentityId: input.previousSessionIdentityId,
         sessionBinding: { batchId: input.batchId, role: 'IMPLEMENTER', expectExisting: true },
+        auditPhase: 'IMPLEMENTATION',
         ...(input.options === undefined ? {} : { options: input.options }),
       }),
     );
@@ -311,6 +313,7 @@ export class ReviewWorkflowImplementationService {
         prompt: input.prompt,
         previousSessionIdentityId: input.previousSessionIdentityId,
         sessionBinding: { batchId: input.batchId, role: 'IMPLEMENTER', expectExisting: true },
+        auditPhase: 'IMPLEMENTATION',
         ...(input.creationMode === 'AGENT_AUTHORIZED'
           ? { additionalAuthorities: ['COMMIT_CREATOR'] }
           : {}),
@@ -880,9 +883,15 @@ export class ReviewWorkflowImplementationService {
     batch: ReviewWorkflowBatch,
     configuration: ReviewWorkflowConfigurationSnapshot,
   ): void {
+    const grantedPasses = this.store
+      .getEvents(batch.batchId)
+      .filter(
+        (event) =>
+          event.eventType === 'BATCH_RESUMED' && event.payload.grantsCorrectionPass === true,
+      ).length;
     if (
       this.successfulAttemptCount(batch.batchId) >=
-      1 + configuration.pacing.maxCorrectionPasses
+      1 + configuration.pacing.maxCorrectionPasses + grantedPasses
     ) {
       throw new ReviewWorkflowImplementationError(
         'PACING_EXHAUSTED',

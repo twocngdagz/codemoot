@@ -1,5 +1,7 @@
+import { execFileSync, spawn } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { basename, resolve } from 'node:path';
 import {
   ModelRegistry,
   RoleInvocationService,
@@ -7,7 +9,7 @@ import {
   generateId,
   loadConfig,
   type openDatabase,
-  type reviewWorkflow,
+  reviewWorkflow,
   reviewWorkflowContracts,
   reviewWorkflowGate,
   reviewWorkflowGit,
@@ -16,6 +18,7 @@ import {
   reviewWorkflowJobs,
   reviewWorkflowPersistence,
   reviewWorkflowPlan,
+  reviewWorkflowRunner,
   reviewWorkflowVerification,
 } from '@codemoot/core';
 import { withDatabase } from '../utils.js';
@@ -99,7 +102,86 @@ export async function reviewWorkflowStatusCommand(workflowId: string): Promise<v
   await withDatabase(async (db) => {
     const runtime = createRuntime(db, process.cwd());
     const status = runtime.service.getStatus(workflowId);
+    // Autonomous-runner status: persist WORKER_HEARTBEAT_EXPIRED when both the heartbeat
+    // and the worker lease expired, then report the durable state.
+    let runner: Record<string, unknown> | null = null;
+    const runnerState = runtime.runnerStore.get(workflowId);
+    if (runnerState !== null) {
+      const config = loadConfig({ projectDir: process.cwd() });
+      const expiry = config.reviewGated?.autonomous.heartbeatExpirySeconds ?? 120;
+      const reconciled = buildRunner(runtime, process.cwd(), workflowId, 1800).reconcileStalled(
+        workflowId,
+      );
+      const observed = reviewWorkflowRunner.deriveObservedStatus(reconciled, expiry, new Date());
+      const statusGit = createRunnerGit(process.cwd());
+      const lastInvocation = runtime.store.workflowStore.listInvocationAudit(workflowId).at(-1);
+      const now = Date.now();
+      runner = {
+        status: reconciled.status,
+        observedStatus: observed.status,
+        currentHeadSha: statusGit.headSha(),
+        remoteHeadSha: statusGit.remoteHeadSha(reconciled.branch),
+        heartbeatAgeSeconds:
+          reconciled.lastHeartbeatAt === undefined
+            ? null
+            : Math.round((now - Date.parse(reconciled.lastHeartbeatAt)) / 1000),
+        phaseElapsedSeconds:
+          reconciled.phaseStartedAt === undefined
+            ? null
+            : Math.round((now - Date.parse(reconciled.phaseStartedAt)) / 1000),
+        activeInvocation: reconciled.activeInvocation ?? null,
+        lastInvocation:
+          lastInvocation === undefined
+            ? null
+            : {
+                invocationId: lastInvocation.invocationId,
+                phase: lastInvocation.phase ?? null,
+                role: lastInvocation.role ?? null,
+                adapterKind: lastInvocation.adapterKind,
+                model: lastInvocation.reportedModel ?? lastInvocation.configuredModel,
+                resultStatus: lastInvocation.resultStatus,
+                finishedAt: lastInvocation.finishedAt,
+              },
+        branch: reconciled.branch,
+        baseBranch: reconciled.baseBranch,
+        baseSha: reconciled.baseSha,
+        phase: reconciled.phase ?? null,
+        reviewRound: reconciled.reviewRound ?? null,
+        correctionPass: reconciled.correctionPass ?? null,
+        currentOrdinal: reconciled.currentOrdinal ?? null,
+        totalBatches: reconciled.totalBatches,
+        completedOrdinals: reconciled.counters.completedOrdinals,
+        lastHeartbeatAt: reconciled.lastHeartbeatAt ?? null,
+        workerId: reconciled.workerId ?? null,
+        leaseExpiresAt: reconciled.leaseExpiresAt ?? null,
+        stopReason: reconciled.stopReason ?? null,
+        stopDetails: reconciled.stopDetails ?? null,
+        pendingDecision: reconciled.counters.pendingDecision ?? null,
+        lastCheckpoint: reconciled.lastCheckpoint ?? null,
+        nextAction:
+          reconciled.status === 'HUMAN_DECISION_REQUIRED'
+            ? `codemoot workflow decide ${workflowId} --action <fix_again|accept_risk|cancel> --rationale "..."`
+            : reconciled.status === 'RUNNING'
+              ? `codemoot workflow watch ${workflowId}`
+              : null,
+        limits: reconciled.limits ?? config.reviewGated?.autonomous ?? null,
+        contractPacing: (() => {
+          try {
+            const pacing = resolveRuntimeContext(runtime.store, workflowId, process.cwd()).snapshot
+              .pacing;
+            return {
+              maxCodeReviewRounds: pacing.maxCodeReviewRounds,
+              maxCorrectionPasses: pacing.maxCorrectionPasses,
+            };
+          } catch {
+            return null;
+          }
+        })(),
+        auditTotals: runtime.runnerStore.auditTotals(workflowId),
+      };
+    }
     printJson({
+      runner,
       workflow: status.workflow,
       batches: status.batches.map((batch) => {
         const implementer = runtime.store.getAssignment(batch.implementerAssignmentId);
@@ -229,13 +311,13 @@ export async function reviewWorkflowBatchFindingsCommand(
   });
 }
 
-export async function reviewWorkflowRefineCommand(
+async function performRefinement(
+  runtime: ReviewWorkflowRuntime,
+  projectDir: string,
   workflowId: string,
-  options: WorkflowInvocationOptions,
-): Promise<void> {
-  await withDatabase(async (db) => {
-    const projectDir = process.cwd();
-    const runtime = createRuntime(db, projectDir);
+  timeoutSeconds: number,
+) {
+  {
     const context = resolveRuntimeContext(runtime.store, workflowId, projectDir);
     if (
       context.workflow.refinedPlanVersionId !== undefined ||
@@ -272,8 +354,9 @@ export async function reviewWorkflowRefineCommand(
           statement: requirement.statement,
         })),
       }),
-      options: { timeout: options.timeout * 1000 },
+      options: agentInvocationOptions(timeoutSeconds),
       additionalAuthorities: ['PLAN_REFINER'],
+      auditPhase: 'PLAN_REFINEMENT',
     });
     const createdAt = prepared.invocation.finishedAt ?? new Date().toISOString();
     const result = runtime.service.captureRefinement({
@@ -291,6 +374,18 @@ export async function reviewWorkflowRefineCommand(
       actor: prepared.execution,
       preparedInvocation: prepared,
     });
+    return result;
+  }
+}
+
+export async function reviewWorkflowRefineCommand(
+  workflowId: string,
+  options: WorkflowInvocationOptions,
+): Promise<void> {
+  await withDatabase(async (db) => {
+    const projectDir = process.cwd();
+    const runtime = createRuntime(db, projectDir);
+    const result = await performRefinement(runtime, projectDir, workflowId, options.timeout);
     printJson(
       result.accepted
         ? {
@@ -401,7 +496,7 @@ export async function reviewWorkflowBatchReviewPlanCommand(
         batchPlan: plan,
         acceptanceCriteria: runtime.store.listAcceptanceCriteria(plan.batchPlanVersionId),
       }),
-      options: { timeout: options.timeout * 1000 },
+      options: agentInvocationOptions(options.timeout),
     });
     const roleSeparation = {
       implementerAssignment: context.snapshot.assignments.implementer,
@@ -475,7 +570,7 @@ export async function reviewWorkflowBatchImplementCommand(
                 batchId: batch.batchId,
                 planVersionId: plan.batchPlanVersionId,
               }),
-              options: { timeout: options.timeout * 1000 },
+              options: agentInvocationOptions(options.timeout),
             })
           ).implementerSessionIdentityId;
     const implementationBatch = runtime.implementationStore.getBatch(batch.batchId);
@@ -513,7 +608,7 @@ export async function reviewWorkflowBatchImplementCommand(
         originalBatchBaseSha: implementationBatch.originalBatchBaseSha,
         creationMode,
       }),
-      options: { timeout: options.timeout * 1000 },
+      options: agentInvocationOptions(options.timeout),
     });
     printJson(
       result.status === 'AWAITING_COMMIT'
@@ -641,7 +736,7 @@ export async function reviewWorkflowBatchResumeImplementationCommand(
         workflowId,
         batchId: batch.batchId,
       }),
-      options: { timeout: options.timeout * 1000 },
+      options: agentInvocationOptions(options.timeout),
     });
     printJson({
       status: result.batch.persistedState,
@@ -710,7 +805,7 @@ async function performCodeReview(
         batchPlan: plan,
         evidence,
       }),
-    options: { timeout: payload.timeout * 1000 },
+    options: agentInvocationOptions(payload.timeout),
   });
   return result.status === 'REJECTED'
     ? {
@@ -1204,7 +1299,7 @@ async function performFinalAudit(
       ? {}
       : { expectedBatchVersion: payload.expectedVersion }),
     buildPrompt: (evidence) => buildFinalAuditPrompt({ workflowId, batchPlan: plan, evidence }),
-    options: { timeout: payload.timeout * 1000 },
+    options: agentInvocationOptions(payload.timeout),
   });
   return result.capture.accepted
     ? {
@@ -1530,6 +1625,7 @@ interface EventsOptions {
   readonly limit: number;
   readonly cursor?: string;
   readonly ack?: boolean;
+  readonly tail?: number;
 }
 
 export async function reviewWorkflowEventsCommand(
@@ -1543,7 +1639,10 @@ export async function reviewWorkflowEventsCommand(
       throw new Error(`Cursor ${options.cursor} belongs to workflow ${cursor.workflowId}`);
     }
     const afterEventId = cursor === null ? options.after : cursor.lastEventId;
-    const events = runtime.jobStore.listWorkflowEvents(workflowId, afterEventId, options.limit);
+    const events =
+      options.tail === undefined
+        ? runtime.jobStore.listWorkflowEvents(workflowId, afterEventId, options.limit)
+        : runtime.jobStore.listWorkflowEvents(workflowId, 0, 100_000).slice(-options.tail);
     const lastEventId = events.at(-1)?.eventId ?? afterEventId;
     if (options.cursor !== undefined && options.ack === true && events.length > 0) {
       runtime.jobStore.advanceCursor({ cursorId: options.cursor, workflowId, lastEventId });
@@ -1763,11 +1862,41 @@ function createRuntime(db: ReturnType<typeof openDatabase>, projectDir: string) 
     db,
   );
   const commandStore = new reviewWorkflowPersistence.ReviewWorkflowCommandStore(db);
+  const runnerStore = new reviewWorkflowRunner.ReviewWorkflowRunnerStore(db);
   const jobStore = new reviewWorkflowJobs.ReviewWorkflowJobStore(db);
   const contractService = new reviewWorkflowContracts.ReviewWorkflowContractService(
     store.workflowStore,
   );
-  const roleInvocation = new RoleInvocationService(store.workflowStore);
+  const runnerGitOps = createRunnerGit(projectDir);
+  const runnerStoreForObserver = new reviewWorkflowRunner.ReviewWorkflowRunnerStore(db);
+  const roleInvocation = new RoleInvocationService(
+    store.workflowStore,
+    {
+      collect: () => runnerGitOps.collectState(),
+      changedBetween: (beforeSha, afterSha) => runnerGitOps.changedBetween(beforeSha, afterSha),
+    },
+    {
+      // Durable live monitoring: the ACTIVE invocation identity is persisted in the runner
+      // state for the whole time the agent is in flight.
+      onStart: (info) => {
+        if (runnerStoreForObserver.get(info.workflowId) === null) return;
+        runnerStoreForObserver.update(info.workflowId, {
+          activeInvocation: {
+            invocationId: info.invocationId,
+            role: info.role ?? null,
+            adapterKind: info.adapterKind,
+            model: info.model,
+            phase: info.phase ?? null,
+            startedAt: info.startedAt,
+          },
+        });
+      },
+      onSettle: (workflowId) => {
+        if (runnerStoreForObserver.get(workflowId) === null) return;
+        runnerStoreForObserver.update(workflowId, { activeInvocation: null });
+      },
+    },
+  );
   const repository = new reviewWorkflowGit.LocalGitRepository(projectDir);
   const gitService = new reviewWorkflowGit.ReviewWorkflowGitService(repository, {
     storePatch: () => {
@@ -1778,6 +1907,8 @@ function createRuntime(db: ReturnType<typeof openDatabase>, projectDir: string) 
     store,
     implementationStore,
     roleInvocation,
+    commandStore,
+    runnerStore,
     service: new reviewWorkflowPlan.ReviewWorkflowPlanService(
       store,
       commandStore,
@@ -1923,4 +2054,1650 @@ function requireImplementationSessionIdentityId(
 
 function printJson(value: unknown): void {
   console.log(JSON.stringify(value, null, 2));
+}
+
+// ---------------------------------------------------------------------------
+// Autonomous workflow runner (codemoot workflow run / watch / logs / export)
+// ---------------------------------------------------------------------------
+
+interface RunnerGitOps extends reviewWorkflowRunner.RunnerGit {
+  status(): string;
+  collectState(): {
+    branch: string;
+    headSha: string;
+    clean: boolean;
+    changedFiles: readonly string[];
+  };
+  changedBetween(beforeSha: string, afterSha: string): readonly string[];
+}
+
+let cachedRealGitPath: string | undefined;
+
+/** The absolute real git binary, resolved BEFORE the guard shim joins PATH. */
+function resolveRealGit(): string {
+  if (cachedRealGitPath === undefined) {
+    cachedRealGitPath = execFileSync('/bin/sh', ['-lc', 'command -v git'], { encoding: 'utf8' })
+      .trim()
+      .split('\n')[0] as string;
+  }
+  return cachedRealGitPath;
+}
+
+/** Deny-by-default: ONLY these read/commit subcommands are permitted for agent shells. */
+const ALLOWED_GIT_SUBCOMMANDS = [
+  'status',
+  'diff',
+  'log',
+  'show',
+  'add',
+  'commit',
+  'rev-parse',
+  'ls-files',
+  'grep',
+  'blame',
+  'describe',
+  'cat-file',
+  'shortlog',
+  'count-objects',
+  'version',
+  'help',
+  'mv',
+] as const;
+
+/**
+ * Installs the git execution boundary for agent subprocesses: a PATH-first `git` wrapper
+ * that refuses every forbidden subcommand outright. CodeMoot's own git operations bypass it
+ * via the absolute real-git path.
+ */
+export function installGitGuard(projectDir: string): string {
+  const realGit = resolveRealGit();
+  const guardDir = resolve(projectDir, '.cowork', 'git-guard');
+  mkdirSync(guardDir, { recursive: true });
+  const guardPath = resolve(guardDir, 'git');
+  // Deny-by-default: the wrapper resolves the ACTUAL subcommand (skipping every global git
+  // option, including `-C <path>` and `-c k=v`) and refuses anything not on the read/commit
+  // allowlist. Only an explicitly allowed subcommand ever reaches the real binary.
+  const script = [
+    '#!/bin/sh',
+    '# CodeMoot git guard: deny-by-default; only read/commit subcommands may execute.',
+    'sub=""',
+    'skip=0',
+    'for arg in "$@"; do',
+    '  if [ "$skip" = "1" ]; then skip=0; continue; fi',
+    '  case "$arg" in',
+    '    -C|-c|--git-dir|--work-tree|--namespace|--exec-path|--super-prefix|--config-env) skip=1 ;;',
+    '    -*) ;;',
+    '    *) sub="$arg"; break ;;',
+    '  esac',
+    'done',
+    'case "$sub" in',
+    `  ${ALLOWED_GIT_SUBCOMMANDS.join('|')}|"")`,
+    `    exec "${realGit}" "$@"`,
+    '    ;;',
+    'esac',
+    'echo "codemoot git-guard: git $sub is forbidden during autonomous execution" >&2',
+    'exit 128',
+    '',
+  ].join('\n');
+  writeFileSync(guardPath, script, { mode: 0o755 });
+  // Second layer: pushes to origin are blocked at the git-config level for EVERY git
+  // binary (absolute paths included); the gated push honours the preserved ORIGINAL push
+  // URL, and uninstallGitGuard restores it when the run ends.
+  const originalFile = resolve(guardDir, 'original-pushurl');
+  let original = PUSH_URL_NONE;
+  try {
+    original = execFileSync(realGit, ['config', '--get', 'remote.origin.pushurl'], {
+      cwd: projectDir,
+      encoding: 'utf8',
+    }).trim();
+  } catch {
+    // no custom push URL configured
+  }
+  if (original !== PUSH_URL_SENTINEL) {
+    writeFileSync(originalFile, original.length === 0 ? PUSH_URL_NONE : original);
+  }
+  execFileSync(realGit, ['config', 'remote.origin.pushurl', PUSH_URL_SENTINEL], {
+    cwd: projectDir,
+  });
+  // The guarded PATH is injected ONLY into agent CLI subprocesses (via invocation options);
+  // CodeMoot's own git/verification subprocesses keep the unguarded environment.
+  guardedAgentPath = `${guardDir}:${process.env.PATH ?? ''}`;
+  return guardPath;
+}
+
+const PUSH_URL_SENTINEL = 'file:///codemoot-push-blocked';
+const PUSH_URL_NONE = '<none>';
+
+/** Restores the user's original push URL; called whenever a runner invocation ends. */
+export function uninstallGitGuard(projectDir: string): void {
+  const realGit = resolveRealGit();
+  const originalFile = resolve(projectDir, '.cowork', 'git-guard', 'original-pushurl');
+  let original = PUSH_URL_NONE;
+  try {
+    original = readFileSync(originalFile, 'utf8').trim();
+  } catch {
+    return; // guard was never installed
+  }
+  if (original === PUSH_URL_NONE || original.length === 0) {
+    try {
+      execFileSync(realGit, ['config', '--unset', 'remote.origin.pushurl'], { cwd: projectDir });
+    } catch {
+      // already unset
+    }
+  } else {
+    execFileSync(realGit, ['config', 'remote.origin.pushurl', original], { cwd: projectDir });
+  }
+}
+
+/** Reads the preserved original push URL (or null) for the gated push. */
+function preservedPushUrl(projectDir: string): string | null {
+  try {
+    const original = readFileSync(
+      resolve(projectDir, '.cowork', 'git-guard', 'original-pushurl'),
+      'utf8',
+    ).trim();
+    return original === PUSH_URL_NONE || original.length === 0 ? null : original;
+  } catch {
+    return null;
+  }
+}
+
+let guardedAgentPath: string | undefined;
+
+/** Invocation options for agent CLIs: timeout plus the git-guarded PATH when active. */
+function agentInvocationOptions(timeoutSeconds: number): {
+  timeout: number;
+  env?: Readonly<Record<string, string>>;
+} {
+  return {
+    timeout: timeoutSeconds * 1000,
+    ...(guardedAgentPath === undefined
+      ? {}
+      : {
+          env: {
+            PATH: guardedAgentPath,
+            // Credential-less git for agent shells: no global/system config (credential
+            // helpers), no prompts, no askpass — authenticated pushes fail even through an
+            // absolute git binary. SSH agents are excluded by the adapter env allowlist.
+            GIT_CONFIG_GLOBAL: '/dev/null',
+            GIT_CONFIG_SYSTEM: '/dev/null',
+            GIT_TERMINAL_PROMPT: '0',
+            GIT_ASKPASS: '/usr/bin/false',
+            // HOME stays visible (the model CLIs need it), so SSH itself is disabled:
+            // key discovery under ~/.ssh is useless when every ssh invocation fails.
+            GIT_SSH_COMMAND: '/usr/bin/false',
+          },
+        }),
+  };
+}
+
+function createRunnerGit(projectDir: string): RunnerGitOps {
+  const run = (args: readonly string[]): string =>
+    execFileSync(resolveRealGit(), [...args], { cwd: projectDir, encoding: 'utf8' }).trim();
+  return {
+    currentBranch: () => run(['rev-parse', '--abbrev-ref', 'HEAD']),
+    headSha: () => run(['rev-parse', 'HEAD']),
+    isClean: () => run(['status', '--porcelain']) === '',
+    createBranch: (name) => {
+      run(['checkout', '-b', name]);
+    },
+    push: (branch) => {
+      // The gated push honours the user's ORIGINAL push URL (preserved at guard install)
+      // and restores the config-level block afterwards.
+      const original = preservedPushUrl(projectDir);
+      if (original === null) {
+        try {
+          run(['config', '--unset', 'remote.origin.pushurl']);
+        } catch {
+          // not set — fine
+        }
+      } else {
+        run(['config', 'remote.origin.pushurl', original]);
+      }
+      try {
+        run(['push', '-u', 'origin', branch]);
+      } finally {
+        run(['config', 'remote.origin.pushurl', PUSH_URL_SENTINEL]);
+      }
+    },
+    collectState: () => ({
+      branch: run(['rev-parse', '--abbrev-ref', 'HEAD']),
+      headSha: run(['rev-parse', 'HEAD']),
+      clean: run(['status', '--porcelain']) === '',
+      changedFiles: run(['status', '--porcelain'])
+        .split('\n')
+        .filter((line) => line.length > 3)
+        .map((line) => line.slice(3)),
+    }),
+    changedBetween: (beforeSha, afterSha) =>
+      run(['diff', '--name-only', `${beforeSha}..${afterSha}`])
+        .split('\n')
+        .filter((line) => line.length > 0),
+    remoteHeadSha: (branch) => {
+      const output = run(['ls-remote', 'origin', `refs/heads/${branch}`]);
+      const sha = output.split('\t')[0];
+      return sha === undefined || sha.length === 0 ? null : sha;
+    },
+    refSha: (ref) => run(['rev-parse', ref]),
+    status: () => run(['status', '--porcelain']),
+  };
+}
+
+/** Appended to every autonomous implementer prompt: the agent may only commit in place. */
+const GIT_PROHIBITIONS =
+  '\n\nSTRICT REPOSITORY RULES (violations stop the workflow): stay on the current branch at all times. ' +
+  'Never switch or create branches, never push, never pull or fetch, never merge, never rebase, ' +
+  'never reset, never stash, never force-push, never delete branches, and never modify any other ' +
+  'branch. Only create ordinary commits on the current branch exactly as instructed.';
+
+function isAncestorOfHead(projectDir: string, sha: string): boolean {
+  try {
+    execFileSync('git', ['merge-base', '--is-ancestor', sha, 'HEAD'], { cwd: projectDir });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function formatFindingsForPrompt(findings: readonly reviewWorkflow.Finding[]): string {
+  return findings
+    .map(
+      (finding) =>
+        `- ${finding.findingId} [${finding.severity.toUpperCase()}/${finding.category}] ${finding.title}\n` +
+        `  Description: ${finding.description}\n` +
+        `  Affected files: ${finding.affectedFiles.join(', ') || 'unspecified'}\n` +
+        `  Expected: ${finding.expectedResult}\n` +
+        `  Observed: ${finding.observedResult}\n` +
+        `  Required action: ${finding.requiredAction}\n` +
+        `  Evidence: ${finding.repositoryEvidence
+          .map((evidence) => `${evidence.kind} ${evidence.location} (${evidence.description})`)
+          .join('; ')}`,
+    )
+    .join('\n');
+}
+
+function planSlug(planFile: string): string {
+  return (
+    basename(planFile)
+      .replace(/\.[^.]+$/, '')
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-+|-+$/g, '')
+      .slice(0, 40) || 'plan'
+  );
+}
+
+async function performAutonomousPlanReview(
+  runtime: ReviewWorkflowRuntime,
+  projectDir: string,
+  workflowId: string,
+  batch: reviewWorkflowRunner.RunnerBatchDescriptor,
+  round: number,
+  timeoutSeconds: number,
+): Promise<{ approved: boolean }> {
+  const context = resolveRuntimeContext(runtime.store, workflowId, projectDir);
+  const stored = runtime.store
+    .listBatches(workflowId)
+    .find((candidate) => candidate.ordinal === batch.ordinal);
+  if (stored === undefined) throw new Error(`Workflow ${workflowId} has no batch ${batch.ordinal}`);
+  if (stored.persistedState === 'APPROVED_FOR_IMPLEMENTATION') return { approved: true };
+  const plan = runtime.store.getBatchPlan(stored.currentPlanVersionId);
+  if (plan === null) throw new Error(`Batch ${stored.batchId} has no current plan`);
+  const commandId = reviewWorkflowPlan.derivePlanCommandId(stored.batchId, `review-${round}`);
+  const actorExecutionId = `${stored.batchId}:reviewer:${generateId('execution')}`;
+  const audit = runtime.store.getLatestRepositoryAudit(workflowId);
+  if (audit === null) throw new Error(`Workflow ${workflowId} has no repository audit`);
+  runtime.service.verifyRepositoryContext(workflowId, audit.repositoryAuditId, actorExecutionId);
+  const prepared = await runtime.roleInvocation.prepare({
+    resolution: context.roles.reviewer,
+    workflowId,
+    commandId,
+    actorExecutionId,
+    invocationId: `${stored.batchId}:reviewer:${generateId('invocation')}`,
+    sessionIdentityId: `${stored.batchId}:reviewer:${generateId('session')}`,
+    sessionBinding: { batchId: stored.batchId, role: 'REVIEWER', expectExisting: round > 1 },
+    auditPhase: 'PLAN_REVIEW',
+    prompt: buildPlanReviewPrompt({
+      workflowId,
+      batchPlan: plan,
+      acceptanceCriteria: runtime.store.listAcceptanceCriteria(plan.batchPlanVersionId),
+    }),
+    options: agentInvocationOptions(timeoutSeconds),
+  });
+  const result = runtime.service.capturePlanReview({
+    transcriptId: `${stored.batchId}:plan-review:${generateId('transcript')}`,
+    workflowId,
+    batchId: stored.batchId,
+    actorExecutionId,
+    invocationId: prepared.invocation.invocationId,
+    sessionIdentityId: prepared.session.sessionIdentityId,
+    rawTranscript: prepared.call.text,
+    createdAt: prepared.invocation.finishedAt ?? new Date().toISOString(),
+    reviewRoundId: `${stored.batchId}:plan-review:${round}`,
+    reviewRoundNumber: round,
+    actor: prepared.execution,
+    roleSeparation: {
+      implementerAssignment: context.snapshot.assignments.implementer,
+      reviewerAssignment: context.snapshot.assignments.reviewer,
+      reviewerSessionIdentityId: prepared.session.sessionIdentityId,
+      minimumIdentityAssurance: context.snapshot.identityPolicy.minimumAssurance,
+    },
+    blockingSeverities: context.snapshot.gates.blockingSeverities,
+    preparedInvocation: prepared,
+  });
+  return { approved: result.capture.accepted && result.state === 'APPROVED_FOR_IMPLEMENTATION' };
+}
+
+async function performAutonomousPlanRevision(
+  runtime: ReviewWorkflowRuntime,
+  projectDir: string,
+  workflowId: string,
+  batch: reviewWorkflowRunner.RunnerBatchDescriptor,
+  round: number,
+  timeoutSeconds: number,
+): Promise<void> {
+  const context = resolveRuntimeContext(runtime.store, workflowId, projectDir);
+  const stored = requireBatchByOrdinal(runtime.store, workflowId, batch.ordinal);
+  if (stored.persistedState !== 'PLAN_NEEDS_REVISION') {
+    throw new Error(
+      `Batch ${stored.batchId} cannot submit a plan revision from ${stored.persistedState}`,
+    );
+  }
+  const plan = runtime.store.getBatchPlan(stored.currentPlanVersionId);
+  if (plan === null) throw new Error(`Batch ${stored.batchId} has no current plan`);
+  const openFindings = runtime.store
+    .listPlanFindings(stored.batchId)
+    .filter((finding) => finding.status === 'OPEN');
+  const criteria = runtime.store.listAcceptanceCriteria(plan.batchPlanVersionId);
+  const revisedPlanVersionId = reviewWorkflowPlan.deriveBatchPlanVersionId(
+    stored.batchId,
+    plan.version + 1,
+  );
+  const commandId = reviewWorkflowPlan.derivePlanCommandId(stored.batchId, `revise-${round}`);
+  const draftTemplate = {
+    batchPlanVersionId: revisedPlanVersionId,
+    batchId: stored.batchId,
+    ordinal: stored.ordinal,
+    objective: plan.objective,
+    currentRepositoryEvidence: plan.currentRepositoryEvidence,
+    dependencies: plan.dependencies,
+    candidateFiles: plan.candidateFiles,
+    technicalImplementation: plan.technicalImplementation,
+    userJourney: plan.userJourney,
+    expectedBehaviour: plan.expectedBehaviour,
+    acceptanceCriteria: criteria.map((criterion) => ({
+      acceptanceCriterionId: criterion.acceptanceCriterionId,
+      kind: criterion.kind,
+      statement: criterion.statement,
+      required: criterion.required,
+      passCondition: criterion.passCondition,
+      sourceRequirementIds: criterion.sourceRequirementIds,
+    })),
+    technicalAcceptanceCriteria: plan.technicalAcceptanceCriteria,
+    userFacingAcceptanceCriteria: plan.userFacingAcceptanceCriteria,
+    cliAcceptanceCriteria: plan.cliAcceptanceCriteria,
+    browserAcceptanceCriteria: plan.browserAcceptanceCriteria,
+    verificationCommands: plan.verificationCommands,
+    manualVerification: plan.manualVerification,
+    documentationChanges: plan.documentationChanges,
+    outOfScope: plan.outOfScope,
+    rollbackBoundary: plan.rollbackBoundary,
+  };
+  const prepared = await runtime.roleInvocation.prepare({
+    resolution: context.roles.implementer,
+    workflowId,
+    commandId,
+    actorExecutionId: `${stored.batchId}:plan-revision:${generateId('execution')}`,
+    invocationId: `${stored.batchId}:plan-revision:${generateId('invocation')}`,
+    sessionIdentityId: `${stored.batchId}:implementer:${generateId('session')}`,
+    sessionBinding: { batchId: stored.batchId, role: 'IMPLEMENTER' },
+    auditPhase: 'PLAN_REVISION',
+    prompt: `The plan review for batch ${stored.ordinal} returned NEEDS_REVISION. Revise the batch plan so every finding is resolved. Reply with EXACTLY one JSON object and nothing else, in this exact contract shape:\n{"schemaVersion": 1, "contractKind": "PLAN_REVISION_RESULT", "batchId": "${stored.batchId}", "previousPlanVersionId": "${plan.batchPlanVersionId}", "summary": "<what changed and why>", "revisedPlan": <the COMPLETE revised batch plan object>, "findingResponses": [{"findingId": "<id>", "response": "REVISED" | "NO_CHANGE_WITH_EVIDENCE", "explanation": "<how the revision resolves it>"}]}\nThe revisedPlan object must keep this exact structure (update the content, keep batchPlanVersionId "${revisedPlanVersionId}"):\n${JSON.stringify(draftTemplate, null, 2)}\nEvery open finding below must appear exactly once in findingResponses:\n${formatFindingsForPrompt(openFindings)}`,
+    options: agentInvocationOptions(timeoutSeconds),
+  });
+  const result = runtime.service.capturePlanRevision({
+    workflowId,
+    batchId: stored.batchId,
+    revisionRound: round,
+    actor: prepared.execution,
+    rawTranscript: prepared.call.text,
+    createdAt: prepared.invocation.finishedAt ?? new Date().toISOString(),
+    preparedInvocation: prepared,
+  });
+  if (result.batch.persistedState !== 'DRAFT') {
+    throw new Error(`Plan revision left batch ${stored.batchId} in ${result.batch.persistedState}`);
+  }
+}
+
+async function performAutonomousImplementation(
+  runtime: ReviewWorkflowRuntime,
+  projectDir: string,
+  workflowId: string,
+  batch: reviewWorkflowRunner.RunnerBatchDescriptor,
+  timeoutSeconds: number,
+  correction?: { readonly pass: number; readonly blockingFindingIds: readonly string[] },
+): Promise<{ commitSha: string }> {
+  const context = resolveRuntimeContext(runtime.store, workflowId, projectDir);
+  const stored = requireBatchByOrdinal(runtime.store, workflowId, batch.ordinal);
+  const plan = runtime.store.getBatchPlan(stored.currentPlanVersionId);
+  if (plan === null) throw new Error(`Batch ${stored.batchId} has no current plan`);
+  const acceptanceCriteria = runtime.store.listAcceptanceCriteria(plan.batchPlanVersionId);
+  // Autonomous mode always creates agent-authorized commits; only HUMAN_REQUIRED denies it.
+  if (context.snapshot.commitPolicy === 'HUMAN_REQUIRED') {
+    throw new Error(
+      'Autonomous execution requires a commit policy that authorizes agent commits (AGENT_AUTHORIZED or EITHER)',
+    );
+  }
+  const creationMode = 'AGENT_AUTHORIZED' as const;
+  // Crash recovery: an AWAITING_COMMIT batch already has an executed, evidence-complete
+  // implementation attempt — only the completion step remains.
+  if (stored.persistedState === 'AWAITING_COMMIT') {
+    const attempt = runtime.implementationStore.listImplementationAttempts(stored.batchId).at(-1);
+    if (attempt === undefined) {
+      throw new Error(`Batch ${stored.batchId} is AWAITING_COMMIT without a persisted attempt`);
+    }
+    const recoveredHead = createRunnerGit(projectDir).headSha();
+    const recovered = runtime.implementationService.complete({
+      workflowId,
+      batchId: stored.batchId,
+      configuration: context.snapshot,
+      implementationAttemptId: attempt.implementationAttemptId,
+      implementationReadyEvidenceId:
+        reviewWorkflowImplementation.deriveImplementationReadyEvidenceId(
+          attempt.implementationAttemptId,
+        ),
+      providedCommitSha: recoveredHead,
+      creationMode,
+      commandId: `${attempt.implementationAttemptId}:complete`,
+    });
+    if (recovered.batch.persistedState !== 'IMPLEMENTATION_COMPLETE') {
+      throw new Error(`Implementation completion left batch in ${recovered.batch.persistedState}`);
+    }
+    return { commitSha: recoveredHead };
+  }
+  const bound = runtime.store.workflowStore.getBatchRoleSession(stored.batchId, 'IMPLEMENTER');
+  let implementerSessionIdentityId: string;
+  if (correction !== undefined) {
+    if (bound === null) throw new Error(`Batch ${stored.batchId} has no implementer session`);
+    await runtime.implementationService.resume({
+      workflowId,
+      batchId: stored.batchId,
+      configuration: context.snapshot,
+      resolution: context.roles.implementer,
+      commandId: `${stored.batchId}:resume-implementation-auto-${correction.pass}`,
+      actorExecutionId: `${stored.batchId}:implementer:${generateId('execution')}`,
+      invocationId: `${stored.batchId}:implementer:${generateId('invocation')}`,
+      sessionIdentityId: bound.sessionIdentityId,
+      previousSessionIdentityId: bound.sessionIdentityId,
+      prompt: buildImplementationResumePrompt({ workflowId, batchId: stored.batchId }),
+      options: agentInvocationOptions(timeoutSeconds),
+    });
+    implementerSessionIdentityId = bound.sessionIdentityId;
+  } else if (stored.persistedState === 'IMPLEMENTING') {
+    implementerSessionIdentityId = requireImplementationSessionIdentityId(
+      runtime.implementationStore,
+      stored.batchId,
+    );
+  } else {
+    implementerSessionIdentityId = (
+      await runtime.implementationService.start({
+        workflowId,
+        batchId: stored.batchId,
+        configuration: context.snapshot,
+        resolution: context.roles.implementer,
+        commandId: `${stored.batchId}:start-implementation`,
+        actorExecutionId: `${stored.batchId}:implementer-preflight:${generateId('execution')}`,
+        invocationId: `${stored.batchId}:implementer-preflight:${generateId('invocation')}`,
+        sessionIdentityId: `${stored.batchId}:implementer:${generateId('session')}`,
+        prompt: buildImplementationPreflightPrompt({
+          workflowId,
+          batchId: stored.batchId,
+          planVersionId: plan.batchPlanVersionId,
+        }),
+        options: agentInvocationOptions(timeoutSeconds),
+      })
+    ).implementerSessionIdentityId;
+  }
+  const implementationBatch = runtime.implementationStore.getBatch(stored.batchId);
+  if (implementationBatch?.originalBatchBaseSha === undefined) {
+    throw new Error(`Batch ${stored.batchId} has no established implementation base`);
+  }
+  const attemptNumber =
+    runtime.implementationStore.listImplementationAttempts(stored.batchId).length + 1;
+  const attemptId = reviewWorkflowImplementation.deriveImplementationAttemptId(
+    stored.batchId,
+    attemptNumber,
+  );
+  const basePrompt = buildImplementationPrompt({
+    workflowId,
+    batchPlan: plan,
+    acceptanceCriteria,
+    originalBatchBaseSha: implementationBatch.originalBatchBaseSha,
+    creationMode,
+  });
+  const correctionFindings =
+    correction === undefined
+      ? []
+      : runtime.gateStore
+          .listBatchFindings(stored.batchId)
+          .filter((finding) => correction.blockingFindingIds.includes(finding.findingId));
+  if (
+    correction !== undefined &&
+    correctionFindings.length !== correction.blockingFindingIds.length
+  ) {
+    const found = correctionFindings.map((finding) => finding.findingId);
+    const missing = correction.blockingFindingIds.filter((id) => !found.includes(id));
+    throw new Error(`Blocking findings are not persisted: ${missing.join(', ')}`);
+  }
+  const prompt =
+    correction === undefined
+      ? `${basePrompt}${GIT_PROHIBITIONS}`
+      : `${basePrompt}\n\nThis is correction pass ${correction.pass}. Fix EVERY blocking finding below completely, run the verification commands, and commit the corrected work on the current branch:\n${formatFindingsForPrompt(correctionFindings)}${GIT_PROHIBITIONS}`;
+  const result = await runtime.implementationService.execute({
+    workflowId,
+    batchId: stored.batchId,
+    configuration: context.snapshot,
+    resolution: context.roles.implementer,
+    commandId: `${stored.batchId}:implementation:${attemptNumber}:ready`,
+    actorExecutionId: `${stored.batchId}:implementer:${generateId('execution')}`,
+    invocationId: `${stored.batchId}:implementer:${generateId('invocation')}`,
+    sessionIdentityId: implementerSessionIdentityId,
+    previousSessionIdentityId: implementerSessionIdentityId,
+    transcriptId: `${stored.batchId}:implementation:${attemptNumber}:transcript`,
+    implementationAttemptId: attemptId,
+    implementationReadyEvidenceId:
+      reviewWorkflowImplementation.deriveImplementationReadyEvidenceId(attemptId),
+    attemptNumber,
+    creationMode,
+    prompt,
+    options: agentInvocationOptions(timeoutSeconds),
+  });
+  if (result.status !== 'AWAITING_COMMIT') {
+    throw new Error(
+      `Implementation attempt ${attemptNumber} did not reach AWAITING_COMMIT (${result.status})`,
+    );
+  }
+  const head = createRunnerGit(projectDir).headSha();
+  const completed = runtime.implementationService.complete({
+    workflowId,
+    batchId: stored.batchId,
+    configuration: context.snapshot,
+    implementationAttemptId: attemptId,
+    implementationReadyEvidenceId:
+      reviewWorkflowImplementation.deriveImplementationReadyEvidenceId(attemptId),
+    providedCommitSha: head,
+    creationMode,
+    commandId: `${attemptId}:complete`,
+  });
+  if (completed.batch.persistedState !== 'IMPLEMENTATION_COMPLETE') {
+    throw new Error(`Implementation completion left batch in ${completed.batch.persistedState}`);
+  }
+  if (correction !== undefined) {
+    // The implementer AUTHORS its own DISPOSITION_RESULT in a dedicated resumed invocation;
+    // nothing is synthesized. The capture validates schema, commit target, and exact
+    // per-finding coverage, and the bounded final review still judges every claim.
+    const dispositionCommandId = `${stored.batchId}:dispositions:${correction.pass}:invoke`;
+    const dispositionInvocationId = `${dispositionCommandId}:invocation`;
+    const dispositionRequester: reviewWorkflow.ActorExecutionIdentity = {
+      actorExecutionId: `${dispositionCommandId}:requester`,
+      actorType: 'AGENT',
+      assignmentId: context.snapshot.assignments.implementer.assignmentId,
+      invocationIdentityId: dispositionInvocationId,
+      sessionIdentityId: implementerSessionIdentityId,
+      authoritiesExercised: ['IMPLEMENTER'],
+      identityAssurance: 'CONFIG_ONLY',
+      observedEvidence: [],
+      startedAt: new Date().toISOString(),
+    };
+    const dispositionGuard: reviewWorkflow.TransitionCommand = {
+      type: 'BLOCK_BATCH',
+      reason: `DISPOSITION_AUTHORING_GUARD:${correction.pass}`,
+    };
+    const dispositionRequest = {
+      commandId: dispositionCommandId,
+      workflowId,
+      batchId: stored.batchId,
+      expectedAggregateVersion: requireBatchByOrdinal(runtime.store, workflowId, batch.ordinal)
+        .aggregateVersion,
+      requester: dispositionRequester,
+      authorityExercised: 'IMPLEMENTER' as const,
+      command: dispositionGuard,
+    };
+    runtime.commandStore.reserve(
+      { ...dispositionRequest, canonicalRequestHash: hashRunnerValue(dispositionRequest) },
+      'AGENT_INVOCATION',
+    );
+    runtime.commandStore.claimSideEffect(dispositionCommandId, dispositionInvocationId);
+    const dispositionPrepared = await runtime.roleInvocation.prepare({
+      resolution: context.roles.implementer,
+      workflowId,
+      commandId: dispositionCommandId,
+      actorExecutionId: `${dispositionCommandId}:execution`,
+      invocationId: dispositionInvocationId,
+      sessionIdentityId: `${dispositionCommandId}:session`,
+      sessionBinding: { batchId: stored.batchId, role: 'IMPLEMENTER', expectExisting: true },
+      auditPhase: 'CORRECTION',
+      prompt: `You just committed correction pass ${correction.pass} as commit ${head}. Author your consolidated disposition result for the blocking findings below. Reply with EXACTLY one JSON object and nothing else, in this exact contract shape:\n{"schemaVersion": 1, "contractKind": "DISPOSITION_RESULT", "target": {"kind": "CODE", "resultingCommitSha": "${head}"}, "summary": "<one-paragraph summary>", "dispositions": [{"findingId": "<id>", "disposition": "FIXED" | "NO_CHANGE_WITH_EVIDENCE" | "BLOCKED", "explanation": "<what you actually changed and why it resolves the finding>", "filesChanged": ["<each file you actually changed for this finding>"], "verificationRecordIds": [], "evidence": [{"kind": "DIFF", "location": "<file or commit path>", "description": "<what the evidence shows>"}]}]}\nEvery finding below must appear exactly once. Report only what you actually did — an honest BLOCKED is acceptable; a false FIXED is not.\nFindings:\n${formatFindingsForPrompt(correctionFindings)}`,
+      options: agentInvocationOptions(timeoutSeconds),
+    });
+    runtime.roleInvocation.persistPrepared(dispositionPrepared);
+    runtime.commandStore.succeedWithoutTransition({
+      commandId: dispositionCommandId,
+      resultHash: hashRunnerValue(dispositionPrepared.call.text),
+      result: { dispositionsAuthored: true },
+    });
+    const capture = runtime.codeReviewService.submitDispositions({
+      workflowId,
+      batchId: stored.batchId,
+      configuration: context.snapshot,
+      transcriptId: `${stored.batchId}:dispositions:${correction.pass}:${generateId('transcript')}`,
+      invocationId: dispositionInvocationId,
+      rawTranscript: dispositionPrepared.call.text,
+      createdAt: new Date().toISOString(),
+    });
+    if (!capture.accepted) {
+      throw new Error(
+        `Implementer disposition result rejected (${capture.error.code}): ${capture.error.message}`,
+      );
+    }
+  }
+  return { commitSha: head };
+}
+
+async function performAutonomousVerification(
+  runtime: ReviewWorkflowRuntime,
+  projectDir: string,
+  workflowId: string,
+  batch: reviewWorkflowRunner.RunnerBatchDescriptor,
+  commandIndex: number,
+  attempt: number,
+  timeoutSeconds: number,
+): Promise<{ accepted: boolean; resultFingerprint: string }> {
+  const context = resolveRuntimeContext(runtime.store, workflowId, projectDir);
+  const stored = requireBatchByOrdinal(runtime.store, workflowId, batch.ordinal);
+  const commandId = `${stored.batchId}:verify:${commandIndex}:auto-${attempt}`;
+  const outcome = await performBatchVerification(runtime, projectDir, workflowId, commandId, null, {
+    ordinal: batch.ordinal,
+    command: commandIndex,
+    timeout: timeoutSeconds,
+  });
+  const recordId = String(outcome.verificationRecordId);
+  const recordEntity = runtime.gateStore.workflowStore.getEntity('VERIFICATION_RECORD', recordId);
+  if (recordEntity === null || recordEntity.kind !== 'VERIFICATION_RECORD') {
+    throw new Error(`Verification record ${recordId} was not persisted`);
+  }
+  const record = recordEntity.value;
+  if (record.observedStatus !== 'SUCCEEDED') {
+    return { accepted: false, resultFingerprint: record.fullLogHash };
+  }
+  // Reviewer-judged acceptance: a dedicated reviewer assessment invocation (resumed
+  // reviewer session) carries VERIFICATION_ATTESTOR authority and independently attests.
+  const assessCommandId = `${commandId}:assess`;
+  const invocationId = `${assessCommandId}:invocation`;
+  const requester: reviewWorkflow.ActorExecutionIdentity = {
+    actorExecutionId: `${assessCommandId}:requester`,
+    actorType: 'AGENT',
+    assignmentId: context.snapshot.assignments.reviewer.assignmentId,
+    invocationIdentityId: invocationId,
+    sessionIdentityId:
+      runtime.store.workflowStore.getBatchRoleSession(stored.batchId, 'REVIEWER')
+        ?.sessionIdentityId ?? `${assessCommandId}:session`,
+    authoritiesExercised: ['REVIEWER'],
+    identityAssurance: 'CONFIG_ONLY',
+    observedEvidence: [],
+    startedAt: new Date().toISOString(),
+  };
+  const guard: reviewWorkflow.TransitionCommand = {
+    type: 'START_CODE_REVIEW',
+    evidence: {
+      reviewedCommitSha: record.commitSha,
+      currentHeadSha: record.commitSha,
+      cleanWorktree: true,
+      unresolvedFindingCount: 0,
+      incompleteDispositionCount: 0,
+      roleSeparation: {
+        implementerAssignment: context.snapshot.assignments.implementer,
+        reviewerAssignment: context.snapshot.assignments.reviewer,
+        minimumIdentityAssurance: context.snapshot.identityPolicy.minimumAssurance,
+      },
+    },
+  };
+  const request = {
+    commandId: assessCommandId,
+    workflowId,
+    batchId: stored.batchId,
+    expectedAggregateVersion: requireBatchByOrdinal(runtime.store, workflowId, batch.ordinal)
+      .aggregateVersion,
+    requester,
+    authorityExercised: 'REVIEWER' as const,
+    command: guard,
+  };
+  runtime.commandStore.reserve(
+    { ...request, canonicalRequestHash: hashRunnerValue(request) },
+    'AGENT_INVOCATION',
+  );
+  runtime.commandStore.claimSideEffect(assessCommandId, invocationId);
+  const prepared = await runtime.roleInvocation.prepare({
+    resolution: context.roles.reviewer,
+    workflowId,
+    commandId: assessCommandId,
+    actorExecutionId: `${assessCommandId}:execution`,
+    invocationId,
+    sessionIdentityId: `${assessCommandId}:session`,
+    sessionBinding: { batchId: stored.batchId, role: 'REVIEWER', expectExisting: true },
+    additionalAuthorities: ['VERIFICATION_ATTESTOR'],
+    auditPhase: 'VERIFICATION',
+    prompt: `Independently assess this verification evidence. Reply with EXACTLY one JSON object {"accept": boolean, "rationale": string}.\nCommand: ${record.command} ${record.arguments.join(' ')}\nExit: ${JSON.stringify(record.outcome)}\nObserved status: ${record.observedStatus}\nOutput summary:\n${record.outputSummary}`,
+    options: agentInvocationOptions(timeoutSeconds),
+  });
+  runtime.roleInvocation.persistPrepared(prepared);
+  runtime.commandStore.succeedWithoutTransition({
+    commandId: assessCommandId,
+    resultHash: hashRunnerValue(prepared.call.text),
+    result: { assessed: true },
+  });
+  let assessment: { accept?: boolean; rationale?: string };
+  try {
+    const parsed: unknown = JSON.parse(prepared.call.text.trim());
+    assessment =
+      typeof parsed === 'object' && parsed !== null
+        ? (parsed as { accept?: boolean; rationale?: string })
+        : {};
+  } catch {
+    assessment = {};
+  }
+  if (assessment.accept !== true) {
+    return { accepted: false, resultFingerprint: record.fullLogHash };
+  }
+  const plan = runtime.store.getBatchPlan(stored.currentPlanVersionId);
+  if (plan === null) throw new Error(`Batch ${stored.batchId} has no current plan`);
+  const criteria = runtime.store.listAcceptanceCriteria(plan.batchPlanVersionId);
+  const approvedReview = runtime.gateStore
+    .listCodeReviews(stored.batchId)
+    .filter((candidate) => candidate.verdict === 'APPROVED')
+    .at(-1);
+  if (approvedReview === undefined || approvedReview.target.kind !== 'CODE') {
+    throw new Error(`Batch ${stored.batchId} has no approved code review to attest against`);
+  }
+  runtime.verificationService.attest({
+    verificationAttestationId: `${recordId}:attestation:reviewer`,
+    verificationRecordId: recordId,
+    workflowId,
+    batchId: stored.batchId,
+    decision: 'ACCEPTED',
+    acceptanceMode: 'REVIEWER',
+    rationale: assessment.rationale ?? 'Reviewer assessment accepted the verification evidence.',
+    attestorActorExecutionId: prepared.execution.actorExecutionId,
+    currentHeadSha: createRunnerGit(projectDir).headSha(),
+    policy: deriveVerificationAttestationPolicy({
+      plan,
+      criteria,
+      record,
+      approvedReviewedCommitSha: approvedReview.target.reviewedCommitSha,
+      configurationHash: context.snapshot.configurationHash,
+    }),
+    createdAt: new Date().toISOString(),
+  });
+  return { accepted: true, resultFingerprint: record.fullLogHash };
+}
+
+/** True only when the durable log exists and its bytes still match the recorded hash. */
+function verificationLogMatches(location: string, expectedHash: string): boolean {
+  try {
+    const serialized = readFileSync(location, 'utf8');
+    return createHash('sha256').update(serialized).digest('hex') === expectedHash;
+  } catch {
+    return false;
+  }
+}
+
+function hashRunnerValue(value: unknown): string {
+  return createHash('sha256').update(JSON.stringify(value)).digest('hex');
+}
+
+function buildRunnerPhases(
+  runtime: ReviewWorkflowRuntime,
+  projectDir: string,
+  workflowId: string,
+  timeoutSeconds: number,
+): reviewWorkflowRunner.RunnerPhases {
+  return {
+    refinePlan: async () => {
+      const existing = runtime.store.listBatches(workflowId);
+      if (existing.length > 0) {
+        return existing.map((batch) => ({ ordinal: batch.ordinal, batchId: batch.batchId }));
+      }
+      const result = await performRefinement(runtime, projectDir, workflowId, timeoutSeconds);
+      if (!result.accepted) {
+        throw new Error(`Plan refinement rejected: ${result.error.message}`);
+      }
+      return runtime.store
+        .listBatches(workflowId)
+        .map((batch) => ({ ordinal: batch.ordinal, batchId: batch.batchId }));
+    },
+    reviewPlan: async (batch, round) => {
+      // Crash-safe re-entry: a batch resumed in PLAN_NEEDS_REVISION submits its pending
+      // revision before the next review round starts.
+      const stored = requireBatchByOrdinal(runtime.store, workflowId, batch.ordinal);
+      if (stored.persistedState === 'PLAN_NEEDS_REVISION') {
+        await performAutonomousPlanRevision(
+          runtime,
+          projectDir,
+          workflowId,
+          batch,
+          Math.max(1, round - 1),
+          timeoutSeconds,
+        );
+      }
+      return performAutonomousPlanReview(
+        runtime,
+        projectDir,
+        workflowId,
+        batch,
+        round,
+        timeoutSeconds,
+      );
+    },
+    revisePlan: (batch, round) =>
+      performAutonomousPlanRevision(runtime, projectDir, workflowId, batch, round, timeoutSeconds),
+    implement: (batch) =>
+      performAutonomousImplementation(runtime, projectDir, workflowId, batch, timeoutSeconds),
+    reviewCode: async (batch, round) => {
+      const result = await performCodeReview(
+        runtime,
+        projectDir,
+        workflowId,
+        `${batch.batchId}:code-review-${round}`,
+        null,
+        {
+          ordinal: batch.ordinal,
+          round,
+          timeout: timeoutSeconds,
+        },
+      );
+      const approved = result.status === 'VERIFYING';
+      const blocking = Array.isArray(result.blockingFindingIds)
+        ? result.blockingFindingIds.map(String)
+        : [];
+      if (result.status === 'REJECTED') {
+        throw new Error(`Code review artifact rejected: ${String(result.message)}`);
+      }
+      return { approved, blockingFindingIds: blocking };
+    },
+    correct: (batch, pass, blockingFindingIds) =>
+      performAutonomousImplementation(runtime, projectDir, workflowId, batch, timeoutSeconds, {
+        pass,
+        blockingFindingIds,
+      }),
+    verificationCommandCount: (batch) => {
+      const stored = requireBatchByOrdinal(runtime.store, workflowId, batch.ordinal);
+      const plan = runtime.store.getBatchPlan(stored.currentPlanVersionId);
+      return plan?.verificationCommands.length ?? 0;
+    },
+    verify: async (batch, commandIndex, attempt) => {
+      // A restarted worker never re-runs an already reviewer-accepted verification command.
+      const stored = requireBatchByOrdinal(runtime.store, workflowId, batch.ordinal);
+      const existing = runtime.gateStore
+        .listVerificationRecords(stored.batchId)
+        .filter((record) => record.verificationRecordId.includes(`:verify:${commandIndex}:auto-`))
+        .find((record) =>
+          runtime.gateStore
+            .listAttestationsForRecord(record.verificationRecordId)
+            .some((attestation) => attestation.decision === 'ACCEPTED'),
+        );
+      if (existing !== undefined) {
+        return { accepted: true, resultFingerprint: existing.fullLogHash };
+      }
+      return performAutonomousVerification(
+        runtime,
+        projectDir,
+        workflowId,
+        batch,
+        commandIndex,
+        attempt,
+        timeoutSeconds,
+      );
+    },
+    finalAudit: async (batch) => {
+      const stored = requireBatchByOrdinal(runtime.store, workflowId, batch.ordinal);
+      const existing = runtime.gateStore.listFinalAudits(stored.batchId).at(-1);
+      if (existing !== undefined) {
+        // A restarted worker never re-runs the single final audit; the persisted verdict rules.
+        return { approved: existing.verdict === 'APPROVED' };
+      }
+      const outcome = await performFinalAudit(
+        runtime,
+        projectDir,
+        workflowId,
+        `${batch.batchId}:final-audit`,
+        null,
+        {
+          ordinal: batch.ordinal,
+          timeout: timeoutSeconds,
+        },
+      );
+      return { approved: outcome.verdict === 'APPROVED' };
+    },
+    gate: async (batch) => {
+      const stored = requireBatchByOrdinal(runtime.store, workflowId, batch.ordinal);
+      const result = runtime.gateService.evaluateGate({
+        workflowId,
+        batchId: stored.batchId,
+        configuration: resolveRuntimeContext(runtime.store, workflowId, projectDir).snapshot,
+        commandId: `${stored.batchId}:gate`,
+        createdAt: new Date().toISOString(),
+      });
+      return result.approved
+        ? { approved: true, failedConditions: [] }
+        : { approved: false, failedConditions: result.failedConditions };
+    },
+    usedPacing: async (batch) => {
+      const stored = requireBatchByOrdinal(runtime.store, workflowId, batch.ordinal);
+      const events = runtime.implementationStore.getEvents(stored.batchId);
+      const count = (predicate: (event: (typeof events)[number]) => boolean) =>
+        events.filter(predicate).length;
+      const successfulAttempts = count((event) => event.eventType === 'IMPLEMENTATION_READY');
+      return {
+        planReviewRounds: count((event) => event.eventType === 'PLAN_REVIEW_STARTED'),
+        codeReviewRounds: count((event) => event.eventType === 'CODE_REVIEW_STARTED'),
+        correctionPasses: Math.max(0, successfulAttempts - 1),
+        grantedReviewRounds: count(
+          (event) =>
+            event.eventType === 'BATCH_RESUMED' && event.payload.grantsReviewRound === true,
+        ),
+        grantedCorrectionPasses: count(
+          (event) =>
+            event.eventType === 'BATCH_RESUMED' && event.payload.grantsCorrectionPass === true,
+        ),
+      };
+    },
+    applyDecision: async (batch, action, decision) => {
+      if (action === 'CANCEL_WORKFLOW') return;
+      let stored = requireBatchByOrdinal(runtime.store, workflowId, batch.ordinal);
+      // A DISTINCT execution from the decide command's recorder (immutable records
+      // cannot be re-persisted with new timestamps).
+      const owner = persistCliActor(runtime.store, {
+        actorExecutionId: `${decision.decisionId}:apply-owner`,
+        actorType: 'HUMAN',
+        authorities: ['WORKFLOW_OWNER'],
+      });
+      const issueTransition = (
+        command: reviewWorkflow.TransitionCommand,
+        commandId: string,
+        eventType: string,
+        eventPayload: Record<string, unknown>,
+      ): void => {
+        const request = {
+          commandId,
+          workflowId,
+          batchId: stored.batchId,
+          expectedAggregateVersion: stored.aggregateVersion,
+          requester: owner,
+          authorityExercised: 'WORKFLOW_OWNER' as const,
+          command,
+        };
+        runtime.commandStore.reserve({
+          ...request,
+          canonicalRequestHash: hashRunnerValue(request),
+        });
+        const transition = reviewWorkflow.transitionBatch({
+          currentState: stored.persistedState,
+          command,
+          actor: owner,
+          ...(stored.blockedFromState === undefined
+            ? {}
+            : { blockedFromState: stored.blockedFromState }),
+          ...(stored.blockedResumeState === undefined
+            ? {}
+            : { blockedResumeState: stored.blockedResumeState }),
+        });
+        if (!transition.allowed) {
+          throw new Error(
+            `${command.type} rejected by the domain kernel: ${transition.code ?? 'unknown'}`,
+          );
+        }
+        runtime.commandStore.succeedWithTransition({
+          commandId,
+          transition,
+          eventType,
+          eventPayload,
+          resultHash: hashRunnerValue(eventPayload),
+          result: eventPayload,
+        });
+        stored = requireBatchByOrdinal(runtime.store, workflowId, batch.ordinal);
+      };
+      if (stored.persistedState === 'BLOCKED') {
+        // The human decision resumes the blocked batch; FIX_AGAIN explicitly grants one
+        // additional review round and correction pass in the coordinator contract.
+        issueTransition(
+          { type: 'RESUME_BATCH' },
+          `${decision.decisionId}:resume`,
+          'BATCH_RESUMED',
+          {
+            decisionId: decision.decisionId,
+            grantsReviewRound: action === 'FIX_AGAIN',
+            grantsCorrectionPass: action === 'FIX_AGAIN',
+          },
+        );
+      }
+      if (action === 'ACCEPT_RISK_AND_CONTINUE') {
+        if (
+          stored.persistedState !== 'NEEDS_REVISION' &&
+          stored.persistedState !== 'IMPLEMENTATION_COMPLETE'
+        ) {
+          throw new Error(`ACCEPT_RISK_AND_CONTINUE cannot apply from ${stored.persistedState}`);
+        }
+        issueTransition(
+          {
+            type: 'ACCEPT_FINDINGS_RISK',
+            evidence: {
+              decisionId: decision.decisionId,
+              findingIds: [...decision.findingIds],
+              acceptedCommitSha: decision.commitSha,
+            },
+          },
+          `${decision.decisionId}:accept-risk`,
+          'BATCH_FINDINGS_RISK_ACCEPTED',
+          {
+            decisionId: decision.decisionId,
+            findingIds: [...decision.findingIds],
+            acceptedCommitSha: decision.commitSha,
+          },
+        );
+      }
+    },
+    resumeStage: async (batch) => {
+      const stored = requireBatchByOrdinal(runtime.store, workflowId, batch.ordinal);
+      switch (stored.persistedState) {
+        case 'DRAFT':
+        case 'PLAN_REVIEW':
+        case 'PLAN_NEEDS_REVISION':
+          return 'PLAN_REVIEW';
+        case 'APPROVED_FOR_IMPLEMENTATION':
+        case 'IMPLEMENTING':
+        case 'AWAITING_COMMIT':
+          return 'IMPLEMENTATION';
+        case 'IMPLEMENTATION_COMPLETE':
+        case 'CODE_REVIEW':
+        case 'NEEDS_REVISION':
+          return 'CODE_REVIEW';
+        case 'VERIFYING':
+          return 'VERIFICATION';
+        case 'APPROVED_FOR_MERGE':
+          return 'PUSH';
+        case 'MERGED':
+          return 'COMPLETE';
+        default:
+          return 'BLOCKED';
+      }
+    },
+    workflowAudit: async () => {
+      const issues: string[] = [];
+      const batches = runtime.store.listBatches(workflowId);
+      const runnerState = runtime.runnerStore.require(workflowId);
+      // Workflow-level verification: re-run every batch's verification commands at the
+      // FINAL HEAD through the ESTABLISHED verification service — the same runner
+      // (process-tree handling, separate stdout/stderr), immutable log store, persisted
+      // SYSTEM executor, and record vocabulary the batch flow uses. Each command records
+      // against ITS OWN batch (whose plan approved it), deduplicated across batches.
+      const finalHead = createRunnerGit(projectDir).headSha();
+      const configurationHash = resolveRuntimeContext(runtime.store, workflowId, projectDir)
+        .snapshot.configurationHash;
+      const seenCommands = new Set<string>();
+      const verification: { command: string; ok: boolean; exitCode: number | null }[] = [];
+      let workflowVerificationIndex = 0;
+      for (const stored of batches) {
+        const plan = runtime.store.getBatchPlan(stored.currentPlanVersionId);
+        const batchRecords = runtime.gateStore.listVerificationRecords(stored.batchId);
+        for (const spec of plan?.verificationCommands ?? []) {
+          const label = `${spec.executable} ${spec.arguments.join(' ')} @ ${spec.workingDirectory}`;
+          if (seenCommands.has(label)) continue;
+          seenCommands.add(label);
+          workflowVerificationIndex += 1;
+          const matchesSpec = (record: reviewWorkflow.VerificationRecord): boolean =>
+            record.verificationRecordId.includes(':workflow-final:') &&
+            record.command === spec.executable &&
+            record.arguments.join('\u0000') === spec.arguments.join('\u0000') &&
+            record.workingDirectory === spec.workingDirectory;
+          // Restart safety: a SUCCEEDED record at this exact final HEAD is reused ONLY when
+          // its durable log still exists and matches its recorded hash — deleted or
+          // corrupted evidence forces re-execution.
+          const alreadyRecorded = batchRecords.find(
+            (record) =>
+              matchesSpec(record) &&
+              record.commitSha === finalHead &&
+              record.observedStatus === 'SUCCEEDED' &&
+              verificationLogMatches(record.fullLogLocation, record.fullLogHash),
+          );
+          if (alreadyRecorded !== undefined) {
+            verification.push({ command: label, ok: true, exitCode: 0 });
+            continue;
+          }
+          const executor = persistCliActor(runtime.store, {
+            actorExecutionId: `${workflowId}:workflow-verification:executor:${workflowVerificationIndex}:${generateId('execution')}`,
+            actorType: 'SYSTEM',
+            authorities: ['VERIFICATION_EXECUTOR'],
+          });
+          // Crash recovery across the log/record write boundary: an orphaned log from a
+          // crash between writes surfaces as LOG_IMMUTABILITY_CONFLICT; the next attempt
+          // number gets a fresh record ID and log file. Nothing is overwritten.
+          let attempt = batchRecords.filter(matchesSpec).length + 1;
+          let capture: reviewWorkflowVerification.VerificationCaptureResult | undefined;
+          for (let tries = 0; tries < 3 && capture === undefined; tries += 1) {
+            const verificationRecordId = `${stored.batchId}:workflow-final:${workflowVerificationIndex}:${finalHead.slice(0, 12)}:attempt-${attempt}`;
+            try {
+              capture = await runtime.verificationService.execute({
+                verificationRecordId,
+                workflowId,
+                batchId: stored.batchId,
+                executorActorExecutionId: executor.actorExecutionId,
+                relatedFindingIds: [],
+                configurationHash,
+                command: spec,
+                expectedCommitSha: finalHead,
+                timeoutMs: 10 * 60 * 1000,
+              });
+            } catch (error) {
+              const conflicted =
+                error instanceof Error &&
+                'code' in error &&
+                (error.code === 'LOG_IMMUTABILITY_CONFLICT' ||
+                  error.code === 'IMMUTABLE_ENTITY_CONFLICT');
+              if (!conflicted) throw error;
+              attempt += 1;
+            }
+          }
+          if (capture === undefined) {
+            issues.push(`workflow-level verification could not persist a record for: ${label}`);
+            verification.push({ command: label, ok: false, exitCode: null });
+            continue;
+          }
+          runtime.runnerStore.appendLog({
+            workflowId,
+            entryType: 'CHECKPOINT',
+            phase: 'FINAL_AUDIT',
+            message: `workflow-verification ${label}: ${capture.record.observedStatus}`,
+            payload: {
+              command: label,
+              verificationRecordId: capture.record.verificationRecordId,
+              observedStatus: capture.record.observedStatus,
+              fullLogLocation: capture.record.fullLogLocation,
+              fullLogHash: capture.record.fullLogHash,
+            },
+          });
+          // A verification command may never move HEAD — a moved HEAD is an audit failure
+          // even when the command exited zero.
+          if (capture.headUnchanged === false) {
+            issues.push(`workflow-level verification moved HEAD: ${label}`);
+          }
+          const commandOk =
+            capture.record.observedStatus === 'SUCCEEDED' && capture.headUnchanged !== false;
+          const exitCode =
+            capture.record.outcome.kind === 'EXITED' ? capture.record.outcome.exitCode : null;
+          verification.push({ command: label, ok: commandOk, exitCode });
+          if (!commandOk) {
+            issues.push(`workflow-level verification failed at final HEAD: ${label}`);
+          }
+        }
+      }
+      // Zero-exit commands can still WRITE files: the tree must be exactly as committed
+      // after workflow-level verification. Unexpected changes are preserved, never cleaned.
+      if (!createRunnerGit(projectDir).isClean()) {
+        issues.push(
+          'workflow-level verification left uncommitted changes in the worktree; they were preserved for inspection (nothing was cleaned or reset)',
+        );
+      }
+      const acceptedRisk = new Set([
+        ...runnerState.counters.completedBatches.flatMap(
+          (summary) => summary.acceptedRiskFindingIds,
+        ),
+        ...(runnerState.counters.batch?.acceptedRiskFindingIds ?? []),
+      ]);
+      for (const stored of batches) {
+        if (stored.persistedState !== 'APPROVED_FOR_MERGE' && stored.persistedState !== 'MERGED') {
+          issues.push(`batch ${stored.ordinal} is ${stored.persistedState}, not gate-approved`);
+          continue;
+        }
+        const effective = runtime.gateService.effectiveState(stored.batchId);
+        const approvalSha = effective.persistedApprovalSha;
+        const isFinalBatch = stored.ordinal === Math.max(...batches.map((b) => b.ordinal));
+        if (approvalSha === undefined) {
+          issues.push(`batch ${stored.ordinal} has no persisted gate-approval SHA`);
+        } else if (isFinalBatch && !effective.approvalValid) {
+          // The FINAL batch's approval must still be effective at the final HEAD.
+          issues.push(
+            `batch ${stored.ordinal} approval is stale: approved ${approvalSha}, HEAD ${effective.currentHeadSha}`,
+          );
+        } else if (!isAncestorOfHead(projectDir, approvalSha)) {
+          // Earlier approvals are legitimately superseded by later batches, but their
+          // approved commits must remain in the final branch history AND the whole is
+          // re-verified above at the final HEAD.
+          issues.push(
+            `batch ${stored.ordinal} approved commit ${approvalSha} is not in the final branch history`,
+          );
+        }
+        // Mirrors the merge gate's resolution rule: a reviewer-ACCEPTED disposition or an
+        // explicit SHA-bound risk acceptance resolves a blocking finding.
+        const openBlockers = runtime.gateStore
+          .listBatchFindings(stored.batchId)
+          .filter(
+            (finding) =>
+              finding.status === 'OPEN' &&
+              (finding.severity === 'critical' || finding.severity === 'high') &&
+              !acceptedRisk.has(finding.findingId) &&
+              !runtime.gateStore
+                .listDispositionsForFinding(finding.findingId)
+                .some((disposition) => disposition.reviewerDecision.decision === 'ACCEPTED'),
+          );
+        if (openBlockers.length > 0) {
+          issues.push(
+            `batch ${stored.ordinal} has unresolved blocking findings: ${openBlockers
+              .map((finding) => finding.findingId)
+              .join(', ')}`,
+          );
+        }
+        const auditRows = runtime.store.workflowStore.listInvocationAudit(workflowId, {
+          batchId: stored.batchId,
+        });
+        if (auditRows.length === 0) {
+          issues.push(`batch ${stored.ordinal} has no invocation audit records`);
+        }
+      }
+      if (batches.length !== runnerState.totalBatches) {
+        issues.push(
+          `plan declared ${runnerState.totalBatches} batches but ${batches.length} exist`,
+        );
+      }
+      return { approved: issues.length === 0, issues, verification };
+    },
+  };
+}
+
+function buildRunner(
+  runtime: ReviewWorkflowRuntime,
+  projectDir: string,
+  workflowId: string,
+  timeoutSeconds: number,
+): reviewWorkflowRunner.AutonomousWorkflowRunner {
+  const config = loadConfig({ projectDir });
+  const autonomous = config.reviewGated?.autonomous;
+  if (autonomous === undefined) {
+    throw new Error('Autonomous execution requires the reviewGated configuration');
+  }
+  const contract = (() => {
+    try {
+      const pacing = resolveRuntimeContext(runtime.store, workflowId, projectDir).snapshot.pacing;
+      return {
+        maxCodeReviewRounds: pacing.maxCodeReviewRounds,
+        maxCorrectionPasses: 1 + pacing.maxCorrectionPasses,
+      };
+    } catch {
+      return undefined; // the workflow may not be initialized yet (decide/status paths)
+    }
+  })();
+  return new reviewWorkflowRunner.AutonomousWorkflowRunner(
+    runtime.runnerStore,
+    autonomous,
+    createRunnerGit(projectDir),
+    buildRunnerPhases(runtime, projectDir, workflowId, timeoutSeconds),
+    // Stops are already durable (NOTIFICATION runner-log entries); stderr is best-effort
+    // transport for a foreground worker.
+    { notify: (message) => console.error(`\n[codemoot] ${message}\n`) },
+    undefined,
+    undefined,
+    {
+      ...(contract === undefined ? {} : { contract }),
+      workerId: `${process.pid}:${workflowId.slice(-8)}`,
+      leaseSeconds: autonomous.heartbeatExpirySeconds,
+    },
+  );
+}
+
+interface WorkflowRunOptions {
+  readonly plan: string;
+  readonly background?: boolean;
+  readonly timeout: number;
+  readonly id?: string;
+}
+
+export async function reviewWorkflowRunCommand(options: WorkflowRunOptions): Promise<void> {
+  await withDatabase(async (db) => {
+    const projectDir = process.cwd();
+    const git = createRunnerGit(projectDir);
+    if (!git.isClean()) {
+      throw new Error('Autonomous execution requires a clean worktree and index');
+    }
+    const baseBranch = git.currentBranch();
+    const baseSha = git.headSha();
+    const config = loadConfig({ projectDir });
+    const workflowId = options.id ?? generateId('review-workflow');
+    const now = new Date().toISOString();
+    const configuration = reviewWorkflowIdentity.createReviewWorkflowConfigurationSnapshot(config, {
+      workflowId,
+      implementerAssignmentId: `${workflowId}:assignment:implementer`,
+      reviewerAssignmentId: `${workflowId}:assignment:reviewer`,
+      assignedAt: now,
+    });
+    const planPath = resolve(projectDir, options.plan);
+    const runtime = createRuntime(db, projectDir);
+    // The workflow branch exists BEFORE the repository audit is captured, so refinement's
+    // audit verification sees the branch it will actually run on. The base branch and its
+    // immutable SHA were recorded above, before the branch switch.
+    const branch = `codemoot/${planSlug(options.plan)}-${workflowId.slice(-8)}`;
+    git.createBranch(branch);
+    runtime.service.initialize({
+      workflowId,
+      planContent: readFileSync(planPath, 'utf8'),
+      sourceType: 'MARKDOWN_FILE',
+      sourceLocation: planPath,
+      authorEvidence: [{ kind: 'LOCAL_CLI', source: 'codemoot workflow run', observedAt: now }],
+      owner: {
+        actorExecutionId: `${workflowId}:owner:${generateId('execution')}`,
+        actorType: 'HUMAN',
+        authoritiesExercised: ['WORKFLOW_OWNER'],
+        identityAssurance: 'CLI_ASSERTED',
+        observedEvidence: [{ kind: 'LOCAL_CLI', source: 'codemoot workflow run', observedAt: now }],
+        startedAt: now,
+        finishedAt: now,
+      },
+      configuration,
+      repositoryAuditId: `${workflowId}:repository-audit:1`,
+      createdAt: now,
+    });
+    const autonomousLimits = config.reviewGated?.autonomous;
+    if (autonomousLimits === undefined) {
+      throw new Error('Autonomous execution requires the reviewGated configuration');
+    }
+    // Freeze the limits into the runner state: config edits between workers never change
+    // enforcement mid-workflow.
+    runtime.runnerStore.initState({
+      workflowId,
+      branch,
+      baseBranch,
+      baseSha,
+      limits: autonomousLimits,
+    });
+    runtime.runnerStore.appendLog({
+      workflowId,
+      entryType: 'CHECKPOINT',
+      message: `Workflow started on branch ${branch} (base ${baseBranch}@${baseSha.slice(0, 8)})`,
+    });
+    if (options.background === true) {
+      const entry = process.argv[1];
+      if (entry === undefined) throw new Error('Cannot resolve the CLI entry point');
+      const child = spawn(process.execPath, [entry, 'workflow', 'run-resume', workflowId], {
+        cwd: projectDir,
+        detached: true,
+        stdio: 'ignore',
+      });
+      child.unref();
+      printJson({
+        status: 'RUNNING',
+        workflowId,
+        branch,
+        baseBranch,
+        baseSha,
+        workerPid: child.pid ?? null,
+        watch: `codemoot workflow watch ${workflowId}`,
+      });
+      return;
+    }
+    printJson({ status: 'RUNNING', workflowId, branch, baseBranch, baseSha });
+    await runResumeInProcess(runtime, projectDir, workflowId, options.timeout);
+  });
+}
+
+async function runResumeInProcess(
+  runtime: ReviewWorkflowRuntime,
+  projectDir: string,
+  workflowId: string,
+  timeoutSeconds: number,
+): Promise<void> {
+  // ONE try/finally owns the guard: even a partial installation failure is restored, and
+  // no validation, initialization, or spawn failure can leave the sentinel behind.
+  try {
+    installGitGuard(projectDir);
+    await runResumeGuarded(runtime, projectDir, workflowId, timeoutSeconds);
+  } finally {
+    uninstallGitGuard(projectDir);
+  }
+}
+
+async function runResumeGuarded(
+  runtime: ReviewWorkflowRuntime,
+  projectDir: string,
+  workflowId: string,
+  timeoutSeconds: number,
+): Promise<void> {
+  const runner = buildRunner(runtime, projectDir, workflowId, timeoutSeconds);
+  const result = await runner.run(workflowId);
+  const state = runtime.runnerStore.require(workflowId);
+  if (result.status === 'READY_FOR_HUMAN_VERIFICATION') {
+    const git = createRunnerGit(projectDir);
+    const totals = runtime.runnerStore.auditTotals(workflowId);
+    printJson({
+      status: result.status,
+      workflowId,
+      branch: state.branch,
+      baseBranch: state.baseBranch,
+      baseSha: state.baseSha,
+      finalCommitSha: git.headSha(),
+      remoteBranchSha: git.remoteHeadSha(state.branch),
+      batchesCompleted: state.counters.completedOrdinals.length,
+      totalBatches: state.totalBatches,
+      batchSummaries: state.counters.completedBatches,
+      workflowVerificationAtFinalHead: runtime.runnerStore
+        .listLog(workflowId, { types: ['CHECKPOINT'], limit: 100_000 })
+        .filter((entry) => entry.message.startsWith('workflow-verification '))
+        .map((entry) => ({
+          message: entry.message,
+          ...(entry.payload === undefined ? {} : { detail: entry.payload }),
+        })),
+      verificationResults: runtime.store.listBatches(workflowId).map((batch) => ({
+        batchId: batch.batchId,
+        records: runtime.gateStore.listVerificationRecords(batch.batchId).map((record) => ({
+          verificationRecordId: record.verificationRecordId,
+          command: `${record.command} ${record.arguments.join(' ')}`.trim(),
+          observedStatus: record.observedStatus,
+          commitSha: record.commitSha,
+        })),
+      })),
+      deferredFindings: state.counters.completedBatches.flatMap(
+        (summary) => summary.deferredFindingIds,
+      ),
+      acceptedRiskFindings: state.counters.completedBatches.flatMap(
+        (summary) => summary.acceptedRiskFindingIds,
+      ),
+      acceptedRiskOverrides: runtime.runnerStore.listDecisions(workflowId),
+      tokenTotals: totals,
+      auditExport: `codemoot workflow export ${workflowId} --output workflow-audit.json`,
+      recommendedPrTitle: `feat: ${state.branch
+        .replace(/^codemoot\//, '')
+        .replace(/-[^-]*$/, '')
+        .replace(/-/g, ' ')}`,
+      recommendedPrSummary: `Review-gated workflow ${workflowId}: ${state.counters.completedOrdinals.length}/${state.totalBatches} batches implemented, reviewed, verified, audited, and gated on branch ${state.branch}. CodeMoot never merges: verify and merge this branch manually.`,
+    });
+  } else {
+    printJson({
+      status: result.status,
+      workflowId,
+      ...(result.stopReason === undefined ? {} : { stopReason: result.stopReason }),
+      ...(result.stopDetails === undefined ? {} : { stopDetails: result.stopDetails }),
+      decide: `codemoot workflow decide ${workflowId} --action <fix_again|accept_risk|cancel> --rationale "..."`,
+    });
+  }
+}
+
+export async function reviewWorkflowRunResumeCommand(
+  workflowId: string,
+  options: { readonly timeout: number; readonly background?: boolean },
+): Promise<void> {
+  if (options.background === true) {
+    const entry = process.argv[1];
+    if (entry === undefined) throw new Error('Cannot resolve the CLI entry point');
+    const child = spawn(process.execPath, [entry, 'workflow', 'run-resume', workflowId], {
+      cwd: process.cwd(),
+      detached: true,
+      stdio: 'ignore',
+    });
+    child.unref();
+    printJson({
+      status: 'RESUMING',
+      workflowId,
+      workerPid: child.pid ?? null,
+      watch: `codemoot workflow watch ${workflowId}`,
+    });
+    return;
+  }
+  await withDatabase(async (db) => {
+    const projectDir = process.cwd();
+    const runtime = createRuntime(db, projectDir);
+    await runResumeInProcess(runtime, projectDir, workflowId, options.timeout);
+  });
+}
+
+export async function reviewWorkflowWatchCommand(workflowId: string): Promise<void> {
+  await withDatabase(async (db) => {
+    const projectDir = process.cwd();
+    const runtime = createRuntime(db, projectDir);
+    const config = loadConfig({ projectDir });
+    const expiry = config.reviewGated?.autonomous.heartbeatExpirySeconds ?? 120;
+    const runner = buildRunner(runtime, projectDir, workflowId, 1800);
+    let lastLogId = 0;
+    for (;;) {
+      if (runtime.runnerStore.get(workflowId) === null) {
+        throw new Error(`Workflow ${workflowId} has no runner state`);
+      }
+      const state = runner.reconcileStalled(workflowId);
+      const entries = runtime.runnerStore.listLog(workflowId, { afterLogId: lastLogId });
+      for (const entry of entries) {
+        const time = entry.createdAt.slice(11, 19);
+        console.log(`${time}  ${entry.entryType.padEnd(11)} ${entry.phase ?? ''} ${entry.message}`);
+        lastLogId = entry.logId;
+      }
+      const observed = reviewWorkflowRunner.deriveObservedStatus(state, expiry, new Date());
+      if (observed.status !== 'RUNNING') {
+        console.log(
+          `${new Date().toISOString().slice(11, 19)}  ${observed.status}${observed.reason === undefined ? '' : `  ${observed.reason}`}${state.stopReason === undefined ? '' : `  ${state.stopReason}`}`,
+        );
+        return;
+      }
+      await new Promise((resolveSleep) => setTimeout(resolveSleep, 2000));
+    }
+  });
+}
+
+export async function reviewWorkflowLogsCommand(
+  workflowId: string,
+  options: { readonly batch?: string; readonly phase?: string; readonly invocation?: string },
+): Promise<void> {
+  await withDatabase(async (db) => {
+    const runtime = createRuntime(db, process.cwd());
+    const audit = runtime.store.workflowStore.listInvocationAudit(workflowId, {
+      ...(options.batch === undefined ? {} : { batchId: options.batch }),
+      ...(options.phase === undefined ? {} : { phase: options.phase }),
+      ...(options.invocation === undefined ? {} : { invocationId: options.invocation }),
+    });
+    printJson({ workflowId, invocations: audit });
+  });
+}
+
+export async function reviewWorkflowExportCommand(
+  workflowId: string,
+  options: { readonly output: string },
+): Promise<void> {
+  await withDatabase(async (db) => {
+    const projectDir = process.cwd();
+    const runtime = createRuntime(db, projectDir);
+    const state = runtime.runnerStore.get(workflowId);
+    const batches = runtime.store.listBatches(workflowId);
+    const output = {
+      workflowId,
+      exportedAt: new Date().toISOString(),
+      workflow: runtime.store.getWorkflow(workflowId),
+      runnerState: state,
+      runnerLog: runtime.runnerStore.listLog(workflowId, { limit: 100_000 }),
+      decisions: runtime.runnerStore.listDecisions(workflowId),
+      events: runtime.jobStore.listWorkflowEvents(workflowId, 0, 100_000),
+      invocationAudit: runtime.store.workflowStore.listInvocationAudit(workflowId),
+      sessionContinuity: batches.flatMap((batch) =>
+        runtime.store.workflowStore.listSessionContinuity(batch.batchId),
+      ),
+      handoffTranscripts: runtime.store.workflowStore.listHandoffTranscripts(workflowId),
+      batches: batches.map((batch) => {
+        const plan = runtime.store.getBatchPlan(batch.currentPlanVersionId);
+        const findings = runtime.gateStore.listBatchFindings(batch.batchId);
+        const verificationRecords = runtime.gateStore.listVerificationRecords(batch.batchId);
+        return {
+          batch,
+          plan,
+          acceptanceCriteria:
+            plan === null ? [] : runtime.store.listAcceptanceCriteria(plan.batchPlanVersionId),
+          findings,
+          dispositions: findings.flatMap((finding) =>
+            runtime.gateStore.listDispositionsForFinding(finding.findingId),
+          ),
+          codeReviews: runtime.gateStore.listCodeReviews(batch.batchId),
+          finalAudits: runtime.gateStore.listFinalAudits(batch.batchId),
+          implementationAttempts: runtime.gateStore.listImplementationAttempts(batch.batchId),
+          verificationRecords,
+          verificationAttestations: verificationRecords.flatMap((record) =>
+            runtime.gateStore.listAttestationsForRecord(record.verificationRecordId),
+          ),
+          gateApprovals: runtime.gateStore
+            .getEvents(batch.batchId)
+            .filter((event) => event.eventType === 'BATCH_GATE_APPROVED'),
+        };
+      }),
+    };
+    const target = resolve(projectDir, options.output);
+    writeFileSync(target, JSON.stringify(output, null, 2));
+    printJson({ workflowId, output: target, invocations: output.invocationAudit.length });
+  });
+}
+
+export async function reviewWorkflowDecideCommand(
+  workflowId: string,
+  options: {
+    readonly action: 'fix_again' | 'accept_risk' | 'cancel';
+    readonly rationale: string;
+    readonly findings?: string;
+    readonly actor?: string;
+  },
+): Promise<void> {
+  await withDatabase(async (db) => {
+    const projectDir = process.cwd();
+    const runtime = createRuntime(db, projectDir);
+    const runner = buildRunner(runtime, projectDir, workflowId, 1800);
+    const action =
+      options.action === 'fix_again'
+        ? 'FIX_AGAIN'
+        : options.action === 'accept_risk'
+          ? 'ACCEPT_RISK_AND_CONTINUE'
+          : 'CANCEL_WORKFLOW';
+    // The decision is made by a persisted HUMAN WORKFLOW_OWNER execution, and the record
+    // carries that execution's ID so the audit trail names a durable identity.
+    const decisionOrdinal = runtime.runnerStore.listDecisions(workflowId).length + 1;
+    const owner = persistCliActor(runtime.store, {
+      actorExecutionId: `${workflowId}:decision:${decisionOrdinal}:owner`,
+      actorType: 'HUMAN',
+      authorities: ['WORKFLOW_OWNER'],
+    });
+    const decision = runner.decide({
+      workflowId,
+      action,
+      actor: `${options.actor ?? 'human-owner'} (${owner.actorExecutionId})`,
+      rationale: options.rationale,
+      ...(options.findings === undefined
+        ? {}
+        : { findingIds: options.findings.split(',').map((id) => id.trim()) }),
+    });
+    printJson({
+      workflowId,
+      decisionId: decision.decisionId,
+      action: decision.action,
+      commitSha: decision.commitSha,
+      resume: `codemoot workflow run-resume ${workflowId} --background`,
+    });
+  });
 }
