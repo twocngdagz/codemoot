@@ -266,6 +266,65 @@ function refinementEntitiesMatchTranscript(
 
 const recordHashRowSchema = z.object({ record_hash: z.string() });
 const payloadRowSchema = z.object({ payload_json: z.string() });
+
+const batchRoleSessionRowSchema = z.object({
+  batch_id: z.string().min(1),
+  role: z.enum(['IMPLEMENTER', 'REVIEWER']),
+  workflow_id: z.string().min(1),
+  session_identity_id: z.string().min(1),
+  provider_or_adapter: z.string().min(1),
+  vendor_session_id: z.string().min(1),
+  created_at: z.string().min(1),
+});
+
+const sessionContinuityRowSchema = z.object({
+  invocation_id: z.string().min(1),
+  workflow_id: z.string().min(1),
+  batch_id: z.string().min(1),
+  role: z.enum(['IMPLEMENTER', 'REVIEWER']),
+  adapter_kind: z.string().min(1),
+  requested_vendor_session_id: z.string().nullable(),
+  returned_vendor_session_id: z.string().nullable(),
+  outcome: z.enum(['CREATED', 'RESUMED', 'FAILED']),
+  error_code: z.string().nullable(),
+  created_at: z.string().min(1),
+});
+
+export interface BatchRoleSession {
+  readonly batchId: string;
+  readonly role: 'IMPLEMENTER' | 'REVIEWER';
+  readonly workflowId: string;
+  readonly sessionIdentityId: string;
+  readonly providerOrAdapter: string;
+  readonly vendorSessionId: string;
+  readonly createdAt: string;
+}
+
+export interface SessionContinuityEvidence {
+  readonly invocationId: string;
+  readonly workflowId: string;
+  readonly batchId: string;
+  readonly role: 'IMPLEMENTER' | 'REVIEWER';
+  readonly adapterKind: string;
+  readonly requestedVendorSessionId?: string;
+  readonly returnedVendorSessionId?: string;
+  readonly outcome: 'CREATED' | 'RESUMED' | 'FAILED';
+  readonly errorCode?: string;
+  readonly createdAt: string;
+}
+
+function parseBatchRoleSessionRow(row: unknown): BatchRoleSession {
+  const parsed = batchRoleSessionRowSchema.parse(row);
+  return {
+    batchId: parsed.batch_id,
+    role: parsed.role,
+    workflowId: parsed.workflow_id,
+    sessionIdentityId: parsed.session_identity_id,
+    providerOrAdapter: parsed.provider_or_adapter,
+    vendorSessionId: parsed.vendor_session_id,
+    createdAt: parsed.created_at,
+  };
+}
 const contextualPayloadRowSchema = payloadRowSchema.extend({
   workflow_id: z.string(),
   batch_id: z.string(),
@@ -513,6 +572,109 @@ export class ReviewWorkflowStore {
     if (row === undefined) return null;
     const parsedRow = payloadRowSchema.parse(row);
     return parseStoredPayload(parsedRow.payload_json, sessionIdentitySchema, 'SESSION_IDENTITY');
+  }
+
+  /** Runs writes in one transaction (better-sqlite3 nests via savepoints). */
+  runAtomically<T>(fn: () => T): T {
+    return this.db.transaction(fn)();
+  }
+
+  /**
+   * The single active vendor session for one batch role. Bindings are immutable: exactly one
+   * per (batch, role), and one vendor session can never serve two bindings (the UNIQUE
+   * constraint on provider + vendor session enforces cross-role and cross-batch isolation).
+   */
+  getBatchRoleSession(batchId: string, role: 'IMPLEMENTER' | 'REVIEWER'): BatchRoleSession | null {
+    const row = this.db
+      .prepare('SELECT * FROM review_workflow_batch_role_sessions WHERE batch_id = ? AND role = ?')
+      .get(batchId, role);
+    if (row === undefined) return null;
+    return parseBatchRoleSessionRow(row);
+  }
+
+  findBatchRoleSessionByVendor(
+    providerOrAdapter: string,
+    vendorSessionId: string,
+  ): BatchRoleSession | null {
+    const row = this.db
+      .prepare(
+        `SELECT * FROM review_workflow_batch_role_sessions
+         WHERE provider_or_adapter = ? AND vendor_session_id = ?`,
+      )
+      .get(providerOrAdapter, vendorSessionId);
+    if (row === undefined) return null;
+    return parseBatchRoleSessionRow(row);
+  }
+
+  bindBatchRoleSession(binding: BatchRoleSession): void {
+    this.db
+      .prepare(
+        `INSERT INTO review_workflow_batch_role_sessions (
+          batch_id, role, workflow_id, session_identity_id,
+          provider_or_adapter, vendor_session_id, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        binding.batchId,
+        binding.role,
+        binding.workflowId,
+        binding.sessionIdentityId,
+        binding.providerOrAdapter,
+        binding.vendorSessionId,
+        binding.createdAt,
+      );
+  }
+
+  /** Append-only continuity evidence: one row per invocation attempt, including failures. */
+  recordSessionContinuity(evidence: SessionContinuityEvidence): void {
+    this.db
+      .prepare(
+        `INSERT INTO review_workflow_session_continuity (
+          invocation_id, workflow_id, batch_id, role, adapter_kind,
+          requested_vendor_session_id, returned_vendor_session_id,
+          outcome, error_code, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        evidence.invocationId,
+        evidence.workflowId,
+        evidence.batchId,
+        evidence.role,
+        evidence.adapterKind,
+        evidence.requestedVendorSessionId ?? null,
+        evidence.returnedVendorSessionId ?? null,
+        evidence.outcome,
+        evidence.errorCode ?? null,
+        evidence.createdAt,
+      );
+  }
+
+  listSessionContinuity(batchId: string): readonly SessionContinuityEvidence[] {
+    return this.db
+      .prepare(
+        `SELECT * FROM review_workflow_session_continuity
+         WHERE batch_id = ? ORDER BY created_at, invocation_id`,
+      )
+      .all(batchId)
+      .map((row) => {
+        const parsed = sessionContinuityRowSchema.parse(row);
+        return {
+          invocationId: parsed.invocation_id,
+          workflowId: parsed.workflow_id,
+          batchId: parsed.batch_id,
+          role: parsed.role,
+          adapterKind: parsed.adapter_kind,
+          ...(parsed.requested_vendor_session_id === null
+            ? {}
+            : { requestedVendorSessionId: parsed.requested_vendor_session_id }),
+          ...(parsed.returned_vendor_session_id === null
+            ? {}
+            : { returnedVendorSessionId: parsed.returned_vendor_session_id }),
+          outcome: parsed.outcome,
+          ...(parsed.error_code === null ? {} : { errorCode: parsed.error_code }),
+          createdAt: parsed.created_at,
+        };
+      });
   }
 
   getEvents(batchId: string, afterSequence = 0): readonly ReviewWorkflowEvent[] {

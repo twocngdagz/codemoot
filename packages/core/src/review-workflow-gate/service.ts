@@ -30,6 +30,7 @@ import type {
   TransitionCommand,
   VerificationRecord,
 } from '../review-workflow/types.js';
+import { isSessionContinuityError } from '../roles/role-invocation.js';
 import type {
   PreparedRoleInvocation,
   RoleInvocationInput,
@@ -145,6 +146,17 @@ export class ReviewWorkflowGateService {
         'Final audit requires the workflow refined plan version',
       );
     }
+    // The bound reviewer session is authoritative for audit-trail identity: the guard
+    // receipt and its requester must name the session actually being resumed, never a
+    // caller-fresh identifier that will remain unpersisted.
+    const boundReviewerSession = this.store.workflowStore.getBatchRoleSession(
+      input.batchId,
+      'REVIEWER',
+    );
+    const reviewerSessionForEvidence =
+      boundReviewerSession?.sessionIdentityId ??
+      input.previousSessionIdentityId ??
+      input.sessionIdentityId;
     const before = this.repository.readWorktree();
     const captured = this.gitService.captureReviewRange({
       kind: 'FINAL_GATE',
@@ -195,7 +207,7 @@ export class ReviewWorkflowGateService {
         cleanWorktree: before.clean,
         unresolvedFindingCount: 0,
         incompleteDispositionCount: 0,
-        roleSeparation: this.roleSeparation(context.configuration, input.sessionIdentityId),
+        roleSeparation: this.roleSeparation(context.configuration, reviewerSessionForEvidence),
       },
     };
     const request = this.commandRequest({
@@ -207,7 +219,7 @@ export class ReviewWorkflowGateService {
         actorType: 'AGENT',
         assignmentId: context.configuration.assignments.reviewer.assignmentId,
         invocationIdentityId: input.invocationId,
-        sessionIdentityId: input.previousSessionIdentityId ?? input.sessionIdentityId,
+        sessionIdentityId: reviewerSessionForEvidence,
         authoritiesExercised: ['REVIEWER'],
         identityAssurance: 'CONFIG_ONLY',
         observedEvidence: [],
@@ -241,6 +253,8 @@ export class ReviewWorkflowGateService {
           cumulativePatch: captured.cumulativePatch.patch,
           deferredFindings,
         }),
+        // The final audit must resume the batch's initial reviewer session.
+        sessionBinding: { batchId: input.batchId, role: 'REVIEWER', expectExisting: true },
         ...(input.previousSessionIdentityId === undefined
           ? {}
           : { previousSessionIdentityId: input.previousSessionIdentityId }),
@@ -250,6 +264,20 @@ export class ReviewWorkflowGateService {
       this.failCommand(input.commandId, 'AGENT_INVOCATION_FAILED', {
         message: error instanceof Error ? error.message : 'Final-audit invocation failed',
       });
+      if (isSessionContinuityError(error)) {
+        // Fail closed: broken reviewer-session continuity is a human decision. The
+        // escalation is best-effort: it must never mask the typed continuity error.
+        try {
+          this.blockBatch({
+            workflowId: input.workflowId,
+            batchId: input.batchId,
+            commandId: `${input.commandId}:session-continuity-block`,
+            reason: `SESSION_CONTINUITY_FAILURE:${error.code}: ${error.message}`,
+          });
+        } catch {
+          // The typed error below remains the authoritative failure.
+        }
+      }
       throw error;
     }
     if (prepared.invocation.commandId !== input.commandId) {

@@ -53,6 +53,8 @@ export interface ProgressCallbacks {
 }
 
 export interface CliCallOptions extends ProgressCallbacks {
+  /** Forbids resume fallback to a fresh exec; a failed resume becomes a thrown error. */
+  strictResume?: boolean;
   /** Total timeout in ms. Default: 600_000 (10 min). */
   timeout?: number;
   /** Inactivity timeout — kill if no stdout for this long. Default: 120_000 (2 min). */
@@ -265,7 +267,17 @@ export class CliAdapter implements CliBridge {
     if (options?.sessionId) {
       try {
         return await doCall(options.sessionId);
-      } catch {
+      } catch (error) {
+        if (options.strictResume === true) {
+          // Mandatory continuity: never fall back to a fresh exec — surface the failure.
+          throw new ModelError(
+            `Codex CLI could not resume thread ${options.sessionId}: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+            this.provider,
+            this.modelId,
+          );
+        }
         // Resume failed — fall back to fresh exec
         console.error(
           `[codemoot] Resume failed for session ${options.sessionId}, falling back to fresh exec`,

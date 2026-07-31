@@ -503,6 +503,33 @@ export const REVIEW_WORKFLOW_MIGRATIONS = [
   `CREATE INDEX IF NOT EXISTS idx_review_workflow_baseline_comparison_attestations
     ON review_workflow_baseline_comparison_attestations(comparison_id, decision, created_at)`,
 
+  `CREATE TABLE IF NOT EXISTS review_workflow_batch_role_sessions (
+    batch_id             TEXT NOT NULL REFERENCES review_workflow_batches(batch_id),
+    role                 TEXT NOT NULL CHECK(role IN ('IMPLEMENTER', 'REVIEWER')),
+    workflow_id          TEXT NOT NULL REFERENCES review_workflows(workflow_id),
+    session_identity_id  TEXT NOT NULL,
+    provider_or_adapter  TEXT NOT NULL,
+    vendor_session_id    TEXT NOT NULL,
+    created_at           TEXT NOT NULL,
+    PRIMARY KEY (batch_id, role),
+    UNIQUE (provider_or_adapter, vendor_session_id)
+  )`,
+
+  `CREATE TABLE IF NOT EXISTS review_workflow_session_continuity (
+    invocation_id                 TEXT PRIMARY KEY,
+    workflow_id                   TEXT NOT NULL,
+    batch_id                      TEXT NOT NULL,
+    role                          TEXT NOT NULL CHECK(role IN ('IMPLEMENTER', 'REVIEWER')),
+    adapter_kind                  TEXT NOT NULL,
+    requested_vendor_session_id   TEXT,
+    returned_vendor_session_id    TEXT,
+    outcome                       TEXT NOT NULL CHECK(outcome IN ('CREATED', 'RESUMED', 'FAILED')),
+    error_code                    TEXT,
+    created_at                    TEXT NOT NULL
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_review_workflow_session_continuity_batch
+    ON review_workflow_session_continuity(batch_id, created_at)`,
+
   `CREATE TABLE IF NOT EXISTS review_workflow_jobs (
     job_id            TEXT PRIMARY KEY,
     workflow_id       TEXT NOT NULL REFERENCES review_workflows(workflow_id),
@@ -565,6 +592,8 @@ export const REVIEW_WORKFLOW_MIGRATIONS = [
     'review_workflow_verification_baseline_comparisons',
     'review_workflow_baseline_comparison_attestations',
     'review_workflow_review_range_evidence',
+    'review_workflow_batch_role_sessions',
+    'review_workflow_session_continuity',
   ].flatMap((table) => [
     `CREATE TRIGGER IF NOT EXISTS ${table}_immutable_update
       BEFORE UPDATE ON ${table}

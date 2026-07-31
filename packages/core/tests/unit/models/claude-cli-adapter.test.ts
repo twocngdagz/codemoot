@@ -87,6 +87,19 @@ describe('ClaudeCliAdapter', () => {
     });
   });
 
+  it('does not claim continuity when the CLI forks the resumed session', async () => {
+    const requested = '550e8400-e29b-41d4-a716-446655440099';
+    const result = await adapter('fork-session').resume(requested, 'review the correction');
+
+    // The CLI answered with a different session_id: continuity is unproven, so the
+    // evidence must NOT carry resumedFromSessionId.
+    expect(result.sessionId).toBe('550e8400-e29b-41d4-a716-446655440777');
+    expect(result.sessionEvidence).toEqual({
+      providerOrAdapter: 'claude',
+      vendorSessionId: '550e8400-e29b-41d4-a716-446655440777',
+    });
+  });
+
   it('runs in and records the configured working directory', async () => {
     const workingDirectory = realpathSync(
       fileURLToPath(new URL('../../fixtures/claude-cli/', import.meta.url)),

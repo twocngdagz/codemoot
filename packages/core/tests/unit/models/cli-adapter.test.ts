@@ -779,6 +779,70 @@ describe('callWithResume', () => {
     expect(result.sessionId).toBe('t1');
   });
 
+  it('strictResume surfaces a failed resume instead of falling back to a fresh exec', async () => {
+    setupJsonlSpawn(['{"type":"error","message":"thread not found"}'], 1);
+
+    await expect(
+      adapter.callWithResume('prompt', { sessionId: 'thread_dead', strictResume: true }),
+    ).rejects.toThrowError(/could not resume thread thread_dead/);
+
+    // Exactly one spawn: the resume attempt. No fallback fresh exec was started.
+    expect(vi.mocked(spawn)).toHaveBeenCalledTimes(1);
+    const resumeArgs = vi.mocked(spawn).mock.calls[0]?.[1];
+    expect(resumeArgs).toContain('resume');
+    expect(resumeArgs).toContain('thread_dead');
+  });
+
+  it('without strictResume a failed resume falls back to a fresh exec', async () => {
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+    const mockSpawn = vi.mocked(spawn);
+    let callIndex = 0;
+    mockSpawn.mockImplementation((() => {
+      callIndex += 1;
+      const failing = callIndex === 1;
+      const stdoutOn = vi.fn(
+        (event: string, cb: (data: Buffer) => void): ReturnType<typeof vi.fn> => {
+          if (event === 'data' && !failing) {
+            setTimeout(
+              () =>
+                cb(
+                  Buffer.from(
+                    [
+                      '{"type":"thread.started","thread_id":"thread_fresh"}',
+                      '{"type":"item.completed","item":{"type":"agent_message","text":"Ok"}}',
+                    ].join('\n'),
+                  ),
+                ),
+              1,
+            );
+          }
+          return stdoutOn;
+        },
+      );
+      const onFn = vi.fn(
+        (event: string, cb: (...args: unknown[]) => void): ReturnType<typeof vi.fn> => {
+          if (event === 'spawn') setTimeout(() => cb(), 0);
+          if (event === 'close') setTimeout(() => cb(failing ? 1 : 0), 2);
+          return onFn;
+        },
+      );
+      return {
+        stdout: { on: stdoutOn },
+        stderr: { on: vi.fn() },
+        stdin: { write: vi.fn(), end: vi.fn() },
+        on: onFn,
+        pid: 12345,
+      };
+    }) as never);
+
+    const result = await adapter.callWithResume('prompt', { sessionId: 'thread_dead' });
+
+    expect(result.sessionId).toBe('thread_fresh');
+    expect(mockSpawn).toHaveBeenCalledTimes(2);
+    expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining('falling back to fresh exec'));
+    errorSpy.mockRestore();
+  });
+
   it('passes onSpawn callback to runProcess', async () => {
     setupJsonlSpawn([
       '{"type":"thread.started","thread_id":"t1"}',

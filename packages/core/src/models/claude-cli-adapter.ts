@@ -245,7 +245,12 @@ export class ClaudeCliAdapter implements CliBridge {
       sessionEvidence: {
         providerOrAdapter: 'claude',
         vendorSessionId: parsed.sessionId,
-        ...(resumeSessionId === undefined ? {} : { resumedFromSessionId: resumeSessionId }),
+        // Continuity is only claimed when the CLI proves it by echoing the resumed session
+        // ID. A --resume run that returns a different session_id (a fork) is NOT proven
+        // continuity and must not be labelled as one.
+        ...(resumeSessionId !== undefined && parsed.sessionId === resumeSessionId
+          ? { resumedFromSessionId: resumeSessionId }
+          : {}),
       },
     };
   }

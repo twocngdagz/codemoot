@@ -25,6 +25,12 @@ export interface BridgeOptions extends ProgressCallbacks {
   maxOutputBytes?: number;
   idleTimeout?: number;
   signal?: AbortSignal;
+  /**
+   * Forbids any fallback to a fresh session when a resume fails. Mandatory role-session
+   * continuity sets this: a failed resume must surface as a failure, never as a silently
+   * created new vendor session.
+   */
+  strictResume?: boolean;
 }
 
 /** Options for a bridge resume call. */

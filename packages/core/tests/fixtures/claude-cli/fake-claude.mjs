@@ -25,7 +25,12 @@ if (mode === 'hang') {
 } else {
   const configuredModel = optionValue('--model') ?? 'unknown-model';
   const resumedSessionId = optionValue('--resume');
-  const sessionId = resumedSessionId ?? '550e8400-e29b-41d4-a716-446655440010';
+  const sessionId =
+    resumedSessionId === undefined
+      ? '550e8400-e29b-41d4-a716-446655440010'
+      : mode === 'fork-session'
+        ? '550e8400-e29b-41d4-a716-446655440777'
+        : resumedSessionId;
   const version = mode === 'unsupported-version' ? '3.0.0' : '2.1.218';
   const init = {
     type: 'system',

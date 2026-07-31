@@ -25,6 +25,7 @@ import type {
   StateChangingCommandRequest,
   TransitionCommand,
 } from '../review-workflow/types.js';
+import { type RoleInvocationError, isSessionContinuityError } from '../roles/role-invocation.js';
 import type {
   PreparedRoleInvocation,
   RoleInvocationInput,
@@ -251,9 +252,17 @@ export class ReviewWorkflowCodeReviewService {
       ),
     };
 
+    // The batch role-session registry is authoritative for the reviewer session identity:
+    // once bound, kernel evidence must name the bound session, never a caller-fresh one.
+    const boundReviewerSession = this.store.workflowStore.getBatchRoleSession(
+      input.batchId,
+      'REVIEWER',
+    );
     const roleSeparation = this.roleSeparation(
       context.configuration,
-      input.previousSessionIdentityId ?? input.sessionIdentityId,
+      boundReviewerSession?.sessionIdentityId ??
+        input.previousSessionIdentityId ??
+        input.sessionIdentityId,
     );
     const startCommand: TransitionCommand = {
       type: 'START_CODE_REVIEW',
@@ -270,7 +279,7 @@ export class ReviewWorkflowCodeReviewService {
       commandId: input.commandId,
       workflowId: input.workflowId,
       batch: context.batch,
-      requester: this.preInvocationRequester(input),
+      requester: this.preInvocationRequester(input, boundReviewerSession?.sessionIdentityId),
       authorityExercised: 'REVIEWER',
       targetCommitSha: currentImplementationSha,
       command: startCommand,
@@ -290,12 +299,28 @@ export class ReviewWorkflowCodeReviewService {
         ...(input.previousSessionIdentityId === undefined
           ? {}
           : { previousSessionIdentityId: input.previousSessionIdentityId }),
+        sessionBinding: {
+          batchId: input.batchId,
+          role: 'REVIEWER',
+          // Every round after the first must resume the initial reviewer session.
+          expectExisting: round > 1,
+        },
         ...(input.options === undefined ? {} : { options: input.options }),
       });
     } catch (error) {
       this.failInvocationCommand(input.commandId, 'AGENT_INVOCATION_FAILED', {
         message: error instanceof Error ? error.message : 'Reviewer invocation failed',
       });
+      if (isSessionContinuityError(error)) {
+        // Fail closed: broken reviewer-session continuity stops the batch for a human
+        // decision — never a silent fallback to a fresh session. The escalation is
+        // best-effort: it must never mask the typed continuity error.
+        try {
+          this.blockBatchForContinuityFailure(input.workflowId, input.batchId, error);
+        } catch {
+          // The typed error below remains the authoritative failure.
+        }
+      }
       throw error;
     }
     if (prepared.invocation.commandId !== input.commandId) {
@@ -715,13 +740,19 @@ export class ReviewWorkflowCodeReviewService {
     ).length;
   }
 
-  private preInvocationRequester(input: ReviewCodeInput): ActorExecutionIdentity {
+  private preInvocationRequester(
+    input: ReviewCodeInput,
+    boundReviewerSessionIdentityId: string | undefined,
+  ): ActorExecutionIdentity {
     return {
       actorExecutionId: `${input.commandId}:requester`,
       actorType: 'AGENT',
       assignmentId: input.configuration.assignments.reviewer.assignmentId,
       invocationIdentityId: input.invocationId,
-      sessionIdentityId: input.previousSessionIdentityId ?? input.sessionIdentityId,
+      sessionIdentityId:
+        boundReviewerSessionIdentityId ??
+        input.previousSessionIdentityId ??
+        input.sessionIdentityId,
       authoritiesExercised: ['REVIEWER'],
       identityAssurance: 'CONFIG_ONLY',
       observedEvidence: [],
@@ -844,6 +875,54 @@ export class ReviewWorkflowCodeReviewService {
         `Command ${commandId} has already reserved its external side effect`,
       );
     }
+  }
+
+  /**
+   * Fail-closed continuity escalation: block the batch with the exact machine-readable
+   * failure reason so only a human decision can move it forward. Best-effort — a batch in a
+   * non-blockable state still stops via the thrown continuity error.
+   */
+  private blockBatchForContinuityFailure(
+    workflowId: string,
+    batchId: string,
+    error: RoleInvocationError,
+  ): void {
+    const batch = this.store.getBatch(batchId);
+    if (batch === null) return;
+    const reason = `SESSION_CONTINUITY_FAILURE:${error.code}: ${error.message}`;
+    const command: TransitionCommand = { type: 'BLOCK_BATCH', reason };
+    const commandId = `${batchId}:session-continuity-block:${batch.aggregateVersion + 1}`;
+    const reconciler: ActorExecutionIdentity = {
+      actorExecutionId: `${commandId}:system-reconciler`,
+      actorType: 'SYSTEM',
+      authoritiesExercised: ['SYSTEM_RECONCILER'],
+      identityAssurance: 'PROCESS_ATTESTED',
+      observedEvidence: [],
+      startedAt: this.clock().toISOString(),
+    };
+    const transition = transitionBatch({
+      currentState: batch.persistedState,
+      command,
+      actor: reconciler,
+    });
+    if (!transition.allowed) return;
+    const request = {
+      commandId,
+      workflowId,
+      batchId,
+      expectedAggregateVersion: batch.aggregateVersion,
+      requester: reconciler,
+      authorityExercised: 'SYSTEM_RECONCILER' as const,
+      command,
+    };
+    this.commandStore.reserve({ ...request, canonicalRequestHash: hashValue(request) });
+    this.commandStore.succeedWithTransition({
+      commandId,
+      transition,
+      eventType: 'BATCH_BLOCKED',
+      eventPayload: { reason },
+      resultHash: hashValue({ reason }),
+    });
   }
 
   private failInvocationCommand(commandId: string, errorCode: string, result: unknown): void {

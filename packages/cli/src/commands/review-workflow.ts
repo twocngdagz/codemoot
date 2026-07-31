@@ -388,6 +388,14 @@ export async function reviewWorkflowBatchReviewPlanCommand(
       actorExecutionId,
       invocationId,
       sessionIdentityId,
+      // Plan review is the batch's first reviewer contact: it creates the one reviewer
+      // role session, which every later reviewer invocation (revision rounds, code review,
+      // final audit) must resume.
+      sessionBinding: {
+        batchId: batch.batchId,
+        role: 'REVIEWER',
+        expectExisting: options.round > 1,
+      },
       prompt: buildPlanReviewPrompt({
         workflowId,
         batchPlan: plan,

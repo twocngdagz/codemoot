@@ -23,6 +23,7 @@ import type {
   StateChangingCommandRequest,
   TransitionCommand,
 } from '../review-workflow/types.js';
+import { type RoleInvocationError, isSessionContinuityError } from '../roles/role-invocation.js';
 import type {
   PreparedRoleInvocation,
   RoleInvocationInput,
@@ -105,6 +106,7 @@ export class ReviewWorkflowImplementationService {
         invocationId: input.invocationId,
         sessionIdentityId: input.sessionIdentityId,
         prompt: input.prompt,
+        sessionBinding: { batchId: input.batchId, role: 'IMPLEMENTER' },
         ...(input.options === undefined ? {} : { options: input.options }),
       }),
     );
@@ -188,6 +190,7 @@ export class ReviewWorkflowImplementationService {
         sessionIdentityId: input.sessionIdentityId,
         prompt: input.prompt,
         previousSessionIdentityId: input.previousSessionIdentityId,
+        sessionBinding: { batchId: input.batchId, role: 'IMPLEMENTER', expectExisting: true },
         ...(input.options === undefined ? {} : { options: input.options }),
       }),
     );
@@ -307,6 +310,7 @@ export class ReviewWorkflowImplementationService {
         sessionIdentityId: input.sessionIdentityId,
         prompt: input.prompt,
         previousSessionIdentityId: input.previousSessionIdentityId,
+        sessionBinding: { batchId: input.batchId, role: 'IMPLEMENTER', expectExisting: true },
         ...(input.creationMode === 'AGENT_AUTHORIZED'
           ? { additionalAuthorities: ['COMMIT_CREATOR'] }
           : {}),
@@ -913,6 +917,54 @@ export class ReviewWorkflowImplementationService {
     };
   }
 
+  /**
+   * Fail-closed continuity escalation: block the batch with the exact machine-readable
+   * failure reason so only a human decision can move it forward. Best-effort — a batch in a
+   * non-blockable state still stops via the thrown continuity error.
+   */
+  private blockBatchForContinuityFailure(
+    workflowId: string,
+    batchId: string,
+    error: RoleInvocationError,
+  ): void {
+    const batch = this.store.getBatch(batchId);
+    if (batch === null) return;
+    const reason = `SESSION_CONTINUITY_FAILURE:${error.code}: ${error.message}`;
+    const command: TransitionCommand = { type: 'BLOCK_BATCH', reason };
+    const commandId = `${batchId}:session-continuity-block:${batch.aggregateVersion + 1}`;
+    const reconciler: ActorExecutionIdentity = {
+      actorExecutionId: `${commandId}:system-reconciler`,
+      actorType: 'SYSTEM',
+      authoritiesExercised: ['SYSTEM_RECONCILER'],
+      identityAssurance: 'PROCESS_ATTESTED',
+      observedEvidence: [],
+      startedAt: this.clock().toISOString(),
+    };
+    const transition = transitionBatch({
+      currentState: batch.persistedState,
+      command,
+      actor: reconciler,
+    });
+    if (!transition.allowed) return;
+    const request = {
+      commandId,
+      workflowId,
+      batchId,
+      expectedAggregateVersion: batch.aggregateVersion,
+      requester: reconciler,
+      authorityExercised: 'SYSTEM_RECONCILER' as const,
+      command,
+    };
+    this.commandStore.reserve({ ...request, canonicalRequestHash: hashValue(request) });
+    this.commandStore.succeedWithTransition({
+      commandId,
+      transition,
+      eventType: 'BATCH_BLOCKED',
+      eventPayload: { reason },
+      resultHash: hashValue({ reason }),
+    });
+  }
+
   private failInvocationCommand(commandId: string, errorCode: string, result: unknown): void {
     this.commandStore.recordOutcome({
       commandId,
@@ -967,6 +1019,16 @@ export class ReviewWorkflowImplementationService {
       this.failInvocationCommand(request.commandId, 'AGENT_INVOCATION_FAILED', {
         message: error instanceof Error ? error.message : 'Agent invocation failed',
       });
+      if (isSessionContinuityError(error)) {
+        // Fail closed: a broken role-session continuity stops the batch for a human
+        // decision — never a silent fallback to a fresh session. The escalation is
+        // best-effort: it must never mask the typed continuity error.
+        try {
+          this.blockBatchForContinuityFailure(request.workflowId, request.batchId, error);
+        } catch {
+          // The typed error below remains the authoritative failure.
+        }
+      }
       throw error;
     }
     if (prepared.invocation.commandId !== request.commandId) {

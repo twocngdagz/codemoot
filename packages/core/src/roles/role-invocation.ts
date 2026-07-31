@@ -1,4 +1,8 @@
-import type { ReviewWorkflowStore } from '../memory/review-workflow-store.js';
+import type {
+  BatchRoleSession,
+  ReviewWorkflowStore,
+  SessionContinuityEvidence,
+} from '../memory/review-workflow-store.js';
 import { type BridgeCallResult, type BridgeOptions, callBridge } from '../models/bridge.js';
 import {
   actorExecutionIdentitySchema,
@@ -23,9 +27,37 @@ export const ROLE_INVOCATION_ERROR_CODES = [
   'SESSION_ADAPTER_MISMATCH',
   'CROSS_ROLE_SESSION_REUSE',
   'AUTHORITY_NOT_ALLOWED',
+  'SESSION_RESUME_REQUIRED',
+  'SESSION_RESUME_UNSUPPORTED',
+  'SESSION_RESUME_FAILED',
+  'SESSION_IDENTITY_MISMATCH',
+  'ROLE_SESSION_MISSING',
 ] as const;
 
 export type RoleInvocationErrorCode = (typeof ROLE_INVOCATION_ERROR_CODES)[number];
+
+/**
+ * The stable machine-readable failure vocabulary of mandatory role-session continuity.
+ * Coordinators treat any of these as fail-closed: the batch stops (BLOCKED, human decision)
+ * with the exact reason, and no fallback session is ever created.
+ */
+export const SESSION_CONTINUITY_ERROR_CODES = [
+  'SESSION_RESUME_REQUIRED',
+  'SESSION_RESUME_UNSUPPORTED',
+  'SESSION_RESUME_FAILED',
+  'SESSION_IDENTITY_MISMATCH',
+  'ROLE_SESSION_MISSING',
+  'CROSS_ROLE_SESSION_REUSE',
+] as const;
+
+export type SessionContinuityErrorCode = (typeof SESSION_CONTINUITY_ERROR_CODES)[number];
+
+export function isSessionContinuityError(error: unknown): error is RoleInvocationError {
+  return (
+    error instanceof RoleInvocationError &&
+    (SESSION_CONTINUITY_ERROR_CODES as readonly string[]).includes(error.code)
+  );
+}
 
 export class RoleInvocationError extends Error {
   constructor(
@@ -35,6 +67,19 @@ export class RoleInvocationError extends Error {
     super(message);
     this.name = 'RoleInvocationError';
   }
+}
+
+/**
+ * Binds this invocation to the batch role-session registry: exactly one active vendor
+ * session per (batch, role). The first bound invocation creates and persists it; every
+ * later bound invocation MUST resume that exact vendor session — the registry, not the
+ * caller, decides between create and resume.
+ */
+export interface RoleSessionBinding {
+  readonly batchId: string;
+  readonly role: 'IMPLEMENTER' | 'REVIEWER';
+  /** The operation requires a prior session (correction, later review rounds, final audit). */
+  readonly expectExisting?: boolean;
 }
 
 export interface RoleInvocationInput {
@@ -48,6 +93,7 @@ export interface RoleInvocationInput {
   readonly options?: BridgeOptions;
   readonly previousSessionIdentityId?: string;
   readonly additionalAuthorities?: readonly Authority[];
+  readonly sessionBinding?: RoleSessionBinding;
 }
 
 export interface RoleInvocationResult {
@@ -60,6 +106,8 @@ export interface RoleInvocationResult {
 
 export type PreparedRoleInvocation = RoleInvocationResult & {
   readonly assignment: ResolvedRoleAdapter['assignment'];
+  /** Present when the invocation ran under a batch role-session binding. */
+  readonly continuity?: SessionContinuityEvidence;
 };
 
 const ROLE_AUTHORITIES: Readonly<Record<ResolvedRoleAdapter['role'], readonly Authority[]>> = {
@@ -99,15 +147,37 @@ export class RoleInvocationService {
     }
     const authoritiesExercised = this.resolveAuthorities(input);
 
-    const previousSession = this.loadPreviousSession(input);
+    // Mandatory role-session continuity: when a binding is declared, the persisted registry
+    // — never the caller — decides between creating the role session and resuming it.
+    const binding = this.resolveBinding(input, expectedRole);
+    const previousSession =
+      binding === null ? this.loadPreviousSession(input) : this.loadBoundSession(binding, input);
 
-    const call =
-      previousSession === undefined
-        ? await callBridge(adapter, input.prompt, input.options)
-        : await callBridge(adapter, input.prompt, {
-            ...input.options,
-            sessionId: previousSession.vendorSessionId,
-          });
+    let call: BridgeCallResult;
+    try {
+      call =
+        previousSession === undefined
+          ? await callBridge(adapter, input.prompt, input.options)
+          : await callBridge(adapter, input.prompt, {
+              ...input.options,
+              sessionId: previousSession.vendorSessionId,
+              ...(binding === null ? {} : { strictResume: true }),
+            });
+    } catch (error) {
+      if (binding !== null && previousSession !== undefined) {
+        throw this.continuityFailure(
+          input,
+          binding,
+          'SESSION_RESUME_FAILED',
+          `Adapter could not resume vendor session ${previousSession.vendorSessionId}: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+          previousSession.vendorSessionId,
+          undefined,
+        );
+      }
+      throw error;
+    }
     const invocationEvidence = call.invocationEvidence;
     if (invocationEvidence === undefined) {
       throw new RoleInvocationError(
@@ -144,6 +214,11 @@ export class RoleInvocationService {
         'SESSION_ADAPTER_MISMATCH',
         'Bridge session evidence does not match the resolved adapter',
       );
+    }
+    // Bound invocations enforce continuity FIRST so every failure records evidence; the
+    // legacy workflow-scoped cross-role check still guards unbound invocations.
+    if (binding !== null) {
+      this.enforceBoundContinuity(input, binding, previousSession, sessionEvidence);
     }
     this.assertNotUsedByOppositeRole(sessionEvidence, input);
 
@@ -220,10 +295,42 @@ export class RoleInvocationService {
       finishedAt: invocation.finishedAt,
     });
 
-    return { call, execution, invocation, session, resumed, assignment };
+    const continuity: SessionContinuityEvidence | undefined =
+      binding === null
+        ? undefined
+        : {
+            invocationId: invocation.invocationId,
+            workflowId: input.workflowId,
+            batchId: binding.batchId,
+            role: binding.role,
+            adapterKind: assignment.expectedAdapterKind,
+            ...(previousSession === undefined
+              ? {}
+              : { requestedVendorSessionId: previousSession.vendorSessionId }),
+            returnedVendorSessionId: sessionEvidence.vendorSessionId,
+            outcome: previousSession === undefined ? 'CREATED' : 'RESUMED',
+            createdAt: invocation.finishedAt ?? invocation.startedAt,
+          };
+
+    return {
+      call,
+      execution,
+      invocation,
+      session,
+      resumed,
+      assignment,
+      ...(continuity === undefined ? {} : { continuity }),
+    };
   }
 
   persistPrepared(prepared: PreparedRoleInvocation): void {
+    // One transaction: an invocation may never persist without its binding and evidence.
+    this.store.runAtomically(() => {
+      this.persistPreparedRecords(prepared);
+    });
+  }
+
+  private persistPreparedRecords(prepared: PreparedRoleInvocation): void {
     this.store.saveRoleInvocation({
       assignment: prepared.assignment,
       invocation: prepared.invocation,
@@ -232,6 +339,20 @@ export class RoleInvocationService {
         : { session: prepared.session }),
       execution: prepared.execution,
     });
+    if (prepared.continuity !== undefined) {
+      if (prepared.continuity.outcome === 'CREATED') {
+        this.store.bindBatchRoleSession({
+          batchId: prepared.continuity.batchId,
+          role: prepared.continuity.role,
+          workflowId: prepared.continuity.workflowId,
+          sessionIdentityId: prepared.session.sessionIdentityId,
+          providerOrAdapter: prepared.session.providerOrAdapter,
+          vendorSessionId: prepared.session.vendorSessionId,
+          createdAt: prepared.continuity.createdAt,
+        });
+      }
+      this.store.recordSessionContinuity(prepared.continuity);
+    }
   }
 
   private assertSessionBelongsToRole(session: SessionIdentity, input: RoleInvocationInput): void {
@@ -283,6 +404,170 @@ export class RoleInvocationService {
         'Implementer and reviewer cannot share a vendor session',
       );
     }
+  }
+
+  /** Validates the declared binding and loads the persisted registry row, if any. */
+  private resolveBinding(
+    input: RoleInvocationInput,
+    expectedRole: 'IMPLEMENTER' | 'REVIEWER',
+  ): (RoleSessionBinding & { readonly existing: BatchRoleSession | null }) | null {
+    if (input.sessionBinding === undefined) return null;
+    if (input.sessionBinding.role !== expectedRole) {
+      throw this.continuityFailure(
+        input,
+        input.sessionBinding,
+        'CROSS_ROLE_SESSION_REUSE',
+        `A ${input.resolution.role} invocation cannot bind the ${input.sessionBinding.role} role session`,
+        undefined,
+        undefined,
+      );
+    }
+    const existing = this.store.getBatchRoleSession(
+      input.sessionBinding.batchId,
+      input.sessionBinding.role,
+    );
+    if (existing === null && input.sessionBinding.expectExisting === true) {
+      throw this.continuityFailure(
+        input,
+        input.sessionBinding,
+        'ROLE_SESSION_MISSING',
+        `Batch ${input.sessionBinding.batchId} has no persisted ${input.sessionBinding.role} session to resume`,
+        undefined,
+        undefined,
+      );
+    }
+    return { ...input.sessionBinding, existing };
+  }
+
+  /**
+   * Loads the session the binding mandates. When a binding exists, resuming it is the ONLY
+   * permitted behavior: the adapter must support resume, and a fresh session is forbidden.
+   */
+  private loadBoundSession(
+    binding: RoleSessionBinding & { readonly existing: BatchRoleSession | null },
+    input: RoleInvocationInput,
+  ): SessionIdentity | undefined {
+    if (binding.existing === null) return undefined;
+    if (!input.resolution.adapter.capabilities.supportsResume) {
+      throw this.continuityFailure(
+        input,
+        binding,
+        'SESSION_RESUME_UNSUPPORTED',
+        `Adapter ${input.resolution.adapter.name} cannot resume sessions, but batch ${binding.batchId} requires resuming its ${binding.role} session`,
+        binding.existing.vendorSessionId,
+        undefined,
+      );
+    }
+    const entity = this.store.getEntity('SESSION_IDENTITY', binding.existing.sessionIdentityId);
+    if (entity === null || entity.kind !== 'SESSION_IDENTITY') {
+      throw this.continuityFailure(
+        input,
+        binding,
+        'ROLE_SESSION_MISSING',
+        `Bound session identity ${binding.existing.sessionIdentityId} is not persisted`,
+        binding.existing.vendorSessionId,
+        undefined,
+      );
+    }
+    try {
+      this.assertSessionBelongsToRole(entity.value, input);
+    } catch (error) {
+      // Bound-session integrity failures must fail closed like every other continuity
+      // violation: stable code, FAILED evidence, batch escalation.
+      const original = error instanceof RoleInvocationError ? error : null;
+      throw this.continuityFailure(
+        input,
+        binding,
+        original?.code === 'SESSION_ROLE_MISMATCH'
+          ? 'CROSS_ROLE_SESSION_REUSE'
+          : 'SESSION_IDENTITY_MISMATCH',
+        original?.message ?? 'Bound session does not match the invocation identity',
+        binding.existing.vendorSessionId,
+        undefined,
+      );
+    }
+    return entity.value;
+  }
+
+  /**
+   * Fail-closed continuity checks after the bridge answered. The returned vendor session
+   * must be provably the bound one (resume) or provably new and unclaimed (create); any
+   * other answer stops the workflow — never a silent fallback.
+   */
+  private enforceBoundContinuity(
+    input: RoleInvocationInput,
+    binding: RoleSessionBinding & { readonly existing: BatchRoleSession | null },
+    previousSession: SessionIdentity | undefined,
+    sessionEvidence: {
+      readonly providerOrAdapter: string;
+      readonly vendorSessionId: string;
+      readonly resumedFromSessionId?: string;
+    },
+  ): void {
+    if (previousSession !== undefined) {
+      if (sessionEvidence.vendorSessionId !== previousSession.vendorSessionId) {
+        throw this.continuityFailure(
+          input,
+          binding,
+          'SESSION_IDENTITY_MISMATCH',
+          `Adapter returned vendor session ${sessionEvidence.vendorSessionId} instead of the bound session ${previousSession.vendorSessionId}`,
+          previousSession.vendorSessionId,
+          sessionEvidence.vendorSessionId,
+        );
+      }
+      if (sessionEvidence.resumedFromSessionId !== previousSession.vendorSessionId) {
+        throw this.continuityFailure(
+          input,
+          binding,
+          'SESSION_RESUME_REQUIRED',
+          `Adapter did not prove it resumed vendor session ${previousSession.vendorSessionId}`,
+          previousSession.vendorSessionId,
+          sessionEvidence.vendorSessionId,
+        );
+      }
+      return;
+    }
+    // Create path: the new vendor session must not already serve any batch role anywhere.
+    const claimed = this.store.findBatchRoleSessionByVendor(
+      sessionEvidence.providerOrAdapter,
+      sessionEvidence.vendorSessionId,
+    );
+    if (claimed !== null) {
+      const code =
+        claimed.role === binding.role ? 'SESSION_IDENTITY_MISMATCH' : 'CROSS_ROLE_SESSION_REUSE';
+      throw this.continuityFailure(
+        input,
+        binding,
+        code,
+        `Vendor session ${sessionEvidence.vendorSessionId} is already bound to batch ${claimed.batchId} as ${claimed.role}`,
+        undefined,
+        sessionEvidence.vendorSessionId,
+      );
+    }
+  }
+
+  /** Records append-only FAILED continuity evidence and returns the typed error to throw. */
+  private continuityFailure(
+    input: RoleInvocationInput,
+    binding: { readonly batchId: string; readonly role: 'IMPLEMENTER' | 'REVIEWER' },
+    code: SessionContinuityErrorCode,
+    message: string,
+    requestedVendorSessionId: string | undefined,
+    returnedVendorSessionId: string | undefined,
+  ): RoleInvocationError {
+    this.store.recordSessionContinuity({
+      invocationId: input.invocationId,
+      workflowId: input.workflowId,
+      batchId: binding.batchId,
+      role: binding.role,
+      adapterKind: input.resolution.assignment.expectedAdapterKind,
+      ...(requestedVendorSessionId === undefined ? {} : { requestedVendorSessionId }),
+      ...(returnedVendorSessionId === undefined ? {} : { returnedVendorSessionId }),
+      outcome: 'FAILED',
+      errorCode: code,
+      createdAt: new Date().toISOString(),
+    });
+    return new RoleInvocationError(code, message);
   }
 
   private resolveAuthorities(input: RoleInvocationInput): readonly Authority[] {
