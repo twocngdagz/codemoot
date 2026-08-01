@@ -77,3 +77,12 @@ export {
   describeContractFields,
   type ContractFieldSummary,
 } from './prompt-contract.js';
+export {
+  CONTRACT_EXAMPLES,
+  DISPOSITION_RESULT_EXAMPLE,
+  FINAL_AUDIT_RESULT_EXAMPLE,
+  IMPLEMENTATION_RESULT_EXAMPLE,
+  REFINEMENT_RESULT_EXAMPLE,
+  REVIEW_RESULT_EXAMPLE,
+  type ContractExampleKind,
+} from './examples.js';

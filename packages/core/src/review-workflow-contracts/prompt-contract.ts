@@ -7,6 +7,7 @@
 // describing a document the validator rejects.
 
 import { z } from 'zod';
+import { CONTRACT_EXAMPLES } from './examples.js';
 
 /** Unwraps `.strict().superRefine(...)` (ZodEffects) down to the underlying object. */
 function unwrapObject(schema: z.ZodTypeAny): z.ZodObject<z.ZodRawShape> | undefined {
@@ -153,6 +154,17 @@ export function buildContractInstruction(
     for (const shape of nested) {
       lines.push(`  ${shape.path}:`, ...describe(shape.fields).map((line) => `  ${line}`));
     }
+  }
+  const example = CONTRACT_EXAMPLES[contractKind as keyof typeof CONTRACT_EXAMPLES];
+  if (example !== undefined) {
+    // A proven-valid template: this exact document parses under the real validator (the
+    // test suite asserts it), so its field names can be copied rather than inferred.
+    lines.push(
+      '',
+      'A MINIMAL VALID document of this contract — copy these field names exactly, then',
+      'replace the values with your real content:',
+      JSON.stringify(example, null, 2),
+    );
   }
   lines.push(
     '',

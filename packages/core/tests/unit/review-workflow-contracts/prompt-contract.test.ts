@@ -3,6 +3,14 @@
 // to a prompt that named the contract value but not its fields.
 
 import { describe, expect, it } from 'vitest';
+import { CONTRACT_EXAMPLES } from '../../../src/review-workflow-contracts/examples.js';
+import {
+  parseDispositionResult,
+  parseFinalAuditResult,
+  parseImplementationResult,
+  parseRefinementResult,
+  parseReviewResult,
+} from '../../../src/review-workflow-contracts/parser.js';
 import {
   buildContractInstruction,
   describeContractFields,
@@ -113,5 +121,44 @@ describe('buildContractInstruction', () => {
     });
     expect(shallow.length).toBeLessThan(deep.length);
     expect(deep.length).toBeLessThan(20_000);
+  });
+});
+
+describe('contract examples round-trip through the real parsers', () => {
+  // The build-time gate: three real runs were rejected AFTER a full successful invocation
+  // (13-21 min, $3.40-$5.07 each) for field-name mistakes. Every example embedded in a
+  // prompt must parse under the exact validator that judges the agent's response, so
+  // schema drift breaks the suite instead of a paid workflow. This gate has already caught
+  // one hand-written example (a stale FINAL_AUDIT target shape).
+  const CASES = [
+    ['REFINEMENT_RESULT', parseRefinementResult],
+    ['REVIEW_RESULT', parseReviewResult],
+    ['IMPLEMENTATION_RESULT', parseImplementationResult],
+    ['DISPOSITION_RESULT', parseDispositionResult],
+    ['FINAL_AUDIT_RESULT', parseFinalAuditResult],
+  ] as const;
+
+  it.each(CASES)('%s example is valid under its real parser', (kind, parse) => {
+    const example = CONTRACT_EXAMPLES[kind];
+    expect(() => parse(JSON.stringify(example))).not.toThrow();
+  });
+
+  it('covers every contract the workflow asks an agent to produce', () => {
+    expect(Object.keys(CONTRACT_EXAMPLES).sort()).toEqual([...CASES.map(([kind]) => kind)].sort());
+  });
+
+  it('embeds the proven example in the instruction agents receive', () => {
+    const instruction = buildContractInstruction(
+      refinementResultContractSchema,
+      'REFINEMENT_RESULT',
+    );
+    expect(instruction).toContain('MINIMAL VALID document');
+    // The example inside the prompt is the same object the parser validated above.
+    expect(instruction).toContain('"refinedPlanContent"');
+    expect(instruction).toContain('"batchPlanVersionIds"');
+    const embedded = instruction.slice(instruction.indexOf('{'));
+    expect(() =>
+      parseRefinementResult(embedded.slice(0, embedded.lastIndexOf('}') + 1)),
+    ).not.toThrow();
   });
 });
