@@ -216,30 +216,60 @@ at `READY_FOR_HUMAN_VERIFICATION`. CodeMoot never merges.
 
 ## Configuration
 
-`.cowork.yml` in your project root:
+CodeMoot reads `.cowork.yml` from the project root. Full field-by-field reference:
+[docs/configuration.md](docs/configuration.md).
+
+Example using Claude Code for both roles:
 
 ```yaml
+configVersion: 3
+
 models:
-  codex-architect:
-    provider: openai
-    model: gpt-5.3-codex
-    providerMode: cli
-  codex-reviewer:
-    provider: openai
-    model: gpt-5.3-codex
-    providerMode: cli
+  implementer:
+    provider: anthropic
+    model: claude-opus-5
+    cliAdapter:
+      kind: claude
+      command: claude
+      args: []
+      timeout: 7200
+
+  reviewer:
+    provider: anthropic
+    model: claude-fable-5
+    cliAdapter:
+      kind: claude
+      command: claude
+      args: []
+      timeout: 7200
 
 roles:
-  architect:
-    model: codex-architect
+  implementer:
+    model: implementer
   reviewer:
-    model: codex-reviewer
+    model: reviewer
 
-workflow: plan-review-implement
+workflow: review-gated-batches
 mode: autonomous
+
+reviewGated:
+  identity:
+    minimumAssurance: process_attested
+    requireDifferentAdapterKinds: false
+    prohibitSharedSessions: true
+
+  commit:
+    mode: agent_authorized
+    agentMayCommit: true
 ```
 
-### `.codemootignore`
+Use complete model identifiers (`claude-opus-5`, `claude-sonnet-4-5`, …): the adapter
+verifies that the CLI reports exactly the configured model, and shorthand aliases such as
+`opus` resolve to full identifiers and would fail that evidence check. The Claude adapter
+automatically supplies print mode, stream JSON output, verbose protocol output, the
+configured model, and session-resume arguments.
+
+## `.codemootignore`
 
 Exclude files from review/cleanup/watch (gitignore syntax):
 
