@@ -84,6 +84,27 @@ export function deriveDispositionId(input: {
   return deriveScopedId('disposition', input);
 }
 
+/**
+ * Strips an OUTERMOST markdown code fence, if the response is wrapped in one.
+ *
+ * Taking the first opening fence and the LAST closing fence — rather than a non-greedy
+ * match — is deliberate: a refined plan legitimately contains fenced code blocks of its
+ * own, and stopping at the first inner ``` would truncate the document. Anything after the
+ * closing fence therefore lands inside the slice and fails validation, which is the right
+ * outcome: a response carrying two candidate documents is ambiguous, not parseable.
+ */
+function stripCodeFence(rawTranscript: string): string {
+  const lines = rawTranscript.trim().split(/\r?\n/);
+  const opening = lines.findIndex((line) => line.trimStart().startsWith('```'));
+  if (opening === -1) return rawTranscript;
+  for (let index = lines.length - 1; index > opening; index -= 1) {
+    if ((lines[index] ?? '').trim().startsWith('```')) {
+      return lines.slice(opening + 1, index).join('\n');
+    }
+  }
+  return rawTranscript;
+}
+
 function parseContract<Schema extends z.ZodTypeAny>(
   rawTranscript: string,
   schema: Schema,
@@ -92,10 +113,23 @@ function parseContract<Schema extends z.ZodTypeAny>(
   try {
     decoded = JSON.parse(rawTranscript);
   } catch {
-    throw new HandoffParseError(
-      'INVALID_JSON',
-      'The handoff must contain exactly one valid JSON value',
-    );
+    // A markdown fence is TRANSPORT, not content. Models wrap JSON in ```json
+    // nondeterministically — the same prompt fences one call and not the next — so a bare
+    // JSON.parse made every contract in the system a coin flip. A real pre-flight produced
+    // a contract-PERFECT refinement outline that was rejected for its wrapper alone.
+    //
+    // The direct parse is attempted FIRST and is unchanged, so nothing that parses today
+    // can parse differently: only previously-failing input reaches the unwrap. Whatever is
+    // inside still faces the same strict schema — this decodes an envelope, it does not
+    // relax a contract.
+    try {
+      decoded = JSON.parse(stripCodeFence(rawTranscript));
+    } catch {
+      throw new HandoffParseError(
+        'INVALID_JSON',
+        'The handoff must contain exactly one valid JSON value',
+      );
+    }
   }
   const parsed = schema.safeParse(decoded);
   if (!parsed.success) {

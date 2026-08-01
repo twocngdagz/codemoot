@@ -4357,6 +4357,10 @@ export async function reviewWorkflowPreflightCommand(options: {
           model: call.model,
           durationMs,
           responseChars: call.text.length,
+          // Reported on failure too: whether a rejection correlates with prompt size or
+          // contract type is only answerable if the failing calls carry their usage.
+          inputTokens: call.usage?.inputTokens,
+          outputTokens: call.usage?.outputTokens,
           rejection: parseError instanceof Error ? parseError.message : String(parseError),
           rejectedResponse: rejectedPath,
         });

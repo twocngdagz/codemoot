@@ -170,12 +170,15 @@ describe('review workflow handoff contracts', () => {
     ).toBe('FINAL_AUDIT_RESULT');
   });
 
-  it('rejects prose, fenced JSON, trailing text, unknown fields, and wrong versions', () => {
-    for (const raw of [
-      'APPROVED',
-      `\`\`\`json\n${JSON.stringify(reviewResult())}\n\`\`\``,
-      `${JSON.stringify(reviewResult())}\nApproved.`,
-    ]) {
+  it('rejects prose, trailing text, unknown fields, and wrong versions', () => {
+    // Fenced JSON used to be listed here as a rejection, on the reasonable stance that the
+    // agent must return one JSON object and nothing else. Measurement overturned that: the
+    // prompt already forbids fences, models fence anyway and nondeterministically, and the
+    // document inside is intact — so the rule only ever destroyed correct work at the cost
+    // of a paid invocation. A single fence carries no ambiguity, so it is now decoded; see
+    // 'a markdown code fence is transport, not content'. Everything else here still fails,
+    // including trailing text, which genuinely IS ambiguous about where the document ends.
+    for (const raw of ['APPROVED', `${JSON.stringify(reviewResult())}\nApproved.`]) {
       expect(() => parseReviewResult(raw)).toThrowError(HandoffParseError);
     }
     expect(
@@ -372,5 +375,78 @@ describe('review workflow handoff contracts', () => {
     expect(prompt).toContain('Do not use Markdown fences or add prose');
     expect(prompt).toContain('"contractKind": "REVIEW_RESULT"');
     expect(prompt).toContain('"planVersionId": "plan-v1"');
+  });
+});
+
+describe('a markdown code fence is transport, not content', () => {
+  // A real pre-flight produced a CONTRACT-PERFECT refinement outline — every field right,
+  // ordinals sequential, IDs unique — that was rejected for its wrapper alone. Models fence
+  // nondeterministically: the prompt above already says "Do not use Markdown fences", and
+  // the model fenced anyway. Instructions cannot fix this; decoding the envelope can.
+  const DOCUMENT = {
+    schemaVersion: 1,
+    contractKind: 'IMPLEMENTATION_RESULT',
+    outcome: 'COMPLETE',
+    summary: 'Implemented the batch.',
+    changedFiles: ['src/example.ts'],
+    verificationRecordIds: [],
+  };
+
+  it('accepts a fenced document, with or without a language tag', () => {
+    for (const opener of ['```json', '```JSON', '```']) {
+      const fenced = `${opener}\n${JSON.stringify(DOCUMENT, null, 2)}\n\`\`\``;
+      expect(parseImplementationResult(fenced).summary, opener).toBe('Implemented the batch.');
+    }
+  });
+
+  it('accepts a fence introduced by prose', () => {
+    const fenced = `Here is the document:\n\`\`\`json\n${JSON.stringify(DOCUMENT)}\n\`\`\``;
+    expect(parseImplementationResult(fenced).outcome).toBe('COMPLETE');
+  });
+
+  it('does NOT change how an unfenced document parses', () => {
+    // The direct parse runs first and is untouched, so nothing that parses today can parse
+    // differently — only previously-failing input ever reaches the unwrap.
+    expect(parseImplementationResult(JSON.stringify(DOCUMENT)).outcome).toBe('COMPLETE');
+  });
+
+  it('preserves a document whose own CONTENT contains code fences', () => {
+    // The refined plan is Markdown and legitimately contains ```bash blocks. Stopping at
+    // the first inner fence would truncate the document, so the OUTERMOST fence is used.
+    const withInnerFences = {
+      schemaVersion: 1,
+      contractKind: 'REFINEMENT_RESULT',
+      summary: 'Refined.',
+      refinedPlanContent: '# Plan\n\n```bash\npnpm test\n```\n\nDone.',
+      batchPlanVersionIds: ['workflow-1:batch:1:plan:1'],
+      requirementCoverage: [],
+    };
+    const unfenced = JSON.stringify(withInnerFences);
+    expect(parseRefinementResult(unfenced).refinedPlanContent).toContain('```bash');
+
+    const fenced = `\`\`\`json\n${JSON.stringify(withInnerFences, null, 2)}\n\`\`\``;
+    expect(parseRefinementResult(fenced).refinedPlanContent).toContain('```bash');
+  });
+
+  it('rejects a response carrying two candidate documents as ambiguous', () => {
+    const two = `\`\`\`json\n${JSON.stringify(DOCUMENT)}\n\`\`\`\n\nOr:\n\n\`\`\`json\n${JSON.stringify(DOCUMENT)}\n\`\`\``;
+    expect(() => parseImplementationResult(two)).toThrow(HandoffParseError);
+  });
+
+  it('still rejects a response that is not JSON at all', () => {
+    expect(() => parseImplementationResult('I could not complete this task.')).toThrow(
+      /exactly one valid JSON value/,
+    );
+    expect(() => parseImplementationResult('```\nnot json\n```')).toThrow(
+      /exactly one valid JSON value/,
+    );
+  });
+
+  it('still applies the STRICT schema to whatever the fence contained', () => {
+    // Decoding an envelope must not relax a contract: the same rejection, same path.
+    const invented = { ...DOCUMENT, notes: 'an invented key' };
+    expect(() =>
+      parseImplementationResult(`\`\`\`json\n${JSON.stringify(invented)}\n\`\`\``),
+    ).toThrow(/schema validation/);
   });
 });
