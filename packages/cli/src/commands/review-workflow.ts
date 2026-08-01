@@ -378,13 +378,29 @@ async function performRefinement(
   const outline = reviewWorkflowContracts.parseRefinementOutline(outlinePrepared.call.text);
 
   // --- Invocations 1..N: one batch plan each, staged the moment it completes.
+  // Staged drafts are re-validated on reuse rather than trusted: a resumed run replays data
+  // written by an earlier run, possibly under an earlier schema.
   const staged = new Map(
     runtime.store.workflowStore
       .listRefinementDrafts(workflowId)
-      .map((entry) => [entry.ordinal, entry.draft]),
+      .map((entry) => [
+        entry.ordinal,
+        reviewWorkflowContracts.parseStoredBatchPlanDraft(entry.draft),
+      ]),
   );
   for (const batch of outline.batches) {
-    if (staged.has(batch.ordinal)) continue; // already authored in an earlier run
+    const alreadyStaged = staged.get(batch.ordinal);
+    if (alreadyStaged !== undefined) {
+      // The outline is re-authored on every resume, so a reused draft must still belong to
+      // the batch this outline assigns to that ordinal — otherwise a regenerated outline
+      // could silently pair batch 3's plan with batch 3's new, different objective.
+      if (alreadyStaged.batchId !== batch.batchId) {
+        throw new Error(
+          `Staged batch plan for ordinal ${batch.ordinal} targets ${alreadyStaged.batchId}, but this outline expects ${batch.batchId}`,
+        );
+      }
+      continue; // already authored in an earlier run
+    }
     const batchPrepared = await runtime.roleInvocation.prepare({
       resolution: context.roles.implementer,
       workflowId,
@@ -430,16 +446,21 @@ async function performRefinement(
   }
 
   // --- Assemble the complete refinement locally and capture it exactly as before, so the
-  // kernel, identity, and validation paths are unchanged.
-  const assembled = {
-    schemaVersion: 1,
-    contractKind: 'REFINEMENT_RESULT',
+  // kernel, identity, and validation paths are unchanged. Every CROSS-BATCH invariant is
+  // established here by construction, because no single batch call can know them: criterion
+  // IDs are namespaced by batch, and coverage is derived from what the plans actually
+  // declare rather than from a guess the outline had to make before they existed.
+  const assembled = reviewWorkflowContracts.assembleRefinement({
     summary: outline.summary,
     refinedPlanContent: outline.refinedPlanContent,
-    batchPlanVersionIds: outline.batches.map((batch) => batch.batchPlanVersionId),
-    requirementCoverage: outline.requirementCoverage,
-    batchPlans: outline.batches.map((batch) => staged.get(batch.ordinal)),
-  };
+    batchPlans: outline.batches.map((batch) => {
+      const draft = staged.get(batch.ordinal);
+      if (draft === undefined) {
+        throw new Error(`Refinement is missing the batch plan for ordinal ${batch.ordinal}`);
+      }
+      return draft;
+    }),
+  });
   return runtime.service.captureRefinement({
     transcriptId: `${workflowId}:refinement:${generateId('transcript')}`,
     workflowId,
@@ -1859,10 +1880,13 @@ afterwards, so this outline stays small. For ordinal N use:
 - batchId: ${input.workflowId}:batch:N
 - batchPlanVersionId: ${input.workflowId}:batch:N:plan:1
 
-Ordinals must be sequential starting at 1. Every imported requirement must appear exactly
-once in requirementCoverage and map to at least one declared batch plan version and
-acceptance criterion. Choose the acceptance criterion IDs now; the batch responses will
-define those exact criteria.
+Ordinals must be sequential starting at 1.
+
+Do NOT map requirements to acceptance criteria here. The criteria do not exist yet, so any
+mapping made now would be a guess; each batch declares the requirements its criteria serve,
+and the coverage map is derived from those declarations. Make sure the batch objectives
+between them account for every imported requirement — that is what makes the derived
+coverage complete.
 
 Repository audit:
 ${JSON.stringify(input.repositoryAudit, null, 2)}
@@ -1902,6 +1926,14 @@ Use exactly these identifiers:
 - batchId: ${input.batch.batchId}
 - batchPlanVersionId: ${input.batch.batchPlanVersionId}
 - ordinal: ${input.batch.ordinal}
+- acceptanceCriterionId: ${input.batch.batchId}:criterion:N for the Nth criterion, numbered
+  from 1. Every batch is authored in a SEPARATE call that cannot see the others, so an
+  unnamespaced ID like "criterion-01" collides with another batch's. Use this exact form in
+  acceptanceCriteria and in every list that references a criterion.
+
+Each criterion's sourceRequirementIds must name the imported requirements it actually
+serves: the plan-wide requirement coverage map is derived from those declarations, so a
+requirement no criterion claims counts as uncovered.
 
 Objective agreed in the outline: ${input.batch.objective}
 Refinement summary: ${input.outlineSummary}

@@ -117,13 +117,8 @@ function buildRefinementContract(): string {
     batches: [
       { batchId, batchPlanVersionId: planVersionId, ordinal: 1, objective: 'Write sample.txt.' },
     ],
-    requirementCoverage: [
-      {
-        requirementId,
-        batchPlanVersionIds: [planVersionId],
-        acceptanceCriterionIds: [criterionId],
-      },
-    ],
+    // NO requirementCoverage: the outline runs before any batch plan exists, so it could
+    // only guess. Coverage is derived from the authored plans at assembly.
   };
   const batchPlans = [
     {

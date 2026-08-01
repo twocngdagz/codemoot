@@ -294,7 +294,10 @@ export const refinementOutlineContractSchema = z
           .strict(),
       )
       .min(1),
-    requirementCoverage: z.array(requirementCoverageSchema),
+    // NO requirementCoverage: the outline is authored before a single batch plan exists,
+    // so any coverage it produced was necessarily a guess — in run 9 all 57 criterion IDs
+    // it invented matched nothing, because the criteria had not been written yet. Coverage
+    // is DERIVED from the authored plans at assembly instead (see assembly.ts).
   })
   .strict()
   .superRefine((value, context) => {

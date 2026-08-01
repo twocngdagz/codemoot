@@ -116,13 +116,6 @@ export const REFINEMENT_OUTLINE_RESULT_EXAMPLE = {
       objective: 'What this batch delivers, in one sentence.',
     },
   ],
-  requirementCoverage: [
-    {
-      requirementId: 'requirement-abc123',
-      batchPlanVersionIds: ['workflow-1:batch:1:plan:1'],
-      acceptanceCriterionIds: ['criterion-1'],
-    },
-  ],
 } as const;
 
 // The hardest contract in the system: 19 fields, a discriminated union, and four
@@ -146,16 +139,20 @@ export const BATCH_PLAN_RESULT_EXAMPLE = {
     expectedBehaviour: ['What is observably true once this batch lands.'],
     acceptanceCriteria: [
       {
-        acceptanceCriterionId: 'criterion-1',
+        // Namespaced by batch: every batch is authored in a separate call that cannot see
+        // the others, so a bare "criterion-01" collides with the next batch's.
+        acceptanceCriterionId: 'workflow-1:batch:1:criterion:1',
         kind: 'TECHNICAL',
         statement: 'What must be true.',
         required: true,
         passCondition: 'How to tell it is true.',
+        // The requirements this criterion serves — the plan-wide coverage map is derived
+        // from these, so they must be real imported requirement IDs.
         sourceRequirementIds: ['requirement-abc123'],
       },
     ],
     // Every criterion must ALSO appear in the list matching its `kind`.
-    technicalAcceptanceCriteria: ['criterion-1'],
+    technicalAcceptanceCriteria: ['workflow-1:batch:1:criterion:1'],
     userFacingAcceptanceCriteria: [],
     cliAcceptanceCriteria: [],
     browserAcceptanceCriteria: {
@@ -168,7 +165,7 @@ export const BATCH_PLAN_RESULT_EXAMPLE = {
         arguments: ['test'],
         workingDirectory: '.',
         verificationType: 'test',
-        relatedCriterionIds: ['criterion-1'],
+        relatedCriterionIds: ['workflow-1:batch:1:criterion:1'],
       },
     ],
     manualVerification: [],

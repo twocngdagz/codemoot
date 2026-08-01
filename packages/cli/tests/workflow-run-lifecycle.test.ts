@@ -7,7 +7,7 @@
 //
 // 1. One batch through the complete lifecycle: refinement -> plan review APPROVED ->
 //    implementation (real commit) -> code review round 1 NEEDS_REVISION (one blocking
-//    merge-blocking-criterion finding; see CODE_REVIEW_NEEDS_REVISION_STEP for why not high)
+//    merge-blocking-criterion finding; see codeReviewNeedsRevisionStep for why not high)
 //    -> correction pass (real fix commit + implementer-authored DISPOSITION_RESULT) ->
 //    code review round 2 APPROVED -> verification command + reviewer acceptance -> final
 //    audit APPROVED -> merge gate -> gated push to the bare remote -> workflow-level audit
@@ -38,7 +38,13 @@ const FAKE_CLAUDE = fileURLToPath(new URL('./fixtures/fake-claude-lifecycle.mjs'
 const FAKE_CODEX = fileURLToPath(new URL('./fixtures/fake-codex-lifecycle.mjs', import.meta.url));
 
 const PLAN_CONTENT = '## Deliver the sample feature\n\nWrite the sample output file.\n';
+// What the MODEL returns in its batch plan. Assembly namespaces every criterion ID by its
+// batch, so anything downstream — findings, final-audit checks — must reference the
+// materialized form instead. Keeping the two distinct is what proves the rename works.
 const CRITERION_ID = 'criterion-sample-output';
+function materializedCriterionId(workflowId: string): string {
+  return `${workflowId}:batch:1:criterion:1`;
+}
 
 function git(projectDir: string, args: readonly string[]): string {
   return execFileSync('git', [...args], { cwd: projectDir, encoding: 'utf8' }).trim();
@@ -136,7 +142,8 @@ function buildRefinementSteps(
       ordinal: plan.ordinal,
       objective: plan.objective,
     })),
-    requirementCoverage: full.requirementCoverage,
+    // NO requirementCoverage: the outline is authored before any batch plan exists, so it
+    // could only guess. Coverage is derived from the batch plans at assembly.
   };
   return [
     { response: outline },
@@ -284,33 +291,35 @@ const PLAN_REVIEW_APPROVED_STEP = {
 // every OPEN critical/high finding as unresolved even after its disposition was
 // reviewer-ACCEPTED — so a high-finding correction loop can never reach
 // READY_FOR_HUMAN_VERIFICATION without an explicit accept-risk decision.
-const CODE_REVIEW_NEEDS_REVISION_STEP = {
-  response: {
-    schemaVersion: 1,
-    contractKind: 'REVIEW_RESULT',
-    target: '{{TARGET}}',
-    verdict: 'NEEDS_REVISION',
-    summary: 'The committed sample.txt content does not match the planned behaviour.',
-    findings: [
-      {
-        findingKey: 'SAMPLE-CONTENT-1',
-        severity: 'medium',
-        acceptanceCriterionId: CRITERION_ID,
-        category: 'correctness',
-        title: 'sample.txt carries placeholder content',
-        description: 'The committed file content does not match the expected behaviour.',
-        repositoryEvidence: [
-          { kind: 'FILE', location: 'sample.txt', description: 'Observed committed content.' },
-        ],
-        affectedFiles: ['sample.txt'],
-        expectedResult: 'sample.txt contains the corrected content.',
-        observedResult: 'sample.txt contains placeholder content.',
-        requiredAction: 'Rewrite sample.txt with the corrected content and commit the fix.',
-        occurrenceLinks: [],
-      },
-    ],
-  },
-};
+function codeReviewNeedsRevisionStep(workflowId: string): Record<string, unknown> {
+  return {
+    response: {
+      schemaVersion: 1,
+      contractKind: 'REVIEW_RESULT',
+      target: '{{TARGET}}',
+      verdict: 'NEEDS_REVISION',
+      summary: 'The committed sample.txt content does not match the planned behaviour.',
+      findings: [
+        {
+          findingKey: 'SAMPLE-CONTENT-1',
+          severity: 'medium',
+          acceptanceCriterionId: materializedCriterionId(workflowId),
+          category: 'correctness',
+          title: 'sample.txt carries placeholder content',
+          description: 'The committed file content does not match the expected behaviour.',
+          repositoryEvidence: [
+            { kind: 'FILE', location: 'sample.txt', description: 'Observed committed content.' },
+          ],
+          affectedFiles: ['sample.txt'],
+          expectedResult: 'sample.txt contains the corrected content.',
+          observedResult: 'sample.txt contains placeholder content.',
+          requiredAction: 'Rewrite sample.txt with the corrected content and commit the fix.',
+          occurrenceLinks: [],
+        },
+      ],
+    },
+  };
+}
 
 const CODE_REVIEW_APPROVED_STEP = {
   response: {
@@ -351,7 +360,7 @@ function finalAuditApprovedStep(workflowId: string): Record<string, unknown> {
       ],
       acceptanceCriterionChecks: [
         {
-          subjectId: CRITERION_ID,
+          subjectId: materializedCriterionId(workflowId),
           status: 'PASSED',
           explanation: 'test -f sample.txt exits 0 at the reviewed commit.',
           evidence: [
@@ -495,7 +504,7 @@ describe('codemoot workflow run lifecycle (real command, scenario-driven adapter
       ]);
       writeSteps(projectDir, 'codex', [
         PLAN_REVIEW_APPROVED_STEP,
-        CODE_REVIEW_NEEDS_REVISION_STEP,
+        codeReviewNeedsRevisionStep(workflowId),
         CODE_REVIEW_APPROVED_STEP,
         VERIFICATION_ACCEPT_STEP,
         finalAuditApprovedStep(workflowId),

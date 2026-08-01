@@ -5,6 +5,7 @@ import type { z } from 'zod';
 import type { Finding, FindingDisposition } from '../review-workflow/types.js';
 import {
   batchPlanContractSchema,
+  batchPlanDraftSchema,
   dispositionResultContractSchema,
   finalAuditResultContractSchema,
   implementationResultContractSchema,
@@ -158,6 +159,27 @@ export function parseBatchPlanResult(
   rawTranscript: string,
 ): z.output<typeof batchPlanContractSchema> {
   return parseContract(rawTranscript, batchPlanContractSchema);
+}
+
+/**
+ * Re-validates a STAGED batch plan on reuse.
+ *
+ * A resumed refinement replays drafts written by an earlier run, and replaying stored data
+ * unchecked is how a schema change silently resurrects a document the current validator
+ * would reject. The draft was valid when written; this proves it is still valid now.
+ */
+export function parseStoredBatchPlanDraft(draft: unknown): z.output<typeof batchPlanDraftSchema> {
+  const parsed = batchPlanDraftSchema.safeParse(draft);
+  if (!parsed.success) {
+    const firstIssue = parsed.error.issues[0];
+    throw new HandoffParseError(
+      'SCHEMA_INVALID',
+      `A staged batch plan is no longer valid at ${firstIssue?.path.join('.') ?? 'root'}: ${
+        firstIssue?.message ?? 'Unknown schema error'
+      }`,
+    );
+  }
+  return parsed.data;
 }
 
 export function parseReviewResult(rawTranscript: string): ReviewResultContract {

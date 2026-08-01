@@ -36,6 +36,7 @@ export {
   parseImplementationResult,
   parseBatchPlanResult,
   parseRefinementOutline,
+  parseStoredBatchPlanDraft,
   parseRefinementResult,
   parseReviewResult,
   requireExpectedFindingIds,
@@ -82,6 +83,13 @@ export {
   findUndescribedContractPaths,
   type ContractFieldSummary,
 } from './prompt-contract.js';
+export {
+  assembleRefinement,
+  deriveCriterionId,
+  deriveRequirementCoverage,
+  namespaceCriterionIds,
+  type RefinementAssemblyInput,
+} from './assembly.js';
 export {
   BATCH_PLAN_RESULT_EXAMPLE,
   CONTRACT_EXAMPLES,
