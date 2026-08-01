@@ -7,6 +7,34 @@ command between ordinary phases. It is a targeted extension: every phase calls t
 coordinators, so all identity, session-continuity, receipt-idempotency, and merge-gate
 guarantees apply unchanged. **CodeMoot never merges.**
 
+## Pre-flight: check the contracts before spending a run
+```bash
+codemoot workflow preflight
+```
+One real model call, judged by the real parser, in about a minute. It builds the SAME
+instruction the workflow builds — from the same zod schema — sends it once, and hands the
+answer to the SAME parser that would reject it mid-run. No workflow, no outline, no branch,
+no database, no state. Exit code is non-zero on failure, so it chains:
+
+```bash
+codemoot workflow preflight && codemoot workflow run --plan <plan.md> --background
+```
+
+`--contract <kind>` selects one (default `BATCH_PLAN_RESULT`, the one that fails most) or
+`all` to check every contract an agent is asked to produce. A rejected response is written to
+`.cowork/preflight/<KIND>.rejected.txt` — the point is to see what the model actually
+produced, not just that it was refused. `--timeout` defaults to 900s, deliberately shorter
+than `cliAdapter.timeout`: a gate must fail fast.
+
+This exists because four contract-shape defects — a wrong `contractKind`, missing top-level
+fields, undescribed nested shapes, and an undescribed discriminated union — were each
+discovered only *after* a successful 13-43 minute invocation costing $2-5. Every one of them
+would have surfaced here in about a minute.
+
+What it does **not** prove: prompt parity beyond the instruction block (real prompts also
+carry the plan and repository audit), cross-batch rules that only exist across several
+documents, and reliability — one valid document is not proof the next one is valid.
+
 ## Branch lifecycle
 A clean worktree is required. The base branch and immutable base SHA are recorded, work
 happens on `codemoot/<plan-slug>-<short-id>` for the whole workflow, the active branch is

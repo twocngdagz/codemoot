@@ -4150,3 +4150,229 @@ export async function reviewWorkflowDecideCommand(
     });
   });
 }
+
+// ---------------------------------------------------------------------------
+// Contract pre-flight (codemoot workflow preflight)
+// ---------------------------------------------------------------------------
+
+/**
+ * ONE real model call per contract, handed to the REAL parser.
+ *
+ * Four contract-shape defects each cost a full paid invocation to discover — 13-43 minutes
+ * and $2-5 apiece — because the only way to learn that a prompt produced an unparseable
+ * document was to run the workflow. The pre-flight closes that loop in about a minute: it
+ * builds the SAME instruction the workflow builds (from the same schema), makes one call,
+ * and hands the answer to the SAME parser that would reject it mid-run.
+ *
+ * This is the `--dry-run` that was scoped earlier and abandoned, on the grounds that a
+ * synthetic response could not satisfy the cross-field superRefines. That premise was
+ * wrong: nothing needs to be synthesised, because a real model answers the question
+ * directly. No workflow, no outline, no branch, no database, no state.
+ *
+ * What it does NOT prove: prompt parity beyond the instruction block (the real prompts also
+ * carry the plan and repository audit), cross-batch rules that only exist across several
+ * documents, and reliability — one valid document is not proof the next one is valid.
+ */
+interface PreflightCase {
+  readonly contractKind: string;
+  readonly schema: Parameters<typeof reviewWorkflowContracts.buildContractInstruction>[0];
+  readonly parse: (rawTranscript: string) => unknown;
+  readonly role: 'implementer' | 'reviewer';
+  /** A synthetic scenario: the CONTENT is irrelevant, only the document shape is tested. */
+  readonly task: string;
+}
+
+// REFINEMENT_RESULT is absent deliberately — it is assembled locally from the outline and
+// the per-batch plans, so no agent is ever asked to produce one.
+// Exported so the test suite can assert PARITY by identity: each case must carry the very
+// schema the prompt is generated from and the very parser that judges a real run. A
+// pre-flight against a lookalike schema would pass while the workflow still failed.
+export const PREFLIGHT_CASES: readonly PreflightCase[] = [
+  {
+    contractKind: 'BATCH_PLAN_RESULT',
+    schema: reviewWorkflowContracts.batchPlanContractSchema,
+    parse: reviewWorkflowContracts.parseBatchPlanResult,
+    role: 'implementer',
+    task: [
+      'Author ONE batch plan for the hypothetical batch below. The CONTENT does not matter:',
+      'this is a contract pre-flight, and only the document shape is being checked.',
+      '',
+      'Batch: add a --version flag to a command-line tool.',
+      '- batchId: preflight:batch:1',
+      '- batchPlanVersionId: preflight:batch:1:plan:1',
+      '- ordinal: 1',
+      '- The only requirement to cover is: preflight-requirement-1',
+    ].join('\n'),
+  },
+  {
+    contractKind: 'REFINEMENT_OUTLINE_RESULT',
+    schema: reviewWorkflowContracts.refinementOutlineContractSchema,
+    parse: reviewWorkflowContracts.parseRefinementOutline,
+    role: 'implementer',
+    task: [
+      'Produce a refinement OUTLINE for the hypothetical plan below. Do not write batch',
+      'bodies — the outline carries batch identity only. Content does not matter.',
+      '',
+      'Plan: add a --version flag, then document it.',
+      '- Use batchId preflight:batch:N and batchPlanVersionId preflight:batch:N:plan:1',
+      '- Exactly two batches, ordinals 1 and 2',
+      '- The only requirement to cover is: preflight-requirement-1',
+    ].join('\n'),
+  },
+  {
+    contractKind: 'REVIEW_RESULT',
+    schema: reviewWorkflowContracts.reviewResultContractSchema,
+    parse: reviewWorkflowContracts.parseReviewResult,
+    role: 'reviewer',
+    task: [
+      'Produce a plan review with verdict APPROVED and no findings. Content does not matter.',
+      'Echo this target verbatim:',
+      JSON.stringify(
+        {
+          kind: 'PLAN',
+          planVersionId: 'preflight:batch:1:plan:1',
+          planContentHash: 'a'.repeat(64),
+          repositoryContextSha: 'b'.repeat(40),
+        },
+        null,
+        2,
+      ),
+    ].join('\n'),
+  },
+  {
+    contractKind: 'IMPLEMENTATION_RESULT',
+    schema: reviewWorkflowContracts.implementationResultContractSchema,
+    parse: reviewWorkflowContracts.parseImplementationResult,
+    role: 'implementer',
+    task: [
+      'Report a COMPLETE implementation that changed exactly one file, src/example.ts, and',
+      'produced no verification records. Content does not matter.',
+    ].join('\n'),
+  },
+  {
+    contractKind: 'DISPOSITION_RESULT',
+    schema: reviewWorkflowContracts.dispositionResultContractSchema,
+    parse: reviewWorkflowContracts.parseDispositionResult,
+    role: 'implementer',
+    task: [
+      'Report a correction pass that FIXED exactly one finding, preflight-finding-1, against',
+      `commit ${'c'.repeat(40)}. Content does not matter.`,
+    ].join('\n'),
+  },
+  {
+    contractKind: 'FINAL_AUDIT_RESULT',
+    schema: reviewWorkflowContracts.finalAuditResultContractSchema,
+    parse: reviewWorkflowContracts.parseFinalAuditResult,
+    role: 'reviewer',
+    task: [
+      'Produce an APPROVED final audit with no findings, covering requirement',
+      'preflight-requirement-1 and criterion preflight-criterion-1, both PASSED.',
+      'Content does not matter. Echo this target verbatim:',
+      JSON.stringify(
+        {
+          kind: 'FINAL_AUDIT',
+          reviewedCommitSha: 'd'.repeat(40),
+          repositoryContextSha: 'd'.repeat(40),
+          reviewRangeEvidenceId: 'preflight:batch:1:range:1',
+          patchHash: 'e'.repeat(64),
+          refinedPlanVersionId: 'preflight:refined-plan:1',
+        },
+        null,
+        2,
+      ),
+    ].join('\n'),
+  },
+];
+
+/**
+ * A pre-flight must fail FAST: the configured `cliAdapter.timeout` is sized for a real
+ * refinement (hours), which would turn a gate into a hang.
+ */
+const PREFLIGHT_TIMEOUT_SECONDS = 900;
+
+export async function reviewWorkflowPreflightCommand(options: {
+  readonly contract?: string;
+  readonly timeout?: number;
+}): Promise<void> {
+  const projectDir = process.cwd();
+  const config = loadConfig({ projectDir });
+  const registry = ModelRegistry.fromConfig(config, projectDir);
+  const selected = options.contract ?? 'BATCH_PLAN_RESULT';
+  const cases =
+    selected === 'all'
+      ? PREFLIGHT_CASES
+      : PREFLIGHT_CASES.filter((entry) => entry.contractKind === selected);
+  if (cases.length === 0) {
+    throw new Error(
+      `Unknown contract "${selected}". Choose one of: ${PREFLIGHT_CASES.map((entry) => entry.contractKind).join(', ')}, or "all".`,
+    );
+  }
+  const timeoutSeconds = options.timeout ?? PREFLIGHT_TIMEOUT_SECONDS;
+  const outputDir = resolve(projectDir, '.cowork', 'preflight');
+
+  const results: unknown[] = [];
+  for (const entry of cases) {
+    const alias = config.roles[entry.role]?.model;
+    if (alias === undefined) {
+      results.push({
+        contract: entry.contractKind,
+        ok: false,
+        error: `No "${entry.role}" role is configured in .cowork.yml`,
+      });
+      continue;
+    }
+    const adapter = registry.getAdapter(alias);
+    // The instruction is generated from the SAME schema the parser validates against, so a
+    // pass here means the prompt and the validator genuinely agree.
+    const prompt = `${entry.task}\n\n${reviewWorkflowContracts.buildContractInstruction(
+      entry.schema,
+      entry.contractKind,
+    )}`;
+    const startedAt = Date.now();
+    try {
+      const call = await adapter.send(prompt, { timeout: timeoutSeconds * 1000 });
+      const durationMs = Date.now() - startedAt;
+      try {
+        entry.parse(call.text);
+        results.push({
+          contract: entry.contractKind,
+          ok: true,
+          role: entry.role,
+          model: call.model,
+          durationMs,
+          responseChars: call.text.length,
+          inputTokens: call.usage?.inputTokens,
+          outputTokens: call.usage?.outputTokens,
+        });
+      } catch (parseError) {
+        // The whole point is to see WHAT the model produced: a blind rejection is the
+        // failure mode this command exists to end.
+        mkdirSync(outputDir, { recursive: true });
+        const rejectedPath = resolve(outputDir, `${entry.contractKind}.rejected.txt`);
+        writeFileSync(rejectedPath, call.text);
+        results.push({
+          contract: entry.contractKind,
+          ok: false,
+          role: entry.role,
+          model: call.model,
+          durationMs,
+          responseChars: call.text.length,
+          rejection: parseError instanceof Error ? parseError.message : String(parseError),
+          rejectedResponse: rejectedPath,
+        });
+      }
+    } catch (invocationError) {
+      results.push({
+        contract: entry.contractKind,
+        ok: false,
+        role: entry.role,
+        durationMs: Date.now() - startedAt,
+        error: invocationError instanceof Error ? invocationError.message : String(invocationError),
+      });
+    }
+  }
+
+  const ok = results.every((result) => (result as { ok: boolean }).ok);
+  printJson({ ok, timeoutSeconds, results });
+  if (!ok) process.exitCode = 1;
+}

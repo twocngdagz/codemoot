@@ -61,6 +61,7 @@ import {
   reviewWorkflowJobsShowCommand,
   reviewWorkflowLogsCommand,
   reviewWorkflowPauseCommand,
+  reviewWorkflowPreflightCommand,
   reviewWorkflowRefineCommand,
   reviewWorkflowResumeCommand,
   reviewWorkflowRunCommand,
@@ -475,6 +476,18 @@ reviewWorkflow
   )
   .option('--id <workflow-id>', 'Explicit workflow ID')
   .action(reviewWorkflowRunCommand);
+
+reviewWorkflow
+  .command('preflight')
+  .description(
+    'Contract pre-flight: one real model call per contract, parsed by the real parser (~1 min)',
+  )
+  .option(
+    '--contract <kind>',
+    'Contract to check, or "all" (default: BATCH_PLAN_RESULT — the one that fails most)',
+  )
+  .option('--timeout <seconds>', 'Per-call timeout in seconds (default: 900)', positiveInteger)
+  .action(reviewWorkflowPreflightCommand);
 
 reviewWorkflow
   .command('cancel')
