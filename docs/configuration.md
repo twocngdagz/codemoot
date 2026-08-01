@@ -43,8 +43,10 @@ A map of **aliases** (any name) to model configurations. Roles reference these a
 | `envAllowlist` | string[] | optional | Extra environment variables passed to the CLI subprocess (everything else is filtered). E.g. `[MAX_THINKING_TOKENS]` lets `export MAX_THINKING_TOKENS=31999` deepen Claude's thinking |
 
 **Reasoning "level" cheat-sheet:**
-- **Claude:** choose the model tier (`claude-opus-5` > `claude-sonnet-5` > `claude-sonnet-4-5`)
-  and optionally allowlist `MAX_THINKING_TOKENS` (e.g. 31999 high / 16000 medium).
+- **Claude:** append `[--effort, <level>]` to `args` — valid levels, fast → smart:
+  `low | medium | high | xhigh | max`. Model tier is the other lever
+  (`claude-opus-5` > `claude-sonnet-5` > `claude-sonnet-4-5`); `MAX_THINKING_TOKENS` via
+  `envAllowlist` remains available for explicit thinking budgets.
 - **Codex:** append `-c model_reasoning_effort=high|medium|low` to `args`.
 
 ## `roles` — role assignments (required)
