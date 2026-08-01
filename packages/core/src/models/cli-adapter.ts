@@ -433,6 +433,8 @@ export class CliAdapter implements CliBridge {
         if (settled) return;
         settled = true;
         cleanup();
+        // Preserve whatever the CLI emitted before failing (see ModelError.partialOutput).
+        err.partialOutput = { stdout, stderr };
         reject(err);
       };
 

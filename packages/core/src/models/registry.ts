@@ -154,6 +154,9 @@ function createModelAdapter(config: ModelConfig, projectDir?: string): ModelAdap
       model: config.model,
       projectDir,
       timeout: (adapterConfig?.timeout ?? config.timeout) * 1000,
+      ...(adapterConfig?.idleTimeout === undefined
+        ? {}
+        : { idleTimeout: adapterConfig.idleTimeout * 1000 }),
       envAllowlist: adapterConfig?.envAllowlist,
     });
   }

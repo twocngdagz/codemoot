@@ -4,6 +4,7 @@
 import { describe, expect, it } from 'vitest';
 import { loadConfig } from '../../../src/config/loader.js';
 import { listPresets } from '../../../src/config/presets.js';
+import { validateConfig } from '../../../src/config/schema.js';
 import { createReviewWorkflowConfigurationSnapshot } from '../../../src/review-workflow-identity/service.js';
 
 describe('review-gated preset', () => {
@@ -72,5 +73,43 @@ describe('autonomous limits configuration', () => {
       expect(Number.isFinite(value)).toBe(true);
       expect(value).toBeGreaterThan(0);
     }
+  });
+
+  it('accepts a configurable cliAdapter idleTimeout for deep-reasoning runs', () => {
+    const config = validateConfig({
+      configVersion: 3,
+      workflow: 'review-gated-batches',
+      models: {
+        implementer: {
+          provider: 'anthropic',
+          model: 'claude-opus-5',
+          cliAdapter: {
+            kind: 'claude',
+            command: 'claude',
+            args: ['--effort', 'max'],
+            timeout: 7200,
+            idleTimeout: 900,
+          },
+        },
+        reviewer: {
+          provider: 'openai',
+          model: 'codex-supported',
+          cliAdapter: { kind: 'codex', command: 'codex', args: ['exec'], timeout: 600 },
+        },
+      },
+      roles: { implementer: { model: 'implementer' }, reviewer: { model: 'reviewer' } },
+      reviewGated: {
+        identity: {
+          minimumAssurance: 'process_attested',
+          requireDifferentAdapterKinds: true,
+          prohibitSharedSessions: true,
+        },
+        commit: { mode: 'either', agentMayCommit: true },
+      },
+      debate: { enabled: false },
+    });
+    expect(config.models.implementer?.cliAdapter?.idleTimeout).toBe(900);
+    // Optional: omitting it keeps the adapter default.
+    expect(config.models.reviewer?.cliAdapter?.idleTimeout).toBeUndefined();
   });
 });

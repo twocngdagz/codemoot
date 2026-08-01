@@ -20,6 +20,11 @@ export const cliAdapterConfigSchema = z.object({
   command: z.string().min(1),
   args: z.array(z.string()),
   timeout: z.number().positive(),
+  /**
+   * Seconds the CLI may produce NO output before it is killed. Deep reasoning (high
+   * `--effort`, large prompts) can think silently for minutes, so this must be raisable.
+   */
+  idleTimeout: z.number().positive().optional(),
   versionConstraint: z.string().min(1).optional(),
   outputFile: z.string().optional(),
   maxOutputBytes: z.number().int().positive().optional(),

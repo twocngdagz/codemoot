@@ -347,3 +347,50 @@ describe('review workflow CLI prompts', () => {
     for (const phrase of phrases) expect(prompt).toContain(phrase);
   });
 });
+
+describe('contract envelope instructions', () => {
+  // A prompt that names the contract VALUE but never the FIELD lets the model guess `kind`
+  // — a 21-minute, $5 rejection at refinement scale. Every builder must spell it out.
+  const CONTRACT_PROMPTS: readonly { name: string; prompt: string; kind: string }[] = [
+    {
+      name: 'refinement',
+      kind: 'REFINEMENT_RESULT',
+      prompt: buildRefinementPrompt({
+        workflowId: 'workflow-1',
+        repositoryAudit: { headSha: 'a'.repeat(40) },
+        generalPlanContent: '## Requirement\n\nDo the thing.\n',
+        requirements: [
+          { requirementId: 'req-1', sourceReference: '## Requirement', statement: 'Do the thing.' },
+        ],
+      }),
+    },
+    {
+      name: 'plan review',
+      kind: 'REVIEW_RESULT',
+      prompt: buildPlanReviewPrompt({
+        workflowId: 'workflow-1',
+        batchPlan: PLAN_FIXTURE,
+        acceptanceCriteria: CRITERIA_FIXTURE,
+      }),
+    },
+    {
+      name: 'implementation',
+      kind: 'IMPLEMENTATION_RESULT',
+      prompt: buildImplementationPrompt({
+        workflowId: 'workflow-1',
+        batchPlan: PLAN_FIXTURE,
+        acceptanceCriteria: CRITERIA_FIXTURE,
+        originalBatchBaseSha: 'b'.repeat(40),
+        creationMode: 'AGENT_AUTHORIZED',
+      }),
+    },
+  ];
+
+  it.each(CONTRACT_PROMPTS)('$name names the contractKind field explicitly', ({ prompt, kind }) => {
+    expect(prompt).toContain('"contractKind"');
+    expect(prompt).toContain(`"contractKind": "${kind}"`);
+    expect(prompt).toContain('"schemaVersion": 1');
+    // And warns against the plausible wrong guesses.
+    expect(prompt).toContain('NOT "kind"');
+  });
+});

@@ -9,6 +9,8 @@ export interface CliAdapterConfig {
   command: string;
   args: string[];
   timeout: number;
+  /** Seconds of NO output before the CLI is killed (deep reasoning needs headroom). */
+  idleTimeout?: number;
   versionConstraint?: string;
   outputFile?: string;
   maxOutputBytes?: number;

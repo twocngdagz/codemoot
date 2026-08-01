@@ -49,3 +49,6 @@ coverage/
 
 # Logs
 *.log
+
+# MCP doc bundle is regenerated on every build from docs/ + README.md
+packages/mcp-server/src/generated/

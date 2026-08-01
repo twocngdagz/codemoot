@@ -127,6 +127,7 @@ export class ClaudeCliAdapter implements CliBridge {
   private readonly baseArgs: readonly string[];
   private readonly projectDir: string;
   private readonly defaultTimeout: number;
+  private readonly defaultIdleTimeout: number;
   private readonly envAllowlist: readonly string[];
 
   constructor(config: {
@@ -135,6 +136,7 @@ export class ClaudeCliAdapter implements CliBridge {
     model: string;
     projectDir?: string;
     timeout?: number;
+    idleTimeout?: number;
     envAllowlist?: readonly string[];
   }) {
     this.command = config.command ?? defaultClaudeCommand();
@@ -142,6 +144,7 @@ export class ClaudeCliAdapter implements CliBridge {
     this.model = config.model;
     this.projectDir = resolve(config.projectDir ?? process.cwd());
     this.defaultTimeout = config.timeout ?? DEFAULT_TIMEOUT_MS;
+    this.defaultIdleTimeout = config.idleTimeout ?? DEFAULT_IDLE_TIMEOUT_MS;
     this.envAllowlist = config.envAllowlist ?? [];
   }
 
@@ -185,7 +188,7 @@ export class ClaudeCliAdapter implements CliBridge {
       provider: 'anthropic',
       model: this.model,
       timeout: options?.timeout ?? this.defaultTimeout,
-      idleTimeout: options?.idleTimeout ?? DEFAULT_IDLE_TIMEOUT_MS,
+      idleTimeout: options?.idleTimeout ?? this.defaultIdleTimeout,
       maxCaptureBytes: Math.max(
         MAX_OUTPUT_BYTES * RAW_OUTPUT_MULTIPLIER,
         maxOutputBytes * RAW_OUTPUT_MULTIPLIER,
@@ -335,6 +338,9 @@ async function runClaudeProcess(input: {
       if (settled) return;
       settled = true;
       cleanup();
+      // Preserve whatever the CLI emitted before failing — the timeout paths would
+      // otherwise discard the entire partial transcript.
+      error.partialOutput = { stdout, stderr };
       rejectResult(error);
     };
     const elapsedDescription = (): string =>

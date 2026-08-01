@@ -11,6 +11,13 @@ export class ConfigError extends Error {
 }
 
 export class ModelError extends Error {
+  /**
+   * Output the subprocess produced before it failed. A timeout kill is exactly the case
+   * where this matters most: without it the audit records an empty response and nobody can
+   * tell how far the agent actually got.
+   */
+  partialOutput?: { readonly stdout: string; readonly stderr: string };
+
   constructor(
     message: string,
     public readonly provider?: string,

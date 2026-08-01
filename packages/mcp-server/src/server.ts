@@ -16,6 +16,14 @@ import type { ProjectConfig } from '@codemoot/core';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js';
+import {
+  CONFIG_TOOL_DEFINITIONS,
+  handleConfigGet,
+  handleConfigInit,
+  handleConfigSet,
+  handleConfigValidate,
+  handleDocs,
+} from './tools/config.js';
 import { handleCost, handleDebate, handleMemory, handlePlan, handleReview } from './tools/index.js';
 import {
   WORKFLOW_TOOL_DEFINITIONS,
@@ -175,7 +183,9 @@ export async function startServer(): Promise<void> {
 
   // Register tool listing handler (the original five tools plus the additive workflow tools)
   server.setRequestHandler(ListToolsRequestSchema, async () => {
-    return { tools: [...TOOL_DEFINITIONS, ...WORKFLOW_TOOL_DEFINITIONS] };
+    return {
+      tools: [...TOOL_DEFINITIONS, ...WORKFLOW_TOOL_DEFINITIONS, ...CONFIG_TOOL_DEFINITIONS],
+    };
   });
 
   // Register tool call handler
@@ -200,6 +210,21 @@ export async function startServer(): Promise<void> {
         }
         case 'codemoot_cost': {
           return await handleCost(costStore, args);
+        }
+        case 'codemoot_docs': {
+          return handleDocs(args);
+        }
+        case 'codemoot_config_get': {
+          return handleConfigGet(projectDir, args);
+        }
+        case 'codemoot_config_validate': {
+          return handleConfigValidate(projectDir, args);
+        }
+        case 'codemoot_config_init': {
+          return handleConfigInit(projectDir, args);
+        }
+        case 'codemoot_config_set': {
+          return handleConfigSet(projectDir, args);
         }
         // Workflow tools build their runtime lazily (the Git repository handle is only
         // valid inside a repository) and return STRUCTURED errors so programmatic clients

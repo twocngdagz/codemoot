@@ -17,6 +17,7 @@ import type {
   InvocationIdentity,
   SessionIdentity,
 } from '../review-workflow/types.js';
+import { ModelError } from '../utils/errors.js';
 import type { ResolvedRoleAdapter } from './role-manager.js';
 
 export const ROLE_INVOCATION_ERROR_CODES = [
@@ -319,8 +320,16 @@ export class RoleInvocationService {
   ): string | undefined {
     const finished = new Date();
     const message = error instanceof Error ? error.message : String(error);
+    // A killed subprocess (idle/absolute timeout) still produced work: persist whatever it
+    // emitted so the audit shows how far the agent actually got.
+    const partial = error instanceof ModelError ? error.partialOutput : undefined;
     const { text: redactedPrompt, redactions: promptRedactions } = redactSecrets(input.prompt);
-    const { text: redactedStderr, redactions: stderrRedactions } = redactSecrets(stderr);
+    const { text: redactedStderr, redactions: stderrRedactions } = redactSecrets(
+      stderr.length > 0 ? stderr : (partial?.stderr ?? ''),
+    );
+    const { text: redactedStdout, redactions: stdoutRedactions } = redactSecrets(
+      partial?.stdout ?? '',
+    );
     try {
       this.store.recordInvocationAudit({
         invocationId: `${input.invocationId}:failure:${finished.toISOString()}`,
@@ -336,10 +345,11 @@ export class RoleInvocationService {
         sessionOutcome: 'NONE',
         prompt: redactedPrompt,
         promptHash: sha256(input.prompt),
-        response: '',
-        responseHash: sha256(''),
-        redactionCount: promptRedactions + stderrRedactions,
+        response: redactedStdout,
+        responseHash: sha256(partial?.stdout ?? ''),
+        redactionCount: promptRedactions + stderrRedactions + stdoutRedactions,
         ...(redactedStderr.length === 0 ? {} : { rawStderr: redactedStderr }),
+        ...(redactedStdout.length === 0 ? {} : { rawStdout: redactedStdout }),
         failure: { classification: classifyInvocationFailure(message), message },
         ...(gitBefore === undefined
           ? {}

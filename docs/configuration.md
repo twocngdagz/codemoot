@@ -36,11 +36,19 @@ A map of **aliases** (any name) to model configurations. Roles reference these a
 | `kind` | `claude` \| `codex` | inferred from provider | `claude` requires `provider: anthropic`; `codex` requires `provider: openai` |
 | `command` | string | — required | Executable, e.g. `claude` or `codex` |
 | `args` | string[] | — required | Base CLI args, **passed through to the CLI**. Codex convention: `[exec]`. This is where per-CLI options go, e.g. Codex reasoning effort: `[exec, -c, model_reasoning_effort=high]` (values: `high`/`medium`/`low`) |
-| `timeout` | positive seconds | — required | Per-invocation subprocess timeout |
+| `timeout` | positive seconds | — required | Per-invocation subprocess timeout (absolute wall clock) |
+| `idleTimeout` | positive seconds | optional (120) | Seconds the CLI may produce **no output** before being killed. Deep reasoning (`--effort high/xhigh/max`, large prompts) can think silently for minutes — raise this (e.g. `900`) for those runs, or the run dies mid-think. `--include-partial-messages` in `args` is the complementary lever: it keeps output flowing during generation |
 | `versionConstraint` | string | optional | Semver constraint on the CLI version |
 | `outputFile` | string | optional | Legacy output-file mode (Codex) |
 | `maxOutputBytes` | positive int | optional | Output capture cap |
 | `envAllowlist` | string[] | optional | Extra environment variables passed to the CLI subprocess (everything else is filtered). E.g. `[MAX_THINKING_TOKENS]` lets `export MAX_THINKING_TOKENS=31999` deepen Claude's thinking |
+
+**Silent-thinking pitfall:** at high effort the CLI can emit nothing for minutes while it
+reasons. The default 120s `idleTimeout` will kill such a run (`Claude CLI idle timeout (no
+output for 120000ms…)`). Raise `idleTimeout`, and/or add `--include-partial-messages` to
+`args` so chunks stream during generation. Partial messages increase volume — raise
+`maxOutputBytes` alongside it. Killed invocations now persist whatever the CLI emitted, so
+`workflow logs` shows how far the agent actually got.
 
 **Reasoning "level" cheat-sheet:**
 - **Claude:** append `[--effort, <level>]` to `args` — valid levels, fast → smart:

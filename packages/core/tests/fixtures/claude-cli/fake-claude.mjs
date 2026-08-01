@@ -22,6 +22,24 @@ if (
 
 if (mode === 'hang') {
   setInterval(() => {}, 60_000);
+} else if (mode === 'hang-after-init') {
+  // Emits the protocol init line, then goes silent — the real deep-reasoning kill shape.
+  process.stdout.write(
+    `${JSON.stringify({
+      type: 'system',
+      subtype: 'init',
+      uuid: 'fake-init',
+      session_id: '550e8400-e29b-41d4-a716-446655440010',
+      apiKeySource: 'subscription',
+      claude_code_version: '2.1.218',
+      cwd: process.cwd(),
+      tools: [],
+      mcp_servers: [],
+      model: optionValue('--model') ?? 'unknown-model',
+      permissionMode: 'acceptEdits',
+    })}\n`,
+  );
+  setInterval(() => {}, 60_000);
 } else {
   const configuredModel = optionValue('--model') ?? 'unknown-model';
   const resumedSessionId = optionValue('--resume');

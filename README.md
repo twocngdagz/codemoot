@@ -299,7 +299,12 @@ Add to your `.mcp.json`:
 }
 ```
 
-Tools: `codemoot_review`, `codemoot_plan`, `codemoot_debate`, `codemoot_memory`, `codemoot_cost`
+Tools: `codemoot_review`, `codemoot_plan`, `codemoot_debate`, `codemoot_memory`,
+`codemoot_cost`, workflow observation (`codemoot_workflow_status/events/jobs/gate`), and
+knowledge + configuration tools (`codemoot_docs`, `codemoot_config_get/validate/init/set`) —
+a connected LLM can read the embedded canonical docs and safely scaffold, validate, and
+update a `.cowork.yml` in any repository (validate-first writes with timestamped backups;
+an invalid configuration is never written).
 
 ## Development
 

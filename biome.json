@@ -1,7 +1,7 @@
 {
   "$schema": "https://biomejs.dev/schemas/1.9.0/schema.json",
   "files": {
-    "ignore": ["**/dist/**", "**/node_modules/**", "**/.cowork/**"]
+    "ignore": ["**/dist/**", "**/node_modules/**", "**/.cowork/**", "**/src/generated/**"]
   },
   "organizeImports": { "enabled": true },
   "linter": { "enabled": true, "rules": { "recommended": true } },

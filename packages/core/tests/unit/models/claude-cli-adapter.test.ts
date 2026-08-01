@@ -216,4 +216,33 @@ describe('buildClaudeEnvironment', () => {
 
     expect(buildClaudeEnvironment(['UNLISTED_SECRET']).UNLISTED_SECRET).toBe('explicit');
   });
+
+  it('honours a configured idle timeout instead of the hardcoded default', async () => {
+    // Deep reasoning can go minutes without emitting: the ceiling must come from config.
+    const configured = new ClaudeCliAdapter({
+      command: process.execPath,
+      args: [FAKE_CLAUDE, '--fixture-mode', 'hang'],
+      model: 'claude-sonnet-4-6',
+      projectDir: process.cwd(),
+      idleTimeout: 300,
+    });
+    const startedAt = Date.now();
+    await expect(configured.send('prompt', { timeout: 30_000 })).rejects.toThrow(
+      /idle timeout \(no output for 300ms/,
+    );
+    // It used the configured 300ms, not the 120s default.
+    expect(Date.now() - startedAt).toBeLessThan(20_000);
+  });
+
+  it('preserves partial output when an invocation is killed', async () => {
+    // The fixture emits its init line, then hangs — exactly the shape of a real deep-think
+    // kill. The audit must still be able to show what the agent produced.
+    const call = adapter('hang-after-init').send('prompt', {
+      timeout: 30_000,
+      idleTimeout: 300,
+    });
+    await expect(call).rejects.toMatchObject({
+      partialOutput: { stdout: expect.stringContaining('"type":"system"') },
+    });
+  });
 });
