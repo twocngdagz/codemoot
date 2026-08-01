@@ -4,9 +4,9 @@
 // captured on the workflow branch) and for failed-invocation auditing and classification.
 
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   openDatabase,
@@ -17,6 +17,7 @@ import {
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   installGitGuard,
+  resolveInvocationTimeoutSeconds,
   reviewWorkflowPauseCommand,
   reviewWorkflowResumeCommand,
   reviewWorkflowRunCommand,
@@ -24,6 +25,7 @@ import {
 } from '../src/commands/review-workflow.js';
 import { getDbPath } from '../src/utils.js';
 
+const __dirname = dirname(fileURLToPath(import.meta.url));
 const FAKE_CLAUDE = fileURLToPath(new URL('./fixtures/fake-claude-scripted.mjs', import.meta.url));
 const FAKE_CODEX = fileURLToPath(new URL('./fixtures/fake-codex-authfail.mjs', import.meta.url));
 
@@ -538,6 +540,33 @@ describe('codemoot workflow run (real command, scripted adapters)', () => {
       expect(runnerStore.acquireLease(WORKFLOW_ID, 'decide-worker', 60)).toBe(true);
     } finally {
       db.close();
+    }
+  });
+
+  it('resolves the invocation timeout from cliAdapter.timeout when no flag is given', () => {
+    // Dead configuration is worse than none: cliAdapter.timeout validated, was documented,
+    // and had no effect for three runs because the runner always passed an explicit value.
+    expect(resolveInvocationTimeoutSeconds(projectDir)).toBe(120);
+    // An explicit flag still wins.
+    expect(resolveInvocationTimeoutSeconds(projectDir, 7200)).toBe(7200);
+  });
+
+  it('forwards --timeout into every detached background worker spawn', () => {
+    // `--timeout N --background` was accepted, reported success, and still ran at the 1800s
+    // default because the spawned argv carried no timeout at all. ESM prevents spying on
+    // spawn, so this asserts the shipped call sites directly: every run-resume spawn must
+    // pass --timeout.
+    const source = readFileSync(
+      join(__dirname, '..', 'src', 'commands', 'review-workflow.ts'),
+      'utf8',
+    );
+    // Both detached spawns (workflow run --background, workflow run-resume --background).
+    const spawnCalls = source.split("'run-resume'").slice(1);
+    expect(spawnCalls.length).toBeGreaterThanOrEqual(2);
+    for (const [index, call] of spawnCalls.entries()) {
+      expect(call.slice(0, 260), `spawn call ${index} must forward --timeout`).toContain(
+        "'--timeout'",
+      );
     }
   });
 });

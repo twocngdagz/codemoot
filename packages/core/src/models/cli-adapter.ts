@@ -16,6 +16,7 @@ import type {
   BridgeSessionEvidence,
   CliBridge,
 } from './bridge.js';
+import { describeProcessFailure } from './claude-cli-adapter.js';
 import { type CliRuntimeEvidence, collectCliRuntimeEvidence } from './cli-runtime-evidence.js';
 
 const MAX_OUTPUT_BYTES = 512 * 1024; // 512KB
@@ -25,6 +26,10 @@ const TRUNCATION_MARKER = '\n[TRUNCATED: output exceeded 512KB]';
 const BASE_ENV_ALLOWLIST = [
   'PATH',
   'HOME',
+  // Without USER the Claude CLI cannot read macOS Keychain credentials and exits 1 with
+  // "Not logged in" — measured: filtered env fails, +LOGNAME still fails, +USER succeeds.
+  'USER',
+  'LOGNAME',
   'TEMP',
   'TMP',
   'USERPROFILE',
@@ -536,7 +541,7 @@ export class CliAdapter implements CliBridge {
         if (code !== 0) {
           reject(
             new ModelError(
-              `CLI subprocess exited with code ${code}: ${stderr.slice(0, 500)}`,
+              `CLI subprocess exited with code ${code}: ${describeProcessFailure(stderr, stdout)}`,
               this.provider,
               this.modelId,
             ),

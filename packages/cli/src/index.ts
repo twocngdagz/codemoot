@@ -51,6 +51,7 @@ import {
   reviewWorkflowBatchReviewPlanCommand,
   reviewWorkflowBatchShowCommand,
   reviewWorkflowBatchVerifyCommand,
+  reviewWorkflowCancelCommand,
   reviewWorkflowDecideCommand,
   reviewWorkflowEventsCommand,
   reviewWorkflowExportCommand,
@@ -467,9 +468,23 @@ reviewWorkflow
   .description('Autonomously run a complete review-gated workflow from a Markdown plan')
   .requiredOption('--plan <file>', 'External Markdown plan file')
   .option('--background', 'Run detached and return the workflow ID immediately')
-  .option('--timeout <seconds>', 'Per-invocation timeout in seconds', positiveInteger, 1800)
+  .option(
+    '--timeout <seconds>',
+    'Per-invocation timeout in seconds (default: cliAdapter.timeout from .cowork.yml)',
+    positiveInteger,
+  )
   .option('--id <workflow-id>', 'Explicit workflow ID')
   .action(reviewWorkflowRunCommand);
+
+reviewWorkflow
+  .command('cancel')
+  .description('Terminally cancel a workflow (pause a live worker first); evidence is preserved')
+  .argument('<workflow-id>', 'Review workflow ID')
+  .requiredOption('--rationale <text>', 'Why the workflow is being cancelled')
+  .option('--actor <name>', 'Deciding human')
+  .action((workflowId: string, options: { rationale: string; actor?: string }) =>
+    reviewWorkflowCancelCommand(workflowId, options),
+  );
 
 reviewWorkflow
   .command('pause')
@@ -481,7 +496,11 @@ reviewWorkflow
   .command('resume')
   .description('Resume a paused autonomous workflow from its next unfinished action')
   .argument('<workflow-id>', 'Review workflow ID')
-  .option('--timeout <seconds>', 'Per-invocation timeout in seconds', positiveInteger, 1800)
+  .option(
+    '--timeout <seconds>',
+    'Per-invocation timeout in seconds (default: cliAdapter.timeout from .cowork.yml)',
+    positiveInteger,
+  )
   .option('--background', 'Resume detached', false)
   .action((workflowId: string, options: { timeout: number; background?: boolean }) =>
     reviewWorkflowResumeCommand(workflowId, options),
@@ -491,7 +510,11 @@ reviewWorkflow
   .command('run-resume')
   .description('Resume an autonomous workflow (also used by the background worker)')
   .argument('<workflow-id>', 'Review workflow ID')
-  .option('--timeout <seconds>', 'Per-invocation timeout in seconds', positiveInteger, 1800)
+  .option(
+    '--timeout <seconds>',
+    'Per-invocation timeout in seconds (default: cliAdapter.timeout from .cowork.yml)',
+    positiveInteger,
+  )
   .option('--background', 'Resume detached', false)
   .action((workflowId: string, options: { timeout: number; background?: boolean }) =>
     reviewWorkflowRunResumeCommand(workflowId, options),

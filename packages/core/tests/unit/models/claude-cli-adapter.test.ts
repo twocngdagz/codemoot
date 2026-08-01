@@ -1,6 +1,7 @@
 import { realpathSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { describeProcessFailure } from '../../../src/models/claude-cli-adapter.js';
 import {
   ClaudeCliAdapter,
   buildClaudeEnvironment,
@@ -244,5 +245,27 @@ describe('buildClaudeEnvironment', () => {
     await expect(call).rejects.toMatchObject({
       partialOutput: { stdout: expect.stringContaining('"type":"system"') },
     });
+  });
+
+  it('diagnoses failures from stdout when stderr is empty', () => {
+    // Real runs died with the literal message "exited with code 1: " — nothing after the
+    // colon — while stdout carried the actual reason. Two hours of debugging.
+    const stdout = [
+      '{"type":"system","subtype":"init"}',
+      '{"type":"result","is_error":true,"result":"Not logged in · Please run /login"}',
+    ].join('\n');
+    expect(describeProcessFailure('', stdout)).toContain('Not logged in');
+    // stderr still wins when it says something.
+    expect(describeProcessFailure('real stderr problem', stdout)).toBe('real stderr problem');
+    // Non-JSON stdout still surfaces a tail rather than nothing.
+    expect(describeProcessFailure('', 'plain failure text')).toContain('plain failure text');
+    expect(describeProcessFailure('', '')).toContain('no stderr or stdout output');
+  });
+
+  it('passes USER through to the CLI so Keychain credentials are readable', () => {
+    // Root cause of two failed runs: without USER the CLI cannot read macOS Keychain
+    // credentials and exits 1 with "Not logged in".
+    const env = buildClaudeEnvironment();
+    expect(env.USER).toBe(process.env.USER);
   });
 });

@@ -24,12 +24,48 @@ import { collectCliRuntimeEvidence } from './cli-runtime-evidence.js';
 const RAW_OUTPUT_MULTIPLIER = 4;
 const DEFAULT_TIMEOUT_MS = 600_000;
 const DEFAULT_IDLE_TIMEOUT_MS = 120_000;
+/**
+ * Floor for RAW transcript capture, independent of the result-truncation limit. Measured:
+ * one plan refinement with --include-partial-messages captured 1.48-2.04 MB, so the old
+ * 2 MB effective default was one heavier call from a capture overflow.
+ */
+const MIN_RAW_CAPTURE_BYTES = 32 * 1024 * 1024;
+
+/**
+ * The Claude CLI writes its diagnosis to STDOUT as stream-json, not stderr: an auth failure
+ * produced the literal message "exited with code 1: " with nothing after the colon, while
+ * stdout carried {"type":"result","is_error":true,"result":"Not logged in ..."}. Failures
+ * must surface whichever stream actually explains them.
+ */
+export function describeProcessFailure(stderr: string, stdout: string): string {
+  const trimmedStderr = stderr.trim();
+  if (trimmedStderr.length > 0) return trimmedStderr.slice(0, 500);
+  for (const line of stdout.trim().split('\n').reverse()) {
+    try {
+      const parsed: unknown = JSON.parse(line);
+      if (parsed !== null && typeof parsed === 'object' && 'result' in parsed) {
+        const message = (parsed as { result?: unknown }).result;
+        if (typeof message === 'string' && message.trim().length > 0) {
+          return `(stdout) ${message.slice(0, 500)}`;
+        }
+      }
+    } catch {
+      // not a JSON line — fall through to the raw tail
+    }
+  }
+  const tail = stdout.trim().slice(-500);
+  return tail.length > 0 ? `(stdout tail) ${tail}` : '(no stderr or stdout output)';
+}
 const DEFAULT_CONTEXT_WINDOW = 200_000;
 const TRUNCATION_MARKER = '\n[TRUNCATED: output exceeded configured limit]';
 
 const CLAUDE_ENV_ALLOWLIST = [
   'PATH',
   'HOME',
+  // Without USER the CLI cannot read macOS Keychain credentials and exits 1 with
+  // "Not logged in" — measured: filtered env fails, +LOGNAME still fails, +USER succeeds.
+  'USER',
+  'LOGNAME',
   'TEMP',
   'TMP',
   'USERPROFILE',
@@ -189,7 +225,12 @@ export class ClaudeCliAdapter implements CliBridge {
       model: this.model,
       timeout: options?.timeout ?? this.defaultTimeout,
       idleTimeout: options?.idleTimeout ?? this.defaultIdleTimeout,
+      // The raw-capture cap answers a different question from the result-truncation
+      // limit: it must hold the FULL stream-json transcript, which with
+      // --include-partial-messages runs 1.5-2 MB for a single plan refinement. A floor
+      // keeps the shipped default safe regardless of maxOutputBytes.
       maxCaptureBytes: Math.max(
+        MIN_RAW_CAPTURE_BYTES,
         MAX_OUTPUT_BYTES * RAW_OUTPUT_MULTIPLIER,
         maxOutputBytes * RAW_OUTPUT_MULTIPLIER,
       ),
@@ -443,7 +484,7 @@ async function runClaudeProcess(input: {
       if (code !== 0) {
         rejectResult(
           new ModelError(
-            `Claude CLI subprocess exited with code ${code}: ${stderr.slice(0, 500)}`,
+            `Claude CLI subprocess exited with code ${code}: ${describeProcessFailure(stderr, stdout)}`,
             input.provider,
             input.model,
           ),

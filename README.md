@@ -97,6 +97,7 @@ the full configuration reference in [docs/configuration.md](docs/configuration.m
 | `codemoot workflow run --plan <file> [--background]` | Create and autonomously run a new workflow from a Markdown plan |
 | `codemoot workflow watch <id>` | Stream durable heartbeats and checkpoints live |
 | `codemoot workflow status <id>` | Runner status: phase, HEADs, active invocation, limits, next action |
+| `codemoot workflow cancel <id> --rationale "..."` | Terminally cancel a workflow (pause a live worker first); all evidence is preserved |
 | `codemoot workflow pause <id>` | Graceful pause after the current atomic action (first Ctrl-C does the same) |
 | `codemoot workflow resume <id> [--background]` | Continue a paused workflow from the next unfinished action |
 | `codemoot workflow decide <id> --action fix_again\|accept_risk\|cancel --rationale "..."` | Explicit human decision on any stop (SHA-bound, immutable); `accept_risk` also requires `--findings FINDING-1,FINDING-2` naming the unresolved blockers |

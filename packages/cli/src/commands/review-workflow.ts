@@ -109,9 +109,12 @@ export async function reviewWorkflowStatusCommand(workflowId: string): Promise<v
     if (runnerState !== null) {
       const config = loadConfig({ projectDir: process.cwd() });
       const expiry = config.reviewGated?.autonomous.heartbeatExpirySeconds ?? 120;
-      const reconciled = buildRunner(runtime, process.cwd(), workflowId, 1800).reconcileStalled(
+      const reconciled = buildRunner(
+        runtime,
+        process.cwd(),
         workflowId,
-      );
+        resolveInvocationTimeoutSeconds(process.cwd()),
+      ).reconcileStalled(workflowId);
       const observed = reviewWorkflowRunner.deriveObservedStatus(reconciled, expiry, new Date());
       const statusGit = createRunnerGit(process.cwd());
       const lastInvocation = runtime.store.workflowStore.listInvocationAudit(workflowId).at(-1);
@@ -2351,6 +2354,33 @@ function formatFindingsForPrompt(findings: readonly reviewWorkflow.Finding[]): s
     .join('\n');
 }
 
+const FALLBACK_INVOCATION_TIMEOUT_SECONDS = 1800;
+
+/**
+ * The per-invocation timeout ceiling, resolved ONCE from the same sources everywhere:
+ * an explicit --timeout wins, otherwise the implementer's `cliAdapter.timeout` from
+ * `.cowork.yml`. Before this, the runner always passed an explicit value, so the
+ * configured ceiling was dead configuration — it validated, was documented, and silently
+ * did nothing while three runs were killed at the 30-minute default.
+ */
+export function resolveInvocationTimeoutSeconds(
+  projectDir: string,
+  explicitSeconds?: number,
+): number {
+  if (explicitSeconds !== undefined) return explicitSeconds;
+  try {
+    const config = loadConfig({ projectDir });
+    const implementerAlias = config.roles.implementer?.model;
+    const configured =
+      implementerAlias === undefined
+        ? undefined
+        : config.models[implementerAlias]?.cliAdapter?.timeout;
+    return configured ?? FALLBACK_INVOCATION_TIMEOUT_SECONDS;
+  } catch {
+    return FALLBACK_INVOCATION_TIMEOUT_SECONDS;
+  }
+}
+
 function planSlug(planFile: string): string {
   return (
     basename(planFile)
@@ -3391,13 +3421,15 @@ function buildRunner(
 interface WorkflowRunOptions {
   readonly plan: string;
   readonly background?: boolean;
-  readonly timeout: number;
+  /** Omitted means: take the ceiling from `cliAdapter.timeout` in .cowork.yml. */
+  readonly timeout?: number;
   readonly id?: string;
 }
 
 export async function reviewWorkflowRunCommand(options: WorkflowRunOptions): Promise<void> {
   await withDatabase(async (db) => {
     const projectDir = process.cwd();
+    const timeoutSeconds = resolveInvocationTimeoutSeconds(projectDir, options.timeout);
     const git = createRunnerGit(projectDir);
     if (!git.isClean()) {
       throw new Error('Autonomous execution requires a clean worktree and index');
@@ -3470,11 +3502,14 @@ export async function reviewWorkflowRunCommand(options: WorkflowRunOptions): Pro
     if (options.background === true) {
       const entry = process.argv[1];
       if (entry === undefined) throw new Error('Cannot resolve the CLI entry point');
-      const child = spawn(process.execPath, [entry, 'workflow', 'run-resume', workflowId], {
-        cwd: projectDir,
-        detached: true,
-        stdio: 'ignore',
-      });
+      // The detached worker must inherit the SAME ceiling: without forwarding it, the
+      // child fell back to commander's 1800 default and `--timeout N --background` was
+      // accepted, reported success, and still ran with a 30-minute cap.
+      const child = spawn(
+        process.execPath,
+        [entry, 'workflow', 'run-resume', workflowId, '--timeout', String(timeoutSeconds)],
+        { cwd: projectDir, detached: true, stdio: 'ignore' },
+      );
       child.unref();
       printJson({
         status: 'RUNNING',
@@ -3483,12 +3518,13 @@ export async function reviewWorkflowRunCommand(options: WorkflowRunOptions): Pro
         baseBranch,
         baseSha,
         workerPid: child.pid ?? null,
+        timeoutSeconds,
         watch: `codemoot workflow watch ${workflowId}`,
       });
       return;
     }
-    printJson({ status: 'RUNNING', workflowId, branch, baseBranch, baseSha });
-    await runResumeInProcess(runtime, projectDir, workflowId, options.timeout);
+    printJson({ status: 'RUNNING', workflowId, branch, baseBranch, baseSha, timeoutSeconds });
+    await runResumeInProcess(runtime, projectDir, workflowId, timeoutSeconds);
   });
 }
 
@@ -3598,16 +3634,23 @@ async function runResumeGuarded(
 
 export async function reviewWorkflowRunResumeCommand(
   workflowId: string,
-  options: { readonly timeout: number; readonly background?: boolean },
+  options: { readonly timeout?: number; readonly background?: boolean },
 ): Promise<void> {
   if (options.background === true) {
     const entry = process.argv[1];
     if (entry === undefined) throw new Error('Cannot resolve the CLI entry point');
-    const child = spawn(process.execPath, [entry, 'workflow', 'run-resume', workflowId], {
-      cwd: process.cwd(),
-      detached: true,
-      stdio: 'ignore',
-    });
+    const child = spawn(
+      process.execPath,
+      [
+        entry,
+        'workflow',
+        'run-resume',
+        workflowId,
+        '--timeout',
+        String(resolveInvocationTimeoutSeconds(process.cwd(), options.timeout)),
+      ],
+      { cwd: process.cwd(), detached: true, stdio: 'ignore' },
+    );
     child.unref();
     printJson({
       status: 'RESUMING',
@@ -3620,7 +3663,12 @@ export async function reviewWorkflowRunResumeCommand(
   await withDatabase(async (db) => {
     const projectDir = process.cwd();
     const runtime = createRuntime(db, projectDir);
-    await runResumeInProcess(runtime, projectDir, workflowId, options.timeout);
+    await runResumeInProcess(
+      runtime,
+      projectDir,
+      workflowId,
+      resolveInvocationTimeoutSeconds(projectDir, options.timeout),
+    );
   });
 }
 
@@ -3672,7 +3720,7 @@ export async function reviewWorkflowPauseCommand(workflowId: string): Promise<vo
 
 export async function reviewWorkflowResumeCommand(
   workflowId: string,
-  options: { readonly timeout: number; readonly background?: boolean },
+  options: { readonly timeout?: number; readonly background?: boolean },
 ): Promise<void> {
   await withDatabase(async (db) => {
     const runtime = createRuntime(db, process.cwd());
@@ -3734,13 +3782,75 @@ export async function reviewWorkflowResumeCommand(
   }
 }
 
+/**
+ * Terminally cancels a workflow from ANY non-terminal state, so a dead workflow never
+ * requires deleting rows from the durable store by hand. The append-only runner log is
+ * immutable by design and is preserved as evidence.
+ */
+export async function reviewWorkflowCancelCommand(
+  workflowId: string,
+  options: { readonly rationale: string; readonly actor?: string },
+): Promise<void> {
+  await withDatabase(async (db) => {
+    const runtime = createRuntime(db, process.cwd());
+    const state = runtime.runnerStore.get(workflowId);
+    if (state === null) throw new Error(`Workflow ${workflowId} has no runner state`);
+    if (state.status === 'CANCELLED') {
+      printJson({ workflowId, status: 'CANCELLED', note: 'already cancelled' });
+      return;
+    }
+    if (state.status === 'READY_FOR_HUMAN_VERIFICATION') {
+      throw new Error(
+        `Workflow ${workflowId} already completed; nothing to cancel (its branch is ready for verification)`,
+      );
+    }
+    const leaseLive =
+      state.leaseExpiresAt !== undefined && Date.parse(state.leaseExpiresAt) > Date.now();
+    if (leaseLive) {
+      throw new Error(
+        `Workflow ${workflowId} has a live worker; run \`codemoot workflow pause ${workflowId}\` first, then cancel`,
+      );
+    }
+    const owner = persistCliActor(runtime.store, {
+      actorExecutionId: `${workflowId}:cancel:${generateId('execution')}`,
+      actorType: 'HUMAN',
+      authorities: ['WORKFLOW_OWNER'],
+    });
+    runtime.runnerStore.update(workflowId, {
+      status: 'CANCELLED',
+      phase: null,
+      stopReason: 'CANCELLED_BY_USER',
+      stopDetails: options.rationale,
+      workerId: null,
+      leaseExpiresAt: null,
+    });
+    runtime.runnerStore.appendLog({
+      workflowId,
+      entryType: 'STOP',
+      message: `Workflow cancelled by ${options.actor ?? 'human-owner'}: ${options.rationale}`,
+      payload: { actorExecutionId: owner.actorExecutionId, rationale: options.rationale },
+    });
+    printJson({
+      workflowId,
+      status: 'CANCELLED',
+      branch: state.branch,
+      note: 'The workflow branch and all durable evidence are preserved; delete the branch yourself if you no longer need it.',
+    });
+  });
+}
+
 export async function reviewWorkflowWatchCommand(workflowId: string): Promise<void> {
   await withDatabase(async (db) => {
     const projectDir = process.cwd();
     const runtime = createRuntime(db, projectDir);
     const config = loadConfig({ projectDir });
     const expiry = config.reviewGated?.autonomous.heartbeatExpirySeconds ?? 120;
-    const runner = buildRunner(runtime, projectDir, workflowId, 1800);
+    const runner = buildRunner(
+      runtime,
+      projectDir,
+      workflowId,
+      resolveInvocationTimeoutSeconds(projectDir),
+    );
     let lastLogId = 0;
     for (;;) {
       if (runtime.runnerStore.get(workflowId) === null) {
@@ -3846,7 +3956,12 @@ export async function reviewWorkflowDecideCommand(
   await withDatabase(async (db) => {
     const projectDir = process.cwd();
     const runtime = createRuntime(db, projectDir);
-    const runner = buildRunner(runtime, projectDir, workflowId, 1800);
+    const runner = buildRunner(
+      runtime,
+      projectDir,
+      workflowId,
+      resolveInvocationTimeoutSeconds(projectDir),
+    );
     const action =
       options.action === 'fix_again'
         ? 'FIX_AGAIN'
