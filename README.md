@@ -27,7 +27,8 @@ codemoot debate start "Should we use REST or GraphQL?"
 
 # Build features the review-gated way (recommended)
 codemoot init --preset review-gated
-codemoot workflow start --plan plan.md
+codemoot workflow run --plan plan.md --background
+codemoot workflow watch <workflow-id>
 
 # Ship with confidence
 codemoot shipit --profile safe
@@ -98,8 +99,8 @@ the full configuration reference in [docs/configuration.md](docs/configuration.m
 | `codemoot workflow status <id>` | Runner status: phase, HEADs, active invocation, limits, next action |
 | `codemoot workflow pause <id>` | Graceful pause after the current atomic action (first Ctrl-C does the same) |
 | `codemoot workflow resume <id> [--background]` | Continue a paused workflow from the next unfinished action |
-| `codemoot workflow decide <id> --action fix_again\|accept_risk\|cancel` | Explicit human decision on any stop (SHA-bound, immutable) |
-| `codemoot workflow run-resume <id> [--background]` | Restart a crashed/stopped worker (receipt-bound recovery) |
+| `codemoot workflow decide <id> --action fix_again\|accept_risk\|cancel --rationale "..."` | Explicit human decision on any stop (SHA-bound, immutable); `accept_risk` also requires `--findings FINDING-1,FINDING-2` naming the unresolved blockers |
+| `codemoot workflow run-resume <id> [--background]` | Advanced recovery: restart a crashed or stopped autonomous worker (receipt-bound). Use `workflow resume` for normally paused workflows |
 | `codemoot workflow logs <id> [--phase ...]` | Immutable full prompt/response invocation audit |
 | `codemoot workflow export <id> --output <file>` | Complete evidence bundle (state, logs, findings, transcripts) |
 
@@ -263,9 +264,9 @@ reviewGated:
     agentMayCommit: true
 ```
 
-Use complete model identifiers (`claude-opus-5`, `claude-sonnet-4-5`, …): the adapter
-verifies that the CLI reports exactly the configured model, and shorthand aliases such as
-`opus` resolve to full identifiers and would fail that evidence check. The Claude adapter
+Use complete model identifiers such as `claude-opus-5` and `claude-fable-5`. This keeps
+configured-model and CLI-reported-model evidence consistent and avoids ambiguity introduced
+by shorthand aliases. The Claude adapter
 automatically supplies print mode, stream JSON output, verbose protocol output, the
 configured model, and session-resume arguments.
 
@@ -315,7 +316,7 @@ pnpm typecheck    # TypeScript strict checks
 
 ## Known Limitations
 
-- Background job worker must be started manually (auto-spawn coming)
+- Generic queued review jobs may require a worker process; autonomous workflows started with `workflow run --background` launch a detached runner automatically
 - Watch mode enqueues jobs but requires worker process
 - MCP server is experimental — core + CLI are stable
 - Autofix loop depends on GPT's ability to apply edits via Codex tools
