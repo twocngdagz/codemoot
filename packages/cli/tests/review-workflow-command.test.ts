@@ -1,4 +1,4 @@
-import type { reviewWorkflow } from '@codemoot/core';
+import { type reviewWorkflow, reviewWorkflowContracts } from '@codemoot/core';
 import { describe, expect, it } from 'vitest';
 import {
   buildFinalAuditPrompt,
@@ -282,7 +282,7 @@ describe('review workflow CLI prompts', () => {
       ],
     });
 
-    expect(prompt).toContain('Output exactly one JSON object and nothing else.');
+    expect(prompt).toContain('Return EXACTLY one JSON object satisfying the REFINEMENT_RESULT');
     expect(prompt).toContain('workflow-1:batch:N');
     expect(prompt).toContain('workflow-1:batch:N:plan:1');
     expect(prompt).toContain('"requirementId": "requirement-1"');
@@ -342,19 +342,27 @@ describe('review workflow CLI prompts', () => {
     });
 
     expect(prompt).toContain('complete approved batch as one atomic unit');
-    expect(prompt).toContain('IMPLEMENTATION_RESULT schemaVersion 1');
+    expect(prompt).toContain('Return EXACTLY one JSON object satisfying the IMPLEMENTATION_RESULT');
     expect(prompt).toContain('changedFiles must exactly list');
     for (const phrase of phrases) expect(prompt).toContain(phrase);
   });
 });
 
-describe('contract envelope instructions', () => {
-  // A prompt that names the contract VALUE but never the FIELD lets the model guess `kind`
-  // — a 21-minute, $5 rejection at refinement scale. Every builder must spell it out.
-  const CONTRACT_PROMPTS: readonly { name: string; prompt: string; kind: string }[] = [
+describe('contract instructions are derived from the schemas', () => {
+  // The blind spot this closes: asserting only contractKind/schemaVersion passed on a
+  // prompt that still omitted summary, refinedPlanContent, and batchPlanVersionIds — the
+  // model could not have produced a valid document from it. Every REQUIRED top-level field
+  // of the validating schema must be named in the prompt, derived, never hand-listed.
+  const CONTRACT_PROMPTS: readonly {
+    name: string;
+    prompt: string;
+    kind: string;
+    schema: Parameters<typeof reviewWorkflowContracts.describeContractFields>[0];
+  }[] = [
     {
       name: 'refinement',
       kind: 'REFINEMENT_RESULT',
+      schema: reviewWorkflowContracts.refinementResultContractSchema,
       prompt: buildRefinementPrompt({
         workflowId: 'workflow-1',
         repositoryAudit: { headSha: 'a'.repeat(40) },
@@ -367,6 +375,7 @@ describe('contract envelope instructions', () => {
     {
       name: 'plan review',
       kind: 'REVIEW_RESULT',
+      schema: reviewWorkflowContracts.reviewResultContractSchema,
       prompt: buildPlanReviewPrompt({
         workflowId: 'workflow-1',
         batchPlan: PLAN_FIXTURE,
@@ -376,6 +385,7 @@ describe('contract envelope instructions', () => {
     {
       name: 'implementation',
       kind: 'IMPLEMENTATION_RESULT',
+      schema: reviewWorkflowContracts.implementationResultContractSchema,
       prompt: buildImplementationPrompt({
         workflowId: 'workflow-1',
         batchPlan: PLAN_FIXTURE,
@@ -386,11 +396,34 @@ describe('contract envelope instructions', () => {
     },
   ];
 
-  it.each(CONTRACT_PROMPTS)('$name names the contractKind field explicitly', ({ prompt, kind }) => {
-    expect(prompt).toContain('"contractKind"');
-    expect(prompt).toContain(`"contractKind": "${kind}"`);
-    expect(prompt).toContain('"schemaVersion": 1');
-    // And warns against the plausible wrong guesses.
-    expect(prompt).toContain('NOT "kind"');
+  it.each(CONTRACT_PROMPTS)(
+    '$name names every required field of its schema',
+    ({ prompt, kind, schema }) => {
+      const fields = reviewWorkflowContracts.describeContractFields(schema);
+      const required = fields.filter((field) => field.required);
+      // The schema must actually have been introspected — an empty list would make this
+      // assertion vacuous.
+      expect(required.length).toBeGreaterThanOrEqual(4);
+      for (const field of required) {
+        expect(prompt, `${kind} prompt must name required field ${field.name}`).toContain(
+          field.name,
+        );
+      }
+      expect(prompt).toContain(`"contractKind": "${kind}"`);
+      expect(prompt).toContain('NOT "kind"');
+      // Strict mode must be stated: inventing extra keys is an outright rejection.
+      expect(prompt).toContain('STRICT');
+    },
+  );
+
+  it('names the exact refinement fields that a real run omitted', () => {
+    // Regression for the $5.07 / 21-minute rejection: contractKind was only the FIRST
+    // error; these three were the next ones waiting.
+    const prompt = CONTRACT_PROMPTS[0]?.prompt ?? '';
+    for (const field of ['summary', 'refinedPlanContent', 'batchPlanVersionIds']) {
+      expect(prompt, field).toContain(field);
+    }
+    // And the singular per-batch id must not be the only thing mentioned.
+    expect(prompt).toContain('batchPlanVersionIds: string[]');
   });
 });

@@ -947,10 +947,10 @@ ${scope}
 
 Never modify repository files, the Git index, or HEAD. Severity policy: critical/high findings block; a medium finding blocks only when its acceptanceCriterionId is one of the merge-blocking criteria listed below; low/suggestion findings are recorded and deferred, never blocking. Your verdict must be APPROVED exactly when no blocking finding exists, otherwise NEEDS_REVISION.
 
-Output exactly one JSON object and nothing else, satisfying the strict REVIEW_RESULT schemaVersion 1 contract. The object MUST begin with exactly these two envelope fields, spelled exactly:
-  "schemaVersion": 1,
-  "contractKind": "REVIEW_RESULT",
-(the field name is contractKind — NOT "kind", NOT "type").
+${reviewWorkflowContracts.buildContractInstruction(
+  reviewWorkflowContracts.reviewResultContractSchema,
+  'REVIEW_RESULT',
+)}
 Echo this authoritative target verbatim as your target field:
 ${JSON.stringify(evidence.target, null, 2)}
 
@@ -1685,11 +1685,10 @@ Verify requirement coverage, every acceptance criterion, scope fidelity to the a
 and documentation completeness against the final-gate diff below. Never modify repository
 files, the Git index, or HEAD. New findings are permitted only for critical or high defects.
 
-Output exactly one JSON object satisfying the strict FINAL_AUDIT_RESULT schemaVersion 1
-contract. The object MUST begin with exactly these two envelope fields, spelled exactly:
-  "schemaVersion": 1,
-  "contractKind": "FINAL_AUDIT_RESULT",
-(the field name is contractKind — NOT "kind", NOT "type").
+${reviewWorkflowContracts.buildContractInstruction(
+  reviewWorkflowContracts.finalAuditResultContractSchema,
+  'FINAL_AUDIT_RESULT',
+)}
 Echo this authoritative target verbatim:
 ${JSON.stringify(evidence.target, null, 2)}
 
@@ -1772,10 +1771,10 @@ export function buildRefinementPrompt(input: {
 }): string {
   return `Act as the assigned plan refiner. Audit the supplied repository evidence against the external plan, then return one complete refined batch plan.
 
-Output exactly one JSON object and nothing else. It must satisfy the strict REFINEMENT_RESULT schemaVersion 1 contract. The object MUST begin with exactly these two envelope fields, spelled exactly:
-  "schemaVersion": 1,
-  "contractKind": "REFINEMENT_RESULT",
-(the field name is contractKind — NOT "kind", NOT "type").
+${reviewWorkflowContracts.buildContractInstruction(
+  reviewWorkflowContracts.refinementResultContractSchema,
+  'REFINEMENT_RESULT',
+)}
 Include batchPlans with every field required by the CodeMoot batch-plan contract. Use sequential ordinals starting at 1. For ordinal N use:
 - batchId: ${input.workflowId}:batch:N
 - batchPlanVersionId: ${input.workflowId}:batch:N:plan:1
@@ -1803,10 +1802,10 @@ export function buildPlanReviewPrompt(input: {
 }): string {
   return `Act as the independent plan reviewer for workflow ${input.workflowId}. Inspect the complete batch plan for correctness, repository grounding, dependencies, user journey, verification, documentation, rollback, and scope.
 
-Output exactly one JSON object and nothing else. It must satisfy the strict REVIEW_RESULT schemaVersion 1 contract. The object MUST begin with exactly these two envelope fields, spelled exactly:
-  "schemaVersion": 1,
-  "contractKind": "REVIEW_RESULT",
-(the field name is contractKind — NOT "kind", NOT "type").
+${reviewWorkflowContracts.buildContractInstruction(
+  reviewWorkflowContracts.reviewResultContractSchema,
+  'REVIEW_RESULT',
+)}
 Echo this authoritative PLAN target exactly:
 ${JSON.stringify(
   {
@@ -1864,10 +1863,10 @@ Do not stop after individual fixes, tests, or files. Resolve correctable failure
 
 ${commitInstruction}
 
-Output exactly one JSON object and nothing else. It must satisfy the strict IMPLEMENTATION_RESULT schemaVersion 1 contract. The object MUST begin with exactly these two envelope fields, spelled exactly:
-  "schemaVersion": 1,
-  "contractKind": "IMPLEMENTATION_RESULT",
-(the field name is contractKind — NOT "kind", NOT "type").
+${reviewWorkflowContracts.buildContractInstruction(
+  reviewWorkflowContracts.implementationResultContractSchema,
+  'IMPLEMENTATION_RESULT',
+)}
 Use outcome COMPLETE only after the whole batch is implemented. changedFiles must exactly list the repository paths actually changed relative to ${input.originalBatchBaseSha}. verificationRecordIds may contain only already-persisted CodeMoot verification records; ordinary command output is not a verification record. Use BLOCKED only for a genuine external blocker and include blockerReason.
 
 Approved batch plan:

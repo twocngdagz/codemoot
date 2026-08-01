@@ -72,3 +72,8 @@ export type {
   ReviewWorkflowReviewVerdict,
   StructuredReview,
 } from './types.js';
+export {
+  buildContractInstruction,
+  describeContractFields,
+  type ContractFieldSummary,
+} from './prompt-contract.js';
