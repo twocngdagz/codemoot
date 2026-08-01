@@ -200,11 +200,19 @@ TypeScript monorepo with 4 packages:
 
 ### How It Works
 
-1. **Claude Code** is your primary AI — it plans, writes code, manages your project
-2. **Codex CLI** (GPT) acts as reviewer/critic — it reads your codebase, finds bugs, suggests fixes
-3. **CodeMoot** bridges them — structured prompts, session persistence, token tracking, policy gates
+CodeMoot assigns configured models to distinct workflow roles:
 
-All GPT calls happen via Codex CLI using your ChatGPT subscription — **$0 API cost**.
+- The **implementer** plans, edits, tests, and corrects code.
+- The **reviewer** independently reviews plans and committed implementation changes.
+- **CodeMoot** coordinates both roles through durable state, separate sessions, immutable
+  audit records, bounded review loops, verification gates, and Git evidence.
+
+Supported CLI adapters include Claude Code and Codex CLI. A project may use Claude plus
+Codex, or separate Claude models for both roles. Review-gated workflows prohibit shared
+implementer and reviewer sessions.
+
+Autonomous workflows run batch by batch on a dedicated branch, push completed work, and stop
+at `READY_FOR_HUMAN_VERIFICATION`. CodeMoot never merges.
 
 ## Configuration
 
