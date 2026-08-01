@@ -75,7 +75,27 @@ codemoot shipit --profile safe
 | `codemoot debate history <id>` | Full message history (`--output <file>` for untruncated export) |
 | `codemoot debate complete <id>` | Mark debate as done |
 
-### Review-Gated Batch Workflow (recommended build path)
+### Autonomous Workflow Runner (recommended)
+
+One command runs a complete review-gated workflow end to end — refinement, plan review,
+implementation, bounded code reviews and corrections, verification, final audit, merge gate,
+and a gated push — stopping at `READY_FOR_HUMAN_VERIFICATION`. CodeMoot never merges. See
+[docs/review-workflow-autonomous-runner.md](docs/review-workflow-autonomous-runner.md) and
+the full configuration reference in [docs/configuration.md](docs/configuration.md).
+
+| Command | Description |
+|---------|-------------|
+| `codemoot workflow run --plan <file> [--background]` | Create and autonomously run a new workflow from a Markdown plan |
+| `codemoot workflow watch <id>` | Stream durable heartbeats and checkpoints live |
+| `codemoot workflow status <id>` | Runner status: phase, HEADs, active invocation, limits, next action |
+| `codemoot workflow pause <id>` | Graceful pause after the current atomic action (first Ctrl-C does the same) |
+| `codemoot workflow resume <id> [--background]` | Continue a paused workflow from the next unfinished action |
+| `codemoot workflow decide <id> --action fix_again\|accept_risk\|cancel` | Explicit human decision on any stop (SHA-bound, immutable) |
+| `codemoot workflow run-resume <id> [--background]` | Restart a crashed/stopped worker (receipt-bound recovery) |
+| `codemoot workflow logs <id> [--phase ...]` | Immutable full prompt/response invocation audit |
+| `codemoot workflow export <id> --output <file>` | Complete evidence bundle (state, logs, findings, transcripts) |
+
+### Review-Gated Batch Workflow (manual per-batch commands)
 
 Two separated agents — an implementer and an independent reviewer — build features in
 review-gated batches: one bounded implement → review → correct → final-review cycle per
@@ -90,7 +110,7 @@ legacy build loop and the current identity/commit limitations.
 |---------|-------------|
 | `codemoot workflow start --plan <file>` | Import an external plan and capture a repository audit |
 | `codemoot workflow refine <id>` | Refine the plan into complete batch plans |
-| `codemoot workflow status <id>` | Batch states plus effective merge-approval state |
+| `codemoot workflow status <id>` | Batch states, effective merge-approval state, and runner status |
 | `codemoot batch review-plan / implement / complete-implementation` | Per-batch plan review and implementation |
 | `codemoot batch review-code / respond` | One complete initial review, one correction pass, one bounded final review |
 | `codemoot batch verify / attest-verification` | Execute approved verification commands and attest acceptance |
