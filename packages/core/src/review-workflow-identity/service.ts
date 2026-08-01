@@ -102,12 +102,11 @@ export function createReviewWorkflowConfigurationSnapshot(
   }
   if (
     policy.identity.minimumAssurance === 'config_only' ||
-    !policy.identity.requireDifferentAdapterKinds ||
     !policy.identity.prohibitSharedSessions
   ) {
     throw new ReviewWorkflowIdentityError(
       'ASSIGNMENT_CONFIG_INVALID',
-      'Review-gated identity policy requires distinct adapters, isolated sessions, and process-attested assurance or stronger',
+      'Review-gated identity policy requires isolated sessions and process-attested assurance or stronger',
     );
   }
 

@@ -269,13 +269,6 @@ export const projectConfigSchema = z
         message: 'Review-gated workflows must prohibit shared implementer/reviewer sessions',
       });
     }
-    if (!data.reviewGated.identity.requireDifferentAdapterKinds) {
-      ctx.addIssue({
-        code: z.ZodIssueCode.custom,
-        path: ['reviewGated', 'identity', 'requireDifferentAdapterKinds'],
-        message: 'Review-gated workflows must require different adapter kinds',
-      });
-    }
     if (data.reviewGated.identity.minimumAssurance === 'config_only') {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
@@ -287,6 +280,7 @@ export const projectConfigSchema = z
     const implementerModel = data.models[implementerRole.model];
     const reviewerModel = data.models[reviewerRole.model];
     if (
+      data.reviewGated.identity.requireDifferentAdapterKinds &&
       implementerModel !== undefined &&
       reviewerModel !== undefined &&
       resolveConfiguredAdapterKind(implementerModel) === resolveConfiguredAdapterKind(reviewerModel)

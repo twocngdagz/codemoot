@@ -20,7 +20,7 @@ export const reviewWorkflowIdentityPolicySnapshotSchema = z
       (value) => value !== 'CONFIG_ONLY',
       'Review-workflow snapshots require process-attested identity assurance or stronger',
     ),
-    requireDifferentAdapterKinds: z.literal(true),
+    requireDifferentAdapterKinds: z.boolean(),
     prohibitSharedSessions: z.literal(true),
   })
   .strict();
@@ -106,11 +106,14 @@ export const reviewWorkflowConfigurationSnapshotSchema = z
         message: 'Implementer and reviewer assignment identities must differ',
       });
     }
-    if (implementer.expectedAdapterKind === reviewer.expectedAdapterKind) {
+    if (
+      value.identityPolicy.requireDifferentAdapterKinds &&
+      implementer.expectedAdapterKind === reviewer.expectedAdapterKind
+    ) {
       context.addIssue({
         code: z.ZodIssueCode.custom,
         path: ['assignments', 'reviewer', 'expectedAdapterKind'],
-        message: 'Implementer and reviewer adapter kinds must differ',
+        message: 'Implementer and reviewer adapter kinds must differ when the policy requires it',
       });
     }
     if (implementer.assignedRole !== 'IMPLEMENTER' || reviewer.assignedRole !== 'REVIEWER') {
