@@ -3,17 +3,21 @@
 // to a prompt that named the contract value but not its fields.
 
 import { describe, expect, it } from 'vitest';
+import { z } from 'zod';
 import { CONTRACT_EXAMPLES } from '../../../src/review-workflow-contracts/examples.js';
 import {
+  parseBatchPlanResult,
   parseDispositionResult,
   parseFinalAuditResult,
   parseImplementationResult,
+  parseRefinementOutline,
   parseRefinementResult,
   parseReviewResult,
 } from '../../../src/review-workflow-contracts/parser.js';
 import {
   buildContractInstruction,
   describeContractFields,
+  findUndescribedContractPaths,
 } from '../../../src/review-workflow-contracts/prompt-contract.js';
 import {
   batchPlanContractSchema,
@@ -136,6 +140,10 @@ describe('contract examples round-trip through the real parsers', () => {
   // one hand-written example (a stale FINAL_AUDIT target shape).
   const CASES = [
     ['REFINEMENT_RESULT', parseRefinementResult],
+    // The two per-batch contracts had NO proven example when refinement was split, which is
+    // how a fourth run reached the model with a union it had to guess at.
+    ['REFINEMENT_OUTLINE_RESULT', parseRefinementOutline],
+    ['BATCH_PLAN_RESULT', parseBatchPlanResult],
     ['REVIEW_RESULT', parseReviewResult],
     ['IMPLEMENTATION_RESULT', parseImplementationResult],
     ['DISPOSITION_RESULT', parseDispositionResult],
@@ -193,5 +201,74 @@ describe('per-batch refinement contracts', () => {
     for (const field of ['batchPlan[]', 'objective', 'acceptanceCriteria', 'rollbackBoundary']) {
       expect(instruction, field).toContain(field.replace('[]', ''));
     }
+  });
+});
+
+describe('discriminated unions are spelled out, not collapsed to "object"', () => {
+  // The FOURTH paid rejection: `browserAcceptanceCriteria` is a discriminatedUnion, the
+  // generator rendered it as a bare `object`, and the model — never told `applicability`
+  // existed — guessed. Every branch and its discriminator value must reach the prompt.
+  it('names the discriminator, its values, and each variant’s own fields', () => {
+    const instruction = buildContractInstruction(batchPlanContractSchema, 'BATCH_PLAN_RESULT');
+    expect(instruction).toContain('browserAcceptanceCriteria');
+    expect(instruction).toContain('EXACTLY ONE variant, chosen by "applicability"');
+    expect(instruction).toContain('when applicability = "APPLICABLE"');
+    expect(instruction).toContain('when applicability = "NOT_APPLICABLE"');
+    // The branches differ, so both branch-specific fields must be present.
+    expect(instruction).toContain('criterionIds:');
+    expect(instruction).toContain('reason:');
+    // And the field is never described as a plain object again.
+    expect(instruction).not.toContain('browserAcceptanceCriteria: object   (REQUIRED)');
+  });
+
+  it('describes the review target union as well', () => {
+    // Masked until now only because those prompts also echo a literal target.
+    const instruction = buildContractInstruction(reviewResultContractSchema, 'REVIEW_RESULT');
+    expect(instruction).toContain('EXACTLY ONE variant, chosen by "kind"');
+    expect(instruction).toContain('when kind = "PLAN"');
+    expect(instruction).toContain('when kind = "CODE"');
+    expect(instruction).toContain('planVersionId');
+    expect(instruction).toContain('reviewRangeEvidenceId');
+  });
+});
+
+describe('the generator never leaves a field undescribed', () => {
+  // The standing guard the four paid rejections argue for. An unhandled zod construct used
+  // to degrade SILENTLY to `object`, so each new construct cost a real run to discover.
+  // Now any field that renders as an unresolved construct — or as a container whose shape
+  // is never spelled out — fails the build instead.
+  const CONTRACTS = [
+    ['REFINEMENT_RESULT', refinementResultContractSchema],
+    ['REFINEMENT_OUTLINE_RESULT', refinementOutlineContractSchema],
+    ['BATCH_PLAN_RESULT', batchPlanContractSchema],
+    ['REVIEW_RESULT', reviewResultContractSchema],
+    ['IMPLEMENTATION_RESULT', implementationResultContractSchema],
+    ['FINAL_AUDIT_RESULT', finalAuditResultContractSchema],
+  ] as const;
+
+  it.each(CONTRACTS)('%s describes every field it requires', (_kind, schema) => {
+    // Depth 6 covers every nesting level the contracts actually use, so a gap here is a
+    // real gap rather than the recursion bound.
+    expect(findUndescribedContractPaths(schema, { maxNestedDepth: 6 })).toEqual([]);
+  });
+
+  it('reports a gap when a construct is genuinely unsupported', () => {
+    // Proves the guard can fail: without this, an always-empty result would look like a pass.
+    const withUnsupported = z.object({ when: z.date() }).strict();
+    expect(findUndescribedContractPaths(withUnsupported)).toEqual([
+      'when: unresolved schema construct',
+    ]);
+  });
+
+  it('reports a container whose shape never got spelled out', () => {
+    // The OTHER half of the bug, and the half the walker alone would miss: the field is
+    // labelled `object`, so it looks described, but nothing ever states its fields.
+    const nested = z
+      .object({ outer: z.object({ inner: z.object({ leaf: z.string() }).strict() }).strict() })
+      .strict();
+    expect(findUndescribedContractPaths(nested, { maxNestedDepth: 1 })).toEqual([
+      'outer.inner: "object" is never spelled out',
+    ]);
+    expect(findUndescribedContractPaths(nested, { maxNestedDepth: 2 })).toEqual([]);
   });
 });

@@ -103,9 +103,86 @@ export const FINAL_AUDIT_RESULT_EXAMPLE = {
   documentationComplete: true,
 } as const;
 
+export const REFINEMENT_OUTLINE_RESULT_EXAMPLE = {
+  schemaVersion: 1,
+  contractKind: 'REFINEMENT_OUTLINE_RESULT',
+  summary: 'One-paragraph summary of the refinement.',
+  refinedPlanContent: 'The complete refined plan content, as Markdown.',
+  batches: [
+    {
+      batchId: 'workflow-1:batch:1',
+      batchPlanVersionId: 'workflow-1:batch:1:plan:1',
+      ordinal: 1,
+      objective: 'What this batch delivers, in one sentence.',
+    },
+  ],
+  requirementCoverage: [
+    {
+      requirementId: 'requirement-abc123',
+      batchPlanVersionIds: ['workflow-1:batch:1:plan:1'],
+      acceptanceCriterionIds: ['criterion-1'],
+    },
+  ],
+} as const;
+
+// The hardest contract in the system: 19 fields, a discriminated union, and four
+// cross-field rules the agent cannot see. This document satisfies all of them, so the
+// prompt can hand over a working skeleton instead of a specification to be interpreted.
+export const BATCH_PLAN_RESULT_EXAMPLE = {
+  schemaVersion: 1,
+  contractKind: 'BATCH_PLAN_RESULT',
+  batchPlan: {
+    batchPlanVersionId: 'workflow-1:batch:1:plan:1',
+    batchId: 'workflow-1:batch:1',
+    ordinal: 1,
+    objective: 'What this batch delivers, in one sentence.',
+    currentRepositoryEvidence: [
+      { kind: 'FILE', location: 'src/example.ts', description: 'What exists today.' },
+    ],
+    dependencies: [],
+    candidateFiles: ['src/example.ts'],
+    technicalImplementation: ['The change to make, step by step.'],
+    userJourney: ['What the user does, end to end.'],
+    expectedBehaviour: ['What is observably true once this batch lands.'],
+    acceptanceCriteria: [
+      {
+        acceptanceCriterionId: 'criterion-1',
+        kind: 'TECHNICAL',
+        statement: 'What must be true.',
+        required: true,
+        passCondition: 'How to tell it is true.',
+        sourceRequirementIds: ['requirement-abc123'],
+      },
+    ],
+    // Every criterion must ALSO appear in the list matching its `kind`.
+    technicalAcceptanceCriteria: ['criterion-1'],
+    userFacingAcceptanceCriteria: [],
+    cliAcceptanceCriteria: [],
+    browserAcceptanceCriteria: {
+      applicability: 'NOT_APPLICABLE',
+      reason: 'This batch changes no browser-facing behaviour.',
+    },
+    verificationCommands: [
+      {
+        executable: 'pnpm',
+        arguments: ['test'],
+        workingDirectory: '.',
+        verificationType: 'test',
+        relatedCriterionIds: ['criterion-1'],
+      },
+    ],
+    manualVerification: [],
+    documentationChanges: [],
+    outOfScope: ['Anything not named above.'],
+    rollbackBoundary: 'What to revert if this batch must be undone.',
+  },
+} as const;
+
 /** Every contract example, keyed by contractKind — used by prompts and the round-trip test. */
 export const CONTRACT_EXAMPLES = {
   REFINEMENT_RESULT: REFINEMENT_RESULT_EXAMPLE,
+  REFINEMENT_OUTLINE_RESULT: REFINEMENT_OUTLINE_RESULT_EXAMPLE,
+  BATCH_PLAN_RESULT: BATCH_PLAN_RESULT_EXAMPLE,
   REVIEW_RESULT: REVIEW_RESULT_EXAMPLE,
   IMPLEMENTATION_RESULT: IMPLEMENTATION_RESULT_EXAMPLE,
   DISPOSITION_RESULT: DISPOSITION_RESULT_EXAMPLE,

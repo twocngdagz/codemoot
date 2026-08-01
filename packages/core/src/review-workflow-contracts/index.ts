@@ -79,13 +79,16 @@ export type {
 export {
   buildContractInstruction,
   describeContractFields,
+  findUndescribedContractPaths,
   type ContractFieldSummary,
 } from './prompt-contract.js';
 export {
+  BATCH_PLAN_RESULT_EXAMPLE,
   CONTRACT_EXAMPLES,
   DISPOSITION_RESULT_EXAMPLE,
   FINAL_AUDIT_RESULT_EXAMPLE,
   IMPLEMENTATION_RESULT_EXAMPLE,
+  REFINEMENT_OUTLINE_RESULT_EXAMPLE,
   REFINEMENT_RESULT_EXAMPLE,
   REVIEW_RESULT_EXAMPLE,
   type ContractExampleKind,
