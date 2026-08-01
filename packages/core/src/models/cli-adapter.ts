@@ -39,6 +39,9 @@ const BASE_ENV_ALLOWLIST = [
 ];
 
 // CLI-specific auth env vars
+/** Vendor knobs a CLI itself tells users to set; stripping them makes its advice unactionable. */
+const CLI_TUNING_VARS: readonly string[] = ['CLAUDE_CODE_MAX_OUTPUT_TOKENS', 'MAX_THINKING_TOKENS'];
+
 const CLI_AUTH_VARS: Record<string, string[]> = {
   codex: ['OPENAI_API_KEY'],
 };
@@ -170,6 +173,7 @@ export class CliAdapter implements CliBridge {
     // Build filtered env
     const allowlist = [
       ...BASE_ENV_ALLOWLIST,
+      ...CLI_TUNING_VARS,
       ...(CLI_AUTH_VARS[this.cliName] ?? []),
       ...(options?.envAllowlist ?? []),
     ];
@@ -226,6 +230,7 @@ export class CliAdapter implements CliBridge {
 
     const allowlist = [
       ...BASE_ENV_ALLOWLIST,
+      ...CLI_TUNING_VARS,
       ...(CLI_AUTH_VARS[this.cliName] ?? []),
       ...(options?.envAllowlist ?? []),
     ];
@@ -303,6 +308,7 @@ export class CliAdapter implements CliBridge {
   ): Promise<CodexCallResult> {
     const env = buildFilteredEnv([
       ...BASE_ENV_ALLOWLIST,
+      ...CLI_TUNING_VARS,
       ...(CLI_AUTH_VARS[this.cliName] ?? []),
       ...(options?.envAllowlist ?? []),
     ]);

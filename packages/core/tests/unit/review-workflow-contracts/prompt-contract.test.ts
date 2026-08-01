@@ -16,6 +16,10 @@ import {
   describeContractFields,
 } from '../../../src/review-workflow-contracts/prompt-contract.js';
 import {
+  batchPlanContractSchema,
+  refinementOutlineContractSchema,
+} from '../../../src/review-workflow-contracts/schemas.js';
+import {
   finalAuditResultContractSchema,
   implementationResultContractSchema,
   refinementResultContractSchema,
@@ -160,5 +164,34 @@ describe('contract examples round-trip through the real parsers', () => {
     expect(() =>
       parseRefinementResult(embedded.slice(0, embedded.lastIndexOf('}') + 1)),
     ).not.toThrow();
+  });
+});
+
+describe('per-batch refinement contracts', () => {
+  // Refinement used to demand every batch plan in one response: a 43-minute run exceeded
+  // the model's output ceiling and produced NOTHING, because batch 1 was discarded when
+  // batch 9 made the answer too long. The outline is small by construction and each batch
+  // plan is its own response.
+  it('the outline carries no batch bodies', () => {
+    const fields = describeContractFields(refinementOutlineContractSchema).map((f) => f.name);
+    expect(fields).toContain('batches');
+    expect(fields).not.toContain('batchPlans');
+    const instruction = buildContractInstruction(
+      refinementOutlineContractSchema,
+      'REFINEMENT_OUTLINE_RESULT',
+    );
+    // The nested batch entries are the SHAPE only: id, ordinal, objective.
+    expect(instruction).toContain('batches[]:');
+    expect(instruction).toContain('objective');
+    expect(instruction).not.toContain('technicalImplementation');
+  });
+
+  it('one batch plan per response, with its full nested shape spelled out', () => {
+    const fields = describeContractFields(batchPlanContractSchema).map((f) => f.name);
+    expect(fields).toEqual(['schemaVersion', 'contractKind', 'batchPlan']);
+    const instruction = buildContractInstruction(batchPlanContractSchema, 'BATCH_PLAN_RESULT');
+    for (const field of ['batchPlan[]', 'objective', 'acceptanceCriteria', 'rollbackBoundary']) {
+      expect(instruction, field).toContain(field.replace('[]', ''));
+    }
   });
 });

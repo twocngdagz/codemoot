@@ -2,7 +2,7 @@
 // stream-json protocol the adapter requires and returns the response text stored in the
 // file named by CODEMOOT_FAKE_RESPONSE_FILE (allowlisted through the adapter env filter).
 
-import { readFileSync } from 'node:fs';
+import { readFileSync, writeFileSync } from 'node:fs';
 
 const argumentsList = process.argv.slice(2);
 
@@ -41,10 +41,35 @@ const init = {
 process.stdout.write(`${JSON.stringify(init)}\n`);
 
 const responseFile = process.env.CODEMOOT_FAKE_RESPONSE_FILE;
-const responseText =
-  responseFile === undefined
-    ? `scripted:${prompt.slice(0, 40)}`
-    : readFileSync(responseFile, 'utf8');
+// Refinement is per-batch now, so a run makes several calls: a response file holding a JSON
+// ARRAY serves one element per call, in order.
+let responseText;
+if (responseFile === undefined) {
+  responseText = `scripted:${prompt.slice(0, 40)}`;
+} else {
+  const raw = readFileSync(responseFile, 'utf8');
+  let sequence;
+  try {
+    const parsed = JSON.parse(raw);
+    sequence = Array.isArray(parsed) ? parsed : undefined;
+  } catch {
+    sequence = undefined;
+  }
+  if (sequence === undefined) {
+    responseText = raw;
+  } else {
+    const counterFile = `${responseFile}.calls`;
+    let index = 0;
+    try {
+      index = Number.parseInt(readFileSync(counterFile, 'utf8').trim(), 10);
+    } catch {
+      index = 0;
+    }
+    writeFileSync(counterFile, String(index + 1));
+    const entry = sequence[Math.min(index, sequence.length - 1)];
+    responseText = typeof entry === 'string' ? entry : JSON.stringify(entry);
+  }
+}
 
 const result = {
   type: 'result',

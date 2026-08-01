@@ -845,6 +845,59 @@ export class ReviewWorkflowStore {
       });
   }
 
+  /**
+   * Stages ONE refined batch plan as soon as its own invocation completes. A failure at
+   * batch N therefore preserves batches 1..N-1 and the run resumes at N — refinement used
+   * to demand every batch in a single response, so one oversized answer lost everything.
+   */
+  saveRefinementDraft(input: {
+    readonly workflowId: string;
+    readonly ordinal: number;
+    readonly batchId: string;
+    readonly draft: unknown;
+    readonly createdAt: string;
+  }): void {
+    this.db
+      .prepare(
+        `INSERT INTO review_workflow_refinement_drafts
+           (workflow_id, ordinal, batch_id, draft_json, created_at)
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(workflow_id, ordinal) DO UPDATE SET
+           batch_id = excluded.batch_id,
+           draft_json = excluded.draft_json,
+           created_at = excluded.created_at`,
+      )
+      .run(
+        input.workflowId,
+        input.ordinal,
+        input.batchId,
+        JSON.stringify(input.draft),
+        input.createdAt,
+      );
+  }
+
+  /** Every staged batch plan for a workflow, in ordinal order. */
+  listRefinementDrafts(
+    workflowId: string,
+  ): readonly { readonly ordinal: number; readonly batchId: string; readonly draft: unknown }[] {
+    return this.db
+      .prepare(
+        `SELECT ordinal, batch_id, draft_json FROM review_workflow_refinement_drafts
+         WHERE workflow_id = ? ORDER BY ordinal`,
+      )
+      .all(workflowId)
+      .map((row) => {
+        const parsed = z
+          .object({ ordinal: z.number().int(), batch_id: z.string(), draft_json: z.string() })
+          .parse(row);
+        return {
+          ordinal: parsed.ordinal,
+          batchId: parsed.batch_id,
+          draft: JSON.parse(parsed.draft_json),
+        };
+      });
+  }
+
   /** Append-only continuity evidence: one row per invocation attempt, including failures. */
   recordSessionContinuity(evidence: SessionContinuityEvidence): void {
     this.db

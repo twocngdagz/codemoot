@@ -108,12 +108,15 @@ function buildRefinementContract(): string {
   const batchId = `${WORKFLOW_ID}:batch:1`;
   const planVersionId = `${batchId}:plan:1`;
   const criterionId = 'criterion-sample-output';
-  return JSON.stringify({
+  // Refinement is per batch: response 1 is the OUTLINE, response 2 is batch 1's plan.
+  const outline = {
     schemaVersion: 1,
-    contractKind: 'REFINEMENT_RESULT',
+    contractKind: 'REFINEMENT_OUTLINE_RESULT',
     summary: 'One batch delivering the sample output file.',
     refinedPlanContent: 'Refined plan: implement the sample output file in a single batch.',
-    batchPlanVersionIds: [planVersionId],
+    batches: [
+      { batchId, batchPlanVersionId: planVersionId, ordinal: 1, objective: 'Write sample.txt.' },
+    ],
     requirementCoverage: [
       {
         requirementId,
@@ -121,50 +124,56 @@ function buildRefinementContract(): string {
         acceptanceCriterionIds: [criterionId],
       },
     ],
-    batchPlans: [
-      {
-        batchPlanVersionId: planVersionId,
-        batchId,
-        ordinal: 1,
-        objective: 'Write the sample output file.',
-        currentRepositoryEvidence: [
-          { kind: 'FILE', location: 'README.md', description: 'Current repository entry point.' },
-        ],
-        dependencies: [],
-        candidateFiles: ['sample.txt'],
-        technicalImplementation: ['Create sample.txt with the expected content.'],
-        userJourney: ['The operator sees sample.txt after the batch lands.'],
-        expectedBehaviour: ['sample.txt exists with the expected content.'],
-        acceptanceCriteria: [
-          {
-            acceptanceCriterionId: criterionId,
-            kind: 'TECHNICAL',
-            statement: 'sample.txt exists.',
-            required: true,
-            passCondition: 'test -f sample.txt exits 0',
-            sourceRequirementIds: [requirementId],
-          },
-        ],
-        technicalAcceptanceCriteria: [criterionId],
-        userFacingAcceptanceCriteria: [],
-        cliAcceptanceCriteria: [],
-        browserAcceptanceCriteria: { applicability: 'NOT_APPLICABLE', reason: 'CLI-only change.' },
-        verificationCommands: [
-          {
-            executable: 'test',
-            arguments: ['-f', 'sample.txt'],
-            workingDirectory: '.',
-            verificationType: 'test',
-            relatedCriterionIds: [criterionId],
-          },
-        ],
-        manualVerification: [],
-        documentationChanges: [],
-        outOfScope: ['Everything else.'],
-        rollbackBoundary: 'Revert the batch commit.',
-      },
-    ],
-  });
+  };
+  const batchPlans = [
+    {
+      batchPlanVersionId: planVersionId,
+      batchId,
+      ordinal: 1,
+      objective: 'Write the sample output file.',
+      currentRepositoryEvidence: [
+        { kind: 'FILE', location: 'README.md', description: 'Current repository entry point.' },
+      ],
+      dependencies: [],
+      candidateFiles: ['sample.txt'],
+      technicalImplementation: ['Create sample.txt with the expected content.'],
+      userJourney: ['The operator sees sample.txt after the batch lands.'],
+      expectedBehaviour: ['sample.txt exists with the expected content.'],
+      acceptanceCriteria: [
+        {
+          acceptanceCriterionId: criterionId,
+          kind: 'TECHNICAL',
+          statement: 'sample.txt exists.',
+          required: true,
+          passCondition: 'test -f sample.txt exits 0',
+          sourceRequirementIds: [requirementId],
+        },
+      ],
+      technicalAcceptanceCriteria: [criterionId],
+      userFacingAcceptanceCriteria: [],
+      cliAcceptanceCriteria: [],
+      browserAcceptanceCriteria: { applicability: 'NOT_APPLICABLE', reason: 'CLI-only change.' },
+      verificationCommands: [
+        {
+          executable: 'test',
+          arguments: ['-f', 'sample.txt'],
+          workingDirectory: '.',
+          verificationType: 'test',
+          relatedCriterionIds: [criterionId],
+        },
+      ],
+      manualVerification: [],
+      documentationChanges: [],
+      outOfScope: ['Everything else.'],
+      rollbackBoundary: 'Revert the batch commit.',
+    },
+  ];
+  return JSON.stringify([
+    JSON.stringify(outline),
+    ...batchPlans.map((batchPlan) =>
+      JSON.stringify({ schemaVersion: 1, contractKind: 'BATCH_PLAN_RESULT', batchPlan }),
+    ),
+  ]);
 }
 
 describe('codemoot workflow run (real command, scripted adapters)', () => {
@@ -185,7 +194,9 @@ describe('codemoot workflow run (real command, scripted adapters)', () => {
     writeFileSync(join(projectDir, 'README.md'), '# Sample project\n');
     writeFileSync(join(projectDir, 'plan.md'), PLAN_CONTENT);
     writeFileSync(join(projectDir, '.cowork.yml'), buildConfig());
-    writeFileSync(join(projectDir, '.gitignore'), '.cowork/\n');
+    // The scripted fake writes a per-call counter beside its response file; it must never
+    // dirty the worktree, which the repository audit checks.
+    writeFileSync(join(projectDir, '.gitignore'), '.cowork/\n.codemoot/\n*.calls\n');
     const responseFile = join(projectDir, 'refinement-response.json');
     writeFileSync(responseFile, buildRefinementContract());
     process.env.CODEMOOT_FAKE_RESPONSE_FILE = responseFile;

@@ -14,6 +14,20 @@ verified before every phase, pushes happen only after each batch's gate passes, 
 HEAD is verified after every push and at completion. No merge, rebase, reset, clean, stash,
 force-push, or branch deletion — ever.
 
+## Plan refinement is per batch
+Refinement issues ONE invocation per batch, never a single response carrying the whole plan:
+
+1. **Outline** — the refined plan content, requirement coverage, and each batch's id,
+   ordinal, and objective. Small by construction; no batch bodies.
+2. **One invocation per batch** — the complete batch plan, **persisted the moment it
+   completes** (`review_workflow_refinement_drafts`).
+
+A failure at batch N preserves batches 1..N-1 and the next run resumes at N. This exists
+because a single-response refinement of a ten-batch plan exceeded the model's output
+ceiling after 43 minutes and produced nothing: batch 1 was lost because batch 9 made the
+answer too long, and there was nothing to resume from because nothing had been stored.
+Every other phase — implementation, review, verification — was already per batch.
+
 ## Limits and stop reasons
 All limits live under `reviewGated.autonomous` (finite, schema-validated; defaults: 3
 code-review rounds, 2 correction passes) and are FROZEN into the runner state at workflow

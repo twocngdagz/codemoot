@@ -316,71 +316,145 @@ export async function reviewWorkflowBatchFindingsCommand(
   });
 }
 
+/**
+ * Plan refinement, ONE invocation per batch.
+ *
+ * Refinement used to demand every batch plan in a single response. A 43-minute run then
+ * produced nothing: the response exceeded the model's output ceiling, so batch 1 was lost
+ * because batch 9 made the answer too long, and there was nothing to resume from because
+ * nothing had been stored. Every other phase — implementation, review, verification — is
+ * already per batch; this makes refinement behave the same way.
+ *
+ * Invocation 0 produces the OUTLINE (plan content, batch objectives, requirement coverage).
+ * Invocations 1..N each produce exactly ONE batch plan, staged durably the moment it
+ * completes. A failure at batch N preserves 1..N-1 and the next run resumes at N.
+ */
 async function performRefinement(
   runtime: ReviewWorkflowRuntime,
   projectDir: string,
   workflowId: string,
   timeoutSeconds: number,
 ) {
-  {
-    const context = resolveRuntimeContext(runtime.store, workflowId, projectDir);
-    if (
-      context.workflow.refinedPlanVersionId !== undefined ||
-      runtime.store.listBatches(workflowId).length > 0
-    ) {
-      throw new Error(`Workflow ${workflowId} already has an initial materialized refinement`);
-    }
-    const requirements = runtime.store.listRequirements(context.workflow.generalPlanVersionId);
-    const generalPlan = runtime.store.getGeneralPlan(context.workflow.generalPlanVersionId);
-    const audit = runtime.store.getLatestRepositoryAudit(workflowId);
-    if (generalPlan === null || audit === null) {
-      throw new Error(`Workflow ${workflowId} is missing its plan or repository audit`);
-    }
-    const firstBatchId = reviewWorkflowPlan.deriveWorkflowBatchId(workflowId, 1);
-    const commandId = reviewWorkflowPlan.derivePlanCommandId(firstBatchId, 'create');
-    const actorExecutionId = `${workflowId}:refiner:${generateId('execution')}`;
-    const invocationId = `${workflowId}:refiner:${generateId('invocation')}`;
-    const sessionIdentityId = `${workflowId}:refiner:${generateId('session')}`;
-    runtime.service.verifyRepositoryContext(workflowId, audit.repositoryAuditId, actorExecutionId);
-    const prepared = await runtime.roleInvocation.prepare({
+  const context = resolveRuntimeContext(runtime.store, workflowId, projectDir);
+  if (
+    context.workflow.refinedPlanVersionId !== undefined ||
+    runtime.store.listBatches(workflowId).length > 0
+  ) {
+    throw new Error(`Workflow ${workflowId} already has an initial materialized refinement`);
+  }
+  const requirements = runtime.store.listRequirements(context.workflow.generalPlanVersionId);
+  const generalPlan = runtime.store.getGeneralPlan(context.workflow.generalPlanVersionId);
+  const audit = runtime.store.getLatestRepositoryAudit(workflowId);
+  if (generalPlan === null || audit === null) {
+    throw new Error(`Workflow ${workflowId} is missing its plan or repository audit`);
+  }
+  const firstBatchId = reviewWorkflowPlan.deriveWorkflowBatchId(workflowId, 1);
+  const requirementSummaries = requirements.map((requirement) => ({
+    requirementId: requirement.requirementId,
+    sourceReference: requirement.sourceReference,
+    statement: requirement.statement,
+  }));
+  const actorExecutionId = `${workflowId}:refiner:${generateId('execution')}`;
+  runtime.service.verifyRepositoryContext(workflowId, audit.repositoryAuditId, actorExecutionId);
+
+  // --- Invocation 0: the outline. Small by construction — no batch bodies.
+  const outlinePrepared = await runtime.roleInvocation.prepare({
+    resolution: context.roles.implementer,
+    workflowId,
+    commandId: reviewWorkflowPlan.derivePlanCommandId(firstBatchId, 'create'),
+    actorExecutionId,
+    invocationId: `${workflowId}:refiner-outline:${generateId('invocation')}`,
+    sessionIdentityId: `${workflowId}:refiner:${generateId('session')}`,
+    prompt: buildRefinementOutlinePrompt({
+      workflowId,
+      repositoryAudit: audit,
+      generalPlanContent: generalPlan.content,
+      requirements: requirementSummaries,
+    }),
+    options: agentInvocationOptions(timeoutSeconds),
+    additionalAuthorities: ['PLAN_REFINER'],
+    auditPhase: 'PLAN_REFINEMENT',
+  });
+  const outline = reviewWorkflowContracts.parseRefinementOutline(outlinePrepared.call.text);
+
+  // --- Invocations 1..N: one batch plan each, staged the moment it completes.
+  const staged = new Map(
+    runtime.store.workflowStore
+      .listRefinementDrafts(workflowId)
+      .map((entry) => [entry.ordinal, entry.draft]),
+  );
+  for (const batch of outline.batches) {
+    if (staged.has(batch.ordinal)) continue; // already authored in an earlier run
+    const batchPrepared = await runtime.roleInvocation.prepare({
       resolution: context.roles.implementer,
       workflowId,
-      commandId,
-      actorExecutionId,
-      invocationId,
-      sessionIdentityId,
-      prompt: buildRefinementPrompt({
+      commandId: reviewWorkflowPlan.derivePlanCommandId(batch.batchId, 'create'),
+      actorExecutionId: `${workflowId}:refiner-batch-${batch.ordinal}:${generateId('execution')}`,
+      invocationId: `${workflowId}:refiner-batch-${batch.ordinal}:${generateId('invocation')}`,
+      // Each batch authoring call stands alone: the outline's session is not durable until
+      // the refinement is captured, and every batch prompt carries its own full context.
+      sessionIdentityId: `${workflowId}:refiner-batch-${batch.ordinal}:${generateId('session')}`,
+      prompt: buildBatchPlanPrompt({
         workflowId,
-        repositoryAudit: audit,
-        generalPlanContent: generalPlan.content,
-        requirements: requirements.map((requirement) => ({
-          requirementId: requirement.requirementId,
-          sourceReference: requirement.sourceReference,
-          statement: requirement.statement,
-        })),
+        batch,
+        outlineSummary: outline.summary,
+        requirements: requirementSummaries,
+        earlierBatchIds: outline.batches
+          .filter((candidate) => candidate.ordinal < batch.ordinal)
+          .map((candidate) => candidate.batchId),
       }),
       options: agentInvocationOptions(timeoutSeconds),
       additionalAuthorities: ['PLAN_REFINER'],
       auditPhase: 'PLAN_REFINEMENT',
     });
-    const createdAt = prepared.invocation.finishedAt ?? new Date().toISOString();
-    const result = runtime.service.captureRefinement({
-      transcriptId: `${workflowId}:refinement:${generateId('transcript')}`,
+    // Each batch authoring call is a real agent invocation: audit it immediately so the
+    // evidence trail is complete and it counts against the invocation and token budgets.
+    // (The refinement COMMAND itself carries the outline invocation's identity; these are
+    // authoring steps feeding that one command.)
+    runtime.store.workflowStore.recordInvocationAudit(batchPrepared.audit);
+    const parsed = reviewWorkflowContracts.parseBatchPlanResult(batchPrepared.call.text);
+    if (parsed.batchPlan.batchId !== batch.batchId) {
+      throw new Error(
+        `Batch plan ${batch.ordinal} targets ${parsed.batchPlan.batchId}, expected ${batch.batchId}`,
+      );
+    }
+    // Durable the instant it lands: a later batch failing can no longer discard this one.
+    runtime.store.workflowStore.saveRefinementDraft({
       workflowId,
-      actorExecutionId,
-      invocationId,
-      sessionIdentityId: prepared.session.sessionIdentityId,
-      rawTranscript: prepared.call.text,
-      createdAt,
-      expectedFirstBatchId: firstBatchId,
-      refinedPlanVersionId: `${workflowId}:refined-plan:1`,
-      repositoryAuditId: audit.repositoryAuditId,
-      version: 1,
-      actor: prepared.execution,
-      preparedInvocation: prepared,
+      ordinal: batch.ordinal,
+      batchId: batch.batchId,
+      draft: parsed.batchPlan,
+      createdAt: batchPrepared.invocation.finishedAt ?? new Date().toISOString(),
     });
-    return result;
+    staged.set(batch.ordinal, parsed.batchPlan);
   }
+
+  // --- Assemble the complete refinement locally and capture it exactly as before, so the
+  // kernel, identity, and validation paths are unchanged.
+  const assembled = {
+    schemaVersion: 1,
+    contractKind: 'REFINEMENT_RESULT',
+    summary: outline.summary,
+    refinedPlanContent: outline.refinedPlanContent,
+    batchPlanVersionIds: outline.batches.map((batch) => batch.batchPlanVersionId),
+    requirementCoverage: outline.requirementCoverage,
+    batchPlans: outline.batches.map((batch) => staged.get(batch.ordinal)),
+  };
+  return runtime.service.captureRefinement({
+    transcriptId: `${workflowId}:refinement:${generateId('transcript')}`,
+    workflowId,
+    actorExecutionId,
+    invocationId: outlinePrepared.invocation.invocationId,
+    sessionIdentityId: outlinePrepared.session.sessionIdentityId,
+    rawTranscript: JSON.stringify(assembled),
+    createdAt: outlinePrepared.invocation.finishedAt ?? new Date().toISOString(),
+    expectedFirstBatchId: firstBatchId,
+    refinedPlanVersionId: `${workflowId}:refined-plan:1`,
+    repositoryAuditId: audit.repositoryAuditId,
+    version: 1,
+    actor: outlinePrepared.execution,
+    preparedInvocation: outlinePrepared,
+  });
 }
 
 export async function reviewWorkflowRefineCommand(
@@ -1760,6 +1834,88 @@ function persistCliActor(
   };
   store.workflowStore.saveEntity({ kind: 'ACTOR_EXECUTION', value: actor });
   return actor;
+}
+
+/** Invocation 0 of refinement: the whole plan's SHAPE, with no batch bodies. */
+export function buildRefinementOutlinePrompt(input: {
+  readonly workflowId: string;
+  readonly repositoryAudit: unknown;
+  readonly generalPlanContent: string;
+  readonly requirements: readonly {
+    readonly requirementId: string;
+    readonly sourceReference: string;
+    readonly statement: string;
+  }[];
+}): string {
+  return `Act as the assigned plan refiner. Audit the supplied repository evidence against the external plan, then return the refinement OUTLINE only.
+
+${reviewWorkflowContracts.buildContractInstruction(
+  reviewWorkflowContracts.refinementOutlineContractSchema,
+  'REFINEMENT_OUTLINE_RESULT',
+)}
+
+Do NOT write the batch plans here — each batch is authored in its own separate response
+afterwards, so this outline stays small. For ordinal N use:
+- batchId: ${input.workflowId}:batch:N
+- batchPlanVersionId: ${input.workflowId}:batch:N:plan:1
+
+Ordinals must be sequential starting at 1. Every imported requirement must appear exactly
+once in requirementCoverage and map to at least one declared batch plan version and
+acceptance criterion. Choose the acceptance criterion IDs now; the batch responses will
+define those exact criteria.
+
+Repository audit:
+${JSON.stringify(input.repositoryAudit, null, 2)}
+
+Imported requirements:
+${JSON.stringify(input.requirements, null, 2)}
+
+External general plan:
+${input.generalPlanContent}`;
+}
+
+/** One batch plan per invocation — stored the moment it completes. */
+export function buildBatchPlanPrompt(input: {
+  readonly workflowId: string;
+  readonly batch: {
+    readonly batchId: string;
+    readonly batchPlanVersionId: string;
+    readonly ordinal: number;
+    readonly objective: string;
+  };
+  readonly outlineSummary: string;
+  readonly requirements: readonly {
+    readonly requirementId: string;
+    readonly sourceReference: string;
+    readonly statement: string;
+  }[];
+  readonly earlierBatchIds: readonly string[];
+}): string {
+  return `Author the COMPLETE batch plan for batch ${input.batch.ordinal} only. You already produced the outline; this response covers exactly one batch.
+
+${reviewWorkflowContracts.buildContractInstruction(
+  reviewWorkflowContracts.batchPlanContractSchema,
+  'BATCH_PLAN_RESULT',
+)}
+
+Use exactly these identifiers:
+- batchId: ${input.batch.batchId}
+- batchPlanVersionId: ${input.batch.batchPlanVersionId}
+- ordinal: ${input.batch.ordinal}
+
+Objective agreed in the outline: ${input.batch.objective}
+Refinement summary: ${input.outlineSummary}
+
+dependencies may reference ONLY these earlier batch IDs: ${
+    input.earlierBatchIds.length === 0
+      ? '(none — this is the first batch)'
+      : input.earlierBatchIds.join(', ')
+  }
+Every acceptance criterion's sourceRequirementIds must reference imported requirement IDs.
+Do not describe any other batch.
+
+Imported requirements:
+${JSON.stringify(input.requirements, null, 2)}`;
 }
 
 export function buildRefinementPrompt(input: {

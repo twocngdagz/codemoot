@@ -4,9 +4,11 @@ import { createHash } from 'node:crypto';
 import type { z } from 'zod';
 import type { Finding, FindingDisposition } from '../review-workflow/types.js';
 import {
+  batchPlanContractSchema,
   dispositionResultContractSchema,
   finalAuditResultContractSchema,
   implementationResultContractSchema,
+  refinementOutlineContractSchema,
   refinementResultContractSchema,
   reviewResultContractSchema,
 } from './schemas.js';
@@ -110,6 +112,18 @@ function parseContract<Schema extends z.ZodTypeAny>(
 
 export function parseRefinementResult(rawTranscript: string): RefinementResultContract {
   return parseContract(rawTranscript, refinementResultContractSchema);
+}
+
+export function parseRefinementOutline(
+  rawTranscript: string,
+): z.output<typeof refinementOutlineContractSchema> {
+  return parseContract(rawTranscript, refinementOutlineContractSchema);
+}
+
+export function parseBatchPlanResult(
+  rawTranscript: string,
+): z.output<typeof batchPlanContractSchema> {
+  return parseContract(rawTranscript, batchPlanContractSchema);
 }
 
 export function parseReviewResult(rawTranscript: string): ReviewResultContract {

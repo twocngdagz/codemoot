@@ -43,6 +43,20 @@ A map of **aliases** (any name) to model configurations. Roles reference these a
 | `maxOutputBytes` | positive int | optional | Output capture cap |
 | `envAllowlist` | string[] | optional | Extra environment variables passed to the CLI subprocess (everything else is filtered). E.g. `[MAX_THINKING_TOKENS]` lets `export MAX_THINKING_TOKENS=31999` deepen Claude's thinking |
 
+**Output-ceiling pitfall (measured):** a 43-minute refinement failed with *"Claude's
+response exceeded the 64000 output token maximum"*. The CLI's remedy —
+`CLAUDE_CODE_MAX_OUTPUT_TOKENS` — is allowlisted by default (as is `MAX_THINKING_TOKENS`),
+but the allowlist only forwards variables that already exist, so export it in the launching
+shell:
+
+```bash
+CLAUDE_CODE_MAX_OUTPUT_TOKENS=128000 codemoot workflow run --plan <plan.md> --background
+```
+
+If a run fails at the same number despite the variable being set, the ceiling is the
+model's rather than the client's, and the response genuinely cannot fit in one turn — the
+fix is then to reduce what a single invocation must emit, not to raise the limit.
+
 **Cost reality (measured, `--effort max`, 137-140 KB prompt):** a SINGLE plan-refinement
 invocation cost **$3.40-$5.07** and ran 13-30 minutes. At that rate
 `maxTotalAgentInvocations: 100` implies a ceiling in the hundreds of dollars, while

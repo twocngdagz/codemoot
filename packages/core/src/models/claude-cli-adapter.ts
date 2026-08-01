@@ -79,6 +79,11 @@ const CLAUDE_ENV_ALLOWLIST = [
   'ANTHROPIC_AUTH_TOKEN',
   'ANTHROPIC_BASE_URL',
   'CLAUDE_CODE_OAUTH_TOKEN',
+  // The CLI's OWN recommended remedies for output/thinking limits: stripping these made
+  // "set the CLAUDE_CODE_MAX_OUTPUT_TOKENS environment variable" unactionable through
+  // CodeMoot after a 43-minute invocation hit the 64000-token output ceiling.
+  'CLAUDE_CODE_MAX_OUTPUT_TOKENS',
+  'MAX_THINKING_TOKENS',
   'CLAUDE_CODE_USE_BEDROCK',
   'CLAUDE_CODE_SKIP_BEDROCK_AUTH',
   'ANTHROPIC_BEDROCK_BASE_URL',

@@ -566,6 +566,15 @@ export const REVIEW_WORKFLOW_MIGRATIONS = [
 
   REVIEW_WORKFLOW_RUNNER_STATE_DDL,
 
+  `CREATE TABLE IF NOT EXISTS review_workflow_refinement_drafts (
+    workflow_id  TEXT NOT NULL,
+    ordinal      INTEGER NOT NULL,
+    batch_id     TEXT NOT NULL,
+    draft_json   TEXT NOT NULL,
+    created_at   TEXT NOT NULL,
+    PRIMARY KEY (workflow_id, ordinal)
+  )`,
+
   `CREATE TABLE IF NOT EXISTS review_workflow_runner_log (
     log_id       INTEGER PRIMARY KEY AUTOINCREMENT,
     workflow_id  TEXT NOT NULL,

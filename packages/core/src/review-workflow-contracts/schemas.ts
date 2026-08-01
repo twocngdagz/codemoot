@@ -272,6 +272,58 @@ function validateReviewResult(
   }
 }
 
+/**
+ * The refinement OUTLINE: the whole plan's shape without any batch bodies. Small enough to
+ * always fit in one response — the batch plans themselves arrive one invocation at a time.
+ */
+export const refinementOutlineContractSchema = z
+  .object({
+    schemaVersion: z.literal(REVIEW_WORKFLOW_CONTRACT_SCHEMA_VERSION),
+    contractKind: z.literal('REFINEMENT_OUTLINE_RESULT'),
+    summary: z.string().min(1),
+    refinedPlanContent: z.string().min(1),
+    batches: z
+      .array(
+        z
+          .object({
+            batchId: idSchema,
+            batchPlanVersionId: idSchema,
+            ordinal: z.number().int().positive(),
+            objective: z.string().min(1),
+          })
+          .strict(),
+      )
+      .min(1),
+    requirementCoverage: z.array(requirementCoverageSchema),
+  })
+  .strict()
+  .superRefine((value, context) => {
+    const ordinals = value.batches.map((batch) => batch.ordinal);
+    if (ordinals.some((ordinal, index) => ordinal !== index + 1)) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['batches'],
+        message: 'Batch ordinals must be sequential starting at 1',
+      });
+    }
+    if (!uniqueStrings(value.batches.map((batch) => batch.batchId))) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['batches'],
+        message: 'Batch IDs must be unique',
+      });
+    }
+  });
+
+/** ONE batch plan, authored in its own invocation and stored the moment it completes. */
+export const batchPlanContractSchema = z
+  .object({
+    schemaVersion: z.literal(REVIEW_WORKFLOW_CONTRACT_SCHEMA_VERSION),
+    contractKind: z.literal('BATCH_PLAN_RESULT'),
+    batchPlan: batchPlanDraftSchema,
+  })
+  .strict();
+
 export const refinementResultContractSchema = z
   .object({
     schemaVersion: z.literal(REVIEW_WORKFLOW_CONTRACT_SCHEMA_VERSION),

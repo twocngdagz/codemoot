@@ -115,7 +115,38 @@ function importedRequirementId(workflowId: string): string {
   return requirementId;
 }
 
-/** The exact REFINEMENT_RESULT contract the scripted implementer returns. */
+/**
+ * Refinement is per batch: the implementer returns an OUTLINE first, then one BATCH_PLAN
+ * per batch. This helper yields both scenario steps in order.
+ */
+function buildRefinementSteps(
+  workflowId: string,
+  extraVerificationCommands: readonly Record<string, unknown>[] = [],
+): readonly { response: Record<string, unknown> }[] {
+  const full = buildRefinementContract(workflowId, extraVerificationCommands);
+  const batchPlans = full.batchPlans as Record<string, unknown>[];
+  const outline = {
+    schemaVersion: 1,
+    contractKind: 'REFINEMENT_OUTLINE_RESULT',
+    summary: full.summary,
+    refinedPlanContent: full.refinedPlanContent,
+    batches: batchPlans.map((plan) => ({
+      batchId: plan.batchId,
+      batchPlanVersionId: plan.batchPlanVersionId,
+      ordinal: plan.ordinal,
+      objective: plan.objective,
+    })),
+    requirementCoverage: full.requirementCoverage,
+  };
+  return [
+    { response: outline },
+    ...batchPlans.map((batchPlan) => ({
+      response: { schemaVersion: 1, contractKind: 'BATCH_PLAN_RESULT', batchPlan },
+    })),
+  ];
+}
+
+/** The complete refinement, used to derive the per-batch scenario steps above. */
 function buildRefinementContract(
   workflowId: string,
   extraVerificationCommands: readonly Record<string, unknown>[] = [],
@@ -455,7 +486,7 @@ describe('codemoot workflow run lifecycle (real command, scenario-driven adapter
       const { projectDir, remoteDir } = createProject();
       const workflowId = 'workflow-lifecycle-success';
       writeSteps(projectDir, 'claude', [
-        { response: buildRefinementContract(workflowId) },
+        ...buildRefinementSteps(workflowId),
         PREFLIGHT_READY_STEP,
         IMPLEMENTATION_STEP,
         PREFLIGHT_READY_STEP, // correction-pass resume gate
@@ -507,7 +538,7 @@ describe('codemoot workflow run lifecycle (real command, scenario-driven adapter
         const audit = planStore.workflowStore.listInvocationAudit(workflowId);
         expect(audit.filter((row) => row.resultStatus === 'FAILED')).toHaveLength(0);
         expect(phaseCounts(db, workflowId)).toEqual({
-          PLAN_REFINEMENT: 1,
+          PLAN_REFINEMENT: 2,
           PLAN_REVIEW: 1,
           // preflight + implementation + correction resume + correction implementation
           IMPLEMENTATION: 4,
@@ -534,7 +565,9 @@ describe('codemoot workflow run lifecycle (real command, scenario-driven adapter
         expect(notifications[0]?.message).toContain('ready for human verification');
 
         // The scripted adapters were consumed exactly once per lifecycle step.
-        expect(scenarioCallCount(projectDir, 'claude')).toBe(6);
+        // 7 = outline + 1 batch plan (refinement is per batch) + preflight + implement
+        // + correction + dispositions + resume.
+        expect(scenarioCallCount(projectDir, 'claude')).toBe(7);
         expect(scenarioCallCount(projectDir, 'codex')).toBe(5);
 
         // The remote directory really is the pushed destination (sanity for the fixture).
@@ -559,7 +592,7 @@ describe('codemoot workflow run lifecycle (real command, scenario-driven adapter
       // Straight success path (round-1 approval, no correction) so the interruption is the
       // only variable: the gated push fails because the remote is temporarily read-only.
       writeSteps(projectDir, 'claude', [
-        { response: buildRefinementContract(workflowId) },
+        ...buildRefinementSteps(workflowId),
         PREFLIGHT_READY_STEP,
         IMPLEMENTATION_STEP,
       ]);
@@ -586,7 +619,7 @@ describe('codemoot workflow run lifecycle (real command, scenario-driven adapter
         expect(planStore.listBatches(workflowId)[0]?.persistedState).toBe('APPROVED_FOR_MERGE');
         countsBeforeResume = phaseCounts(dbAfterStop, workflowId);
         expect(countsBeforeResume).toEqual({
-          PLAN_REFINEMENT: 1,
+          PLAN_REFINEMENT: 2,
           PLAN_REVIEW: 1,
           IMPLEMENTATION: 2,
           CODE_REVIEW: 1,
@@ -615,7 +648,8 @@ describe('codemoot workflow run lifecycle (real command, scenario-driven adapter
         // The resumed worker re-entered at PUSH: not one additional agent invocation was
         // made in any phase, and the fake CLIs were never called again.
         expect(phaseCounts(db, workflowId)).toEqual(countsBeforeResume);
-        expect(scenarioCallCount(projectDir, 'claude')).toBe(3);
+        // 4 = outline + 1 batch plan + preflight + implement.
+        expect(scenarioCallCount(projectDir, 'claude')).toBe(4);
         expect(scenarioCallCount(projectDir, 'codex')).toBe(4);
 
         // The push now succeeded and the workflow completed.
@@ -658,7 +692,7 @@ describe('codemoot workflow run lifecycle (real command, scenario-driven adapter
         relatedCriterionIds: [CRITERION_ID],
       };
       writeSteps(projectDir, 'claude', [
-        { response: buildRefinementContract(workflowId, [sideEffectCommand]) },
+        ...buildRefinementSteps(workflowId, [sideEffectCommand]),
         PREFLIGHT_READY_STEP,
         IMPLEMENTATION_STEP,
       ]);
@@ -700,7 +734,7 @@ describe('codemoot workflow run lifecycle (real command, scenario-driven adapter
       // step so the concurrent pause command deterministically lands while an atomic
       // action is in flight.
       writeSteps(projectDir, 'claude', [
-        { response: buildRefinementContract(workflowId) },
+        ...buildRefinementSteps(workflowId),
         PREFLIGHT_READY_STEP,
         {
           ...IMPLEMENTATION_STEP,
@@ -770,7 +804,7 @@ describe('codemoot workflow run lifecycle (real command, scenario-driven adapter
         const planStore = new reviewWorkflowPlan.ReviewWorkflowPlanStore(db);
         // Exactly the single-run baseline: no phase was ever repeated across the pause.
         expect(phaseCounts(db, workflowId)).toEqual({
-          PLAN_REFINEMENT: 1,
+          PLAN_REFINEMENT: 2,
           PLAN_REVIEW: 1,
           IMPLEMENTATION: 2,
           CODE_REVIEW: 1,

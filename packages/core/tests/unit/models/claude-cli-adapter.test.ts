@@ -262,6 +262,18 @@ describe('buildClaudeEnvironment', () => {
     expect(describeProcessFailure('', '')).toContain('no stderr or stdout output');
   });
 
+  it("passes the CLI's own tuning knobs through so its advice is actionable", () => {
+    // A 43-minute invocation failed with "set the CLAUDE_CODE_MAX_OUTPUT_TOKENS
+    // environment variable" — while the allowlist stripped that exact variable.
+    const previous = process.env.CLAUDE_CODE_MAX_OUTPUT_TOKENS;
+    process.env.CLAUDE_CODE_MAX_OUTPUT_TOKENS = '128000';
+    try {
+      expect(buildClaudeEnvironment().CLAUDE_CODE_MAX_OUTPUT_TOKENS).toBe('128000');
+    } finally {
+      process.env.CLAUDE_CODE_MAX_OUTPUT_TOKENS = previous;
+    }
+  });
+
   it('passes USER through to the CLI so Keychain credentials are readable', () => {
     // Root cause of two failed runs: without USER the CLI cannot read macOS Keychain
     // credentials and exits 1 with "Not logged in".

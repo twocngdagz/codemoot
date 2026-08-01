@@ -7,7 +7,7 @@ import {
   REVIEW_WORKFLOW_RUNNER_STATE_DDL,
 } from './review-workflow-schema.js';
 
-const SCHEMA_VERSION = '15';
+const SCHEMA_VERSION = '16';
 
 const MIGRATIONS = [
   // Sessions
