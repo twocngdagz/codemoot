@@ -1,5 +1,39 @@
 // Additive SQLite schema for review-gated workflow persistence.
 
+/**
+ * The authoritative runner-state DDL: referenced by the ordinary migration list AND by the
+ * v14→v15 table rebuild (SQLite cannot alter a CHECK constraint in place).
+ */
+export const REVIEW_WORKFLOW_RUNNER_STATE_DDL = `CREATE TABLE IF NOT EXISTS review_workflow_runner_state (
+    workflow_id        TEXT PRIMARY KEY REFERENCES review_workflows(workflow_id),
+    status             TEXT NOT NULL CHECK(status IN (
+      'RUNNING', 'PAUSE_REQUESTED', 'PAUSED_BY_USER', 'HUMAN_DECISION_REQUIRED',
+      'CANCELLED', 'READY_FOR_HUMAN_VERIFICATION', 'FAILED'
+    )),
+    branch             TEXT NOT NULL,
+    base_branch        TEXT NOT NULL,
+    base_sha           TEXT NOT NULL,
+    total_batches      INTEGER NOT NULL DEFAULT 0,
+    current_ordinal    INTEGER,
+    phase              TEXT,
+    review_round       INTEGER,
+    correction_pass    INTEGER,
+    phase_started_at   TEXT,
+    last_heartbeat_at  TEXT,
+    last_checkpoint    TEXT,
+    stop_reason        TEXT,
+    stop_details       TEXT,
+    notified           INTEGER NOT NULL DEFAULT 0,
+    worker_id          TEXT,
+    lease_expires_at   TEXT,
+    limits_json        TEXT,
+    active_invocation_json TEXT,
+    paused_repo_json   TEXT,
+    counters_json      TEXT NOT NULL,
+    started_at         TEXT NOT NULL,
+    updated_at         TEXT NOT NULL
+  )`;
+
 export const REVIEW_WORKFLOW_MIGRATIONS = [
   `CREATE TABLE IF NOT EXISTS review_workflows (
     workflow_id                TEXT PRIMARY KEY,
@@ -530,34 +564,7 @@ export const REVIEW_WORKFLOW_MIGRATIONS = [
   `CREATE INDEX IF NOT EXISTS idx_review_workflow_session_continuity_batch
     ON review_workflow_session_continuity(batch_id, created_at)`,
 
-  `CREATE TABLE IF NOT EXISTS review_workflow_runner_state (
-    workflow_id        TEXT PRIMARY KEY REFERENCES review_workflows(workflow_id),
-    status             TEXT NOT NULL CHECK(status IN (
-      'RUNNING', 'HUMAN_DECISION_REQUIRED', 'CANCELLED',
-      'READY_FOR_HUMAN_VERIFICATION', 'FAILED'
-    )),
-    branch             TEXT NOT NULL,
-    base_branch        TEXT NOT NULL,
-    base_sha           TEXT NOT NULL,
-    total_batches      INTEGER NOT NULL DEFAULT 0,
-    current_ordinal    INTEGER,
-    phase              TEXT,
-    review_round       INTEGER,
-    correction_pass    INTEGER,
-    phase_started_at   TEXT,
-    last_heartbeat_at  TEXT,
-    last_checkpoint    TEXT,
-    stop_reason        TEXT,
-    stop_details       TEXT,
-    notified           INTEGER NOT NULL DEFAULT 0,
-    worker_id          TEXT,
-    lease_expires_at   TEXT,
-    limits_json        TEXT,
-    active_invocation_json TEXT,
-    counters_json      TEXT NOT NULL,
-    started_at         TEXT NOT NULL,
-    updated_at         TEXT NOT NULL
-  )`,
+  REVIEW_WORKFLOW_RUNNER_STATE_DDL,
 
   `CREATE TABLE IF NOT EXISTS review_workflow_runner_log (
     log_id       INTEGER PRIMARY KEY AUTOINCREMENT,

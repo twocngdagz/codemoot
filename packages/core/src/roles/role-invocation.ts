@@ -149,6 +149,7 @@ const ROLE_AUTHORITIES: Readonly<Record<ResolvedRoleAdapter['role'], readonly Au
  */
 /** Live-monitoring hook: called when an agent invocation starts and when it settles. */
 export interface InvocationObserver {
+  /** Fail-closed: a throw here prevents the agent process from starting at all. */
   onStart(info: {
     readonly workflowId: string;
     readonly invocationId: string;
@@ -158,6 +159,13 @@ export interface InvocationObserver {
     readonly phase?: string;
     readonly startedAt: string;
   }): void;
+  /** The external agent process actually spawned: its outcome is now uncertain until settled. */
+  onAgentSpawned(workflowId: string, invocationId: string): void;
+  /**
+   * Called only once the invocation's outcome is DURABLE — the success path calls it inside
+   * the same transaction that persists the audit row; the failure path calls it after the
+   * failure audit is written.
+   */
   onSettle(workflowId: string, invocationId: string): void;
 }
 
@@ -233,8 +241,8 @@ export class RoleInvocationService {
           `Adapter stderr exceeded the ${STDERR_CAPTURE_LIMIT}-character capture limit; the invocation fails closed so the audit stays complete`,
         );
       }
-      // Fail closed: a settlement-persistence failure surfaces as a durable runner failure.
-      this.observer?.onSettle(input.workflowId, input.invocationId);
+      // NOT settled yet: the response only becomes durable when persistPrepared commits the
+      // audit row — settlement happens inside that same transaction.
       return prepared;
     } catch (error) {
       // Every FAILED invocation attempt is audited (and therefore budget-counted) too. If
@@ -247,10 +255,14 @@ export class RoleInvocationService {
         gitBefore,
       );
       let settleFailure: string | undefined;
-      try {
-        this.observer?.onSettle(input.workflowId, input.invocationId);
-      } catch (settleError) {
-        settleFailure = settleError instanceof Error ? settleError.message : String(settleError);
+      if (persistFailure === undefined) {
+        // The failure is durable: the marker may clear. If the failure audit could NOT be
+        // persisted, the marker stays set so the crash stays visible as unknown-outcome.
+        try {
+          this.observer?.onSettle(input.workflowId, input.invocationId);
+        } catch (settleError) {
+          settleFailure = settleError instanceof Error ? settleError.message : String(settleError);
+        }
       }
       if (settleFailure !== undefined) {
         const combined = `${error instanceof Error ? error.message : String(error)} (ADDITIONALLY: active-invocation settlement could not be persisted: ${settleFailure})`;
@@ -376,6 +388,10 @@ export class RoleInvocationService {
     const previousSession =
       binding === null ? this.loadPreviousSession(input) : this.loadBoundSession(binding, input);
 
+    // Fail closed BEFORE the external process can exist: if the durable marker cannot be
+    // promoted to AGENT_RUNNING, no agent is started. A crash after this write classifies
+    // conservatively as unknown-outcome — never as safely restartable.
+    this.observer?.onAgentSpawned(input.workflowId, input.invocationId);
     let call: BridgeCallResult;
     try {
       call =
@@ -608,9 +624,11 @@ export class RoleInvocationService {
   }
 
   persistPrepared(prepared: PreparedRoleInvocation): void {
-    // One transaction: an invocation may never persist without its binding and evidence.
+    // One transaction: an invocation may never persist without its binding and evidence,
+    // and the active-invocation marker clears ONLY when that evidence is durable.
     this.store.runAtomically(() => {
       this.persistPreparedRecords(prepared);
+      this.observer?.onSettle(prepared.audit.workflowId, prepared.invocation.invocationId);
     });
   }
 

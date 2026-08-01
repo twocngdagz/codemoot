@@ -74,7 +74,7 @@ describe('openDatabase', () => {
   it('sets schema version', () => {
     const db = openDatabase(':memory:');
     const version = getSchemaVersion(db);
-    expect(version).toBe('14');
+    expect(version).toBe('15');
     db.close();
   });
 
@@ -83,7 +83,7 @@ describe('openDatabase', () => {
     // Run migrations again -- should be idempotent
     runMigrations(db);
     const version = getSchemaVersion(db);
-    expect(version).toBe('14');
+    expect(version).toBe('15');
     db.close();
   });
 
@@ -105,7 +105,7 @@ describe('openDatabase', () => {
 
     runMigrations(db);
 
-    expect(getSchemaVersion(db)).toBe('14');
+    expect(getSchemaVersion(db)).toBe('15');
     expect(
       db.prepare('SELECT value FROM legacy_sentinel WHERE id = ?').pluck().get('legacy-1'),
     ).toBe('preserve-me');
@@ -133,6 +133,96 @@ describe('openDatabase', () => {
         .pluck()
         .get(),
     ).toBe(4);
+    db.close();
+  });
+
+  it('rebuilds a real v14 runner-state table so the pause statuses are accepted', () => {
+    // A faithful v14-shaped database: the OLD runner-state DDL (whose CHECK predates the
+    // pause statuses), version 14, and an existing RUNNING workflow row.
+    const db = new Database(':memory:');
+    db.exec(`CREATE TABLE review_workflows (
+      workflow_id TEXT PRIMARY KEY, status TEXT NOT NULL, general_plan_version_id TEXT NOT NULL,
+      refined_plan_version_id TEXT, implementer_assignment_id TEXT NOT NULL,
+      reviewer_assignment_id TEXT NOT NULL, configuration_hash TEXT NOT NULL,
+      aggregate_version INTEGER NOT NULL DEFAULT 0, payload_json TEXT NOT NULL DEFAULT '{}',
+      record_hash TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL DEFAULT '',
+      updated_at TEXT NOT NULL DEFAULT ''
+    )`);
+    db.exec(`CREATE TABLE review_workflow_runner_state (
+      workflow_id        TEXT PRIMARY KEY REFERENCES review_workflows(workflow_id),
+      status             TEXT NOT NULL CHECK(status IN (
+        'RUNNING', 'HUMAN_DECISION_REQUIRED', 'CANCELLED',
+        'READY_FOR_HUMAN_VERIFICATION', 'FAILED'
+      )),
+      branch             TEXT NOT NULL,
+      base_branch        TEXT NOT NULL,
+      base_sha           TEXT NOT NULL,
+      total_batches      INTEGER NOT NULL DEFAULT 0,
+      current_ordinal    INTEGER,
+      phase              TEXT,
+      review_round       INTEGER,
+      correction_pass    INTEGER,
+      phase_started_at   TEXT,
+      last_heartbeat_at  TEXT,
+      last_checkpoint    TEXT,
+      stop_reason        TEXT,
+      stop_details       TEXT,
+      notified           INTEGER NOT NULL DEFAULT 0,
+      worker_id          TEXT,
+      lease_expires_at   TEXT,
+      limits_json        TEXT,
+      active_invocation_json TEXT,
+      counters_json      TEXT NOT NULL,
+      started_at         TEXT NOT NULL,
+      updated_at         TEXT NOT NULL
+    )`);
+    db.exec('CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)');
+    db.prepare("INSERT INTO schema_meta(key, value) VALUES ('version', '14')").run();
+    db.prepare(
+      `INSERT INTO review_workflows (workflow_id, status, general_plan_version_id,
+        implementer_assignment_id, reviewer_assignment_id, configuration_hash)
+       VALUES ('wf-migrate', 'ACTIVE', 'plan', 'a-impl', 'a-rev', 'hash')`,
+    ).run();
+    db.prepare(
+      `INSERT INTO review_workflow_runner_state (
+         workflow_id, status, branch, base_branch, base_sha, counters_json, started_at, updated_at
+       ) VALUES ('wf-migrate', 'RUNNING', 'codemoot/x', 'main', '${'a'.repeat(40)}',
+                 '{"batch":null,"completedOrdinals":[],"completedBatches":[]}',
+                 '2026-08-01T00:00:00.000Z', '2026-08-01T00:00:00.000Z')`,
+    ).run();
+    // The old CHECK genuinely rejects the new status before migration.
+    expect(() =>
+      db.prepare("UPDATE review_workflow_runner_state SET status = 'PAUSE_REQUESTED'").run(),
+    ).toThrow(/CHECK/);
+
+    runMigrations(db);
+
+    // The rebuilt table accepts the pause statuses, kept the existing row intact, and
+    // carries the new paused-repo column.
+    expect(getSchemaVersion(db)).toBe('15');
+    db.prepare(
+      "UPDATE review_workflow_runner_state SET status = 'PAUSE_REQUESTED' WHERE workflow_id = 'wf-migrate'",
+    ).run();
+    const row = db
+      .prepare("SELECT * FROM review_workflow_runner_state WHERE workflow_id = 'wf-migrate'")
+      .get() as Record<string, unknown>;
+    expect(row.status).toBe('PAUSE_REQUESTED');
+    expect(row.branch).toBe('codemoot/x');
+    expect('paused_repo_json' in row).toBe(true);
+    db.prepare(
+      "UPDATE review_workflow_runner_state SET status = 'PAUSED_BY_USER' WHERE workflow_id = 'wf-migrate'",
+    ).run();
+    // Re-running migrations is idempotent.
+    runMigrations(db);
+    expect(
+      (
+        db
+          .prepare(
+            "SELECT status FROM review_workflow_runner_state WHERE workflow_id = 'wf-migrate'",
+          )
+          .get() as { status: string }
+      ).status,
+    ).toBe('PAUSED_BY_USER');
     db.close();
   });
 });

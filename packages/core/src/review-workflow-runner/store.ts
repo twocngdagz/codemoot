@@ -12,6 +12,7 @@ import {
   type RunnerCounters,
   RunnerError,
   type RunnerLogEntry,
+  type RunnerPausedRepoState,
   type RunnerState,
 } from './types.js';
 
@@ -23,6 +24,14 @@ const activeInvocationSchema = z.object({
   model: z.string().min(1),
   phase: z.string().nullable().optional(),
   startedAt: z.string().min(1),
+  // Older markers (pre-stage) classify conservatively as AGENT_RUNNING.
+  stage: z.enum(['PREPARING', 'AGENT_RUNNING']).default('AGENT_RUNNING'),
+});
+
+const pausedRepoSchema = z.object({
+  headSha: z.string().min(1),
+  clean: z.boolean(),
+  statusFingerprint: z.string().min(1),
 });
 
 const limitsSchema = z.object({
@@ -64,6 +73,7 @@ const stateRowSchema = z.object({
   lease_expires_at: z.string().nullable(),
   limits_json: z.string().nullable(),
   active_invocation_json: z.string().nullable(),
+  paused_repo_json: z.string().nullable(),
   counters_json: z.string().min(1),
   started_at: z.string().min(1),
   updated_at: z.string().min(1),
@@ -200,6 +210,9 @@ export class ReviewWorkflowRunnerStore {
               JSON.parse(parsed.active_invocation_json),
             ),
           }),
+      ...(parsed.paused_repo_json === null
+        ? {}
+        : { pausedRepo: pausedRepoSchema.parse(JSON.parse(parsed.paused_repo_json)) }),
       ...(parsed.worker_id === null ? {} : { workerId: parsed.worker_id }),
       ...(parsed.lease_expires_at === null ? {} : { leaseExpiresAt: parsed.lease_expires_at }),
       counters: countersSchema.parse(JSON.parse(parsed.counters_json)),
@@ -234,6 +247,7 @@ export class ReviewWorkflowRunnerStore {
       workerId: string | null;
       leaseExpiresAt: string | null;
       activeInvocation: RunnerActiveInvocation | null;
+      pausedRepo: RunnerPausedRepoState | null;
       counters: RunnerCounters;
     }>,
   ): RunnerState {
@@ -262,6 +276,8 @@ export class ReviewWorkflowRunnerStore {
         'active_invocation_json',
         patch.activeInvocation === null ? null : JSON.stringify(patch.activeInvocation),
       );
+    if (patch.pausedRepo !== undefined)
+      set('paused_repo_json', patch.pausedRepo === null ? null : JSON.stringify(patch.pausedRepo));
     if (patch.counters !== undefined) set('counters_json', JSON.stringify(patch.counters));
     set('updated_at', this.timestamp());
     this.db
@@ -437,9 +453,121 @@ export class ReviewWorkflowRunnerStore {
         `UPDATE review_workflow_runner_state
          SET worker_id = ?, lease_expires_at = ?, updated_at = ?
          WHERE workflow_id = ?
-           AND (worker_id IS NULL OR worker_id = ? OR lease_expires_at IS NULL OR lease_expires_at < ?)`,
+           AND status IN ('RUNNING', 'HUMAN_DECISION_REQUIRED')
+           AND (worker_id IS NULL OR worker_id = ?
+                OR worker_id LIKE 'launcher:%'
+                OR lease_expires_at IS NULL OR lease_expires_at < ?)`,
       )
       .run(workerId, expiresAt, now.toISOString(), workflowId, workerId, now.toISOString());
+    return result.changes === 1;
+  }
+
+  /**
+   * Atomically claims the resume of a PAUSED workflow: exactly one caller wins, so
+   * concurrent or repeated resume commands can never start two workers or cancel an
+   * in-flight graceful pause.
+   */
+  /** How long a winning resume claim may hold the launch lease before a worker takes over. */
+  static readonly LAUNCH_GRACE_SECONDS = 120;
+
+  /**
+   * Requests a graceful pause, conditionally: only a RUNNING workflow can enter
+   * PAUSE_REQUESTED, so a pause racing a successful READY (or any other terminal
+   * transition) always loses.
+   */
+  requestPause(workflowId: string): boolean {
+    const result = this.db
+      .prepare(
+        `UPDATE review_workflow_runner_state
+         SET status = 'PAUSE_REQUESTED', updated_at = ?
+         WHERE workflow_id = ? AND status = 'RUNNING'`,
+      )
+      .run(this.clock().toISOString(), workflowId);
+    return result.changes === 1;
+  }
+
+  /**
+   * Settles a requested pause, conditionally, capturing the paused repository state in the
+   * same write. Used by the worker's own graceful settle AND by resume when the pausing
+   * worker died (its lease expired) before settling.
+   */
+  settleRequestedPause(
+    workflowId: string,
+    pausedRepo: RunnerPausedRepoState,
+    options?: { readonly requireDeadLease?: boolean },
+  ): boolean {
+    const now = this.clock().toISOString();
+    const payload = JSON.stringify(pausedRepo);
+    const result =
+      options?.requireDeadLease === true
+        ? this.db
+            .prepare(
+              `UPDATE review_workflow_runner_state
+               SET status = 'PAUSED_BY_USER', phase = NULL, paused_repo_json = ?, updated_at = ?
+               WHERE workflow_id = ? AND status = 'PAUSE_REQUESTED'
+                 AND (lease_expires_at IS NULL OR lease_expires_at < ?)`,
+            )
+            .run(payload, now, workflowId, now)
+        : this.db
+            .prepare(
+              `UPDATE review_workflow_runner_state
+               SET status = 'PAUSED_BY_USER', phase = NULL, paused_repo_json = ?, updated_at = ?
+               WHERE workflow_id = ? AND status = 'PAUSE_REQUESTED'`,
+            )
+            .run(payload, now, workflowId);
+    return result.changes === 1;
+  }
+
+  claimResume(workflowId: string): boolean {
+    // ONE conditional statement claims either a settled pause or a STRANDED running
+    // workflow (a worker that died — or a launch that never produced one — leaves RUNNING
+    // with a dead lease). The winner stamps a short launch lease, so concurrent resumes
+    // cannot double-claim during the handoff to the real worker.
+    const now = this.clock();
+    const nowIso = now.toISOString();
+    const launchLease = new Date(
+      now.getTime() + ReviewWorkflowRunnerStore.LAUNCH_GRACE_SECONDS * 1000,
+    ).toISOString();
+    const result = this.db
+      .prepare(
+        `UPDATE review_workflow_runner_state
+         SET status = 'RUNNING', worker_id = ?, lease_expires_at = ?, updated_at = ?
+         WHERE workflow_id = ?
+           AND (status = 'PAUSED_BY_USER'
+                OR (status = 'RUNNING'
+                    AND (lease_expires_at IS NULL OR lease_expires_at < ?)))`,
+      )
+      .run(`launcher:${process.pid}`, launchLease, nowIso, workflowId, nowIso);
+    return result.changes === 1;
+  }
+
+  /** Reverts a claimed-but-never-launched resume so the workflow stays publicly resumable. */
+  revertResumeClaim(workflowId: string): void {
+    const now = this.clock().toISOString();
+    this.db
+      .prepare(
+        `UPDATE review_workflow_runner_state
+         SET status = 'PAUSED_BY_USER', worker_id = NULL, lease_expires_at = NULL, updated_at = ?
+         WHERE workflow_id = ? AND status = 'RUNNING'
+           AND (worker_id LIKE 'launcher:%'
+                OR lease_expires_at IS NULL OR lease_expires_at < ?)`,
+      )
+      .run(now, workflowId, now);
+  }
+
+  /**
+   * The terminal READY transition, as ONE conditional write: it succeeds only while the
+   * workflow is still RUNNING, so a pause that lands during the final action always wins.
+   */
+  markReady(workflowId: string): boolean {
+    const result = this.db
+      .prepare(
+        `UPDATE review_workflow_runner_state
+         SET status = 'READY_FOR_HUMAN_VERIFICATION', phase = NULL,
+             stop_reason = NULL, stop_details = NULL, notified = 1, updated_at = ?
+         WHERE workflow_id = ? AND status = 'RUNNING'`,
+      )
+      .run(this.clock().toISOString(), workflowId);
     return result.changes === 1;
   }
 

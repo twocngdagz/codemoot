@@ -17,6 +17,7 @@ export const RUNNER_STOP_REASONS = [
   'TOKEN_BUDGET_REACHED',
   'COST_BUDGET_REACHED',
   'WORKER_HEARTBEAT_EXPIRED',
+  'OUTCOME_UNKNOWN',
   'SESSION_CONTINUITY_FAILURE',
   'AUTHENTICATION_REQUIRED',
   'PUSH_FAILED',
@@ -26,6 +27,8 @@ export type RunnerStopReason = (typeof RUNNER_STOP_REASONS)[number];
 
 export const RUNNER_STATUSES = [
   'RUNNING',
+  'PAUSE_REQUESTED',
+  'PAUSED_BY_USER',
   'HUMAN_DECISION_REQUIRED',
   'CANCELLED',
   'READY_FOR_HUMAN_VERIFICATION',
@@ -104,7 +107,12 @@ export interface RunnerCounters {
   pendingDecision?: HumanDecisionAction;
 }
 
-/** The agent invocation currently in flight, persisted for live monitoring. */
+/**
+ * The agent invocation currently in flight, persisted for live monitoring AND crash
+ * classification: PREPARING means the external agent process never spawned (safe to
+ * restart); AGENT_RUNNING means the agent ran and its outcome is unknown until the
+ * response and receipt become durable (never auto-repeated).
+ */
 export interface RunnerActiveInvocation {
   readonly invocationId: string;
   readonly role?: string | null;
@@ -112,6 +120,14 @@ export interface RunnerActiveInvocation {
   readonly model: string;
   readonly phase?: string | null;
   readonly startedAt: string;
+  readonly stage: 'PREPARING' | 'AGENT_RUNNING';
+}
+
+/** Repository state captured at pause time and verified on resume. */
+export interface RunnerPausedRepoState {
+  readonly headSha: string;
+  readonly clean: boolean;
+  readonly statusFingerprint: string;
 }
 
 export interface RunnerState {
@@ -120,6 +136,8 @@ export interface RunnerState {
   readonly limits?: RunnerConfig;
   /** Set while an agent invocation is in flight; null between invocations. */
   readonly activeInvocation?: RunnerActiveInvocation;
+  /** Captured when the workflow pauses; compared and cleared on resume. */
+  readonly pausedRepo?: RunnerPausedRepoState;
   readonly status: RunnerStatus;
   readonly branch: string;
   readonly baseBranch: string;
@@ -180,6 +198,8 @@ export interface RunnerGit {
   remoteHeadSha(branch: string): string | null;
   /** Local SHA of an arbitrary ref — used to prove the base branch was never touched. */
   refSha(ref: string): string;
+  /** Stable fingerprint of the worktree/index status — detects paused-state drift. */
+  statusFingerprint(): string;
 }
 
 /** Where a (possibly restarted) batch re-enters its stage sequence, derived from domain state. */

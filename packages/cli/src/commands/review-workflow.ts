@@ -161,9 +161,11 @@ export async function reviewWorkflowStatusCommand(workflowId: string): Promise<v
         nextAction:
           reconciled.status === 'HUMAN_DECISION_REQUIRED'
             ? `codemoot workflow decide ${workflowId} --action <fix_again|accept_risk|cancel> --rationale "..."`
-            : reconciled.status === 'RUNNING'
-              ? `codemoot workflow watch ${workflowId}`
-              : null,
+            : reconciled.status === 'PAUSED_BY_USER' || reconciled.status === 'PAUSE_REQUESTED'
+              ? `codemoot workflow resume ${workflowId} --background`
+              : reconciled.status === 'RUNNING'
+                ? `codemoot workflow watch ${workflowId}`
+                : null,
         limits: reconciled.limits ?? config.reviewGated?.autonomous ?? null,
         contractPacing: (() => {
           try {
@@ -1888,7 +1890,17 @@ function createRuntime(db: ReturnType<typeof openDatabase>, projectDir: string) 
             model: info.model,
             phase: info.phase ?? null,
             startedAt: info.startedAt,
+            // Nothing external has run yet: a crash here restarts safely.
+            stage: 'PREPARING',
           },
+        });
+      },
+      onAgentSpawned: (workflowId, invocationId) => {
+        const current = runnerStoreForObserver.get(workflowId);
+        if (current?.activeInvocation?.invocationId !== invocationId) return;
+        runnerStoreForObserver.update(workflowId, {
+          // The agent process exists: its outcome is uncertain until durably settled.
+          activeInvocation: { ...current.activeInvocation, stage: 'AGENT_RUNNING' },
         });
       },
       onSettle: (workflowId) => {
@@ -2279,6 +2291,10 @@ function createRunnerGit(projectDir: string): RunnerGitOps {
       return sha === undefined || sha.length === 0 ? null : sha;
     },
     refSha: (ref) => run(['rev-parse', ref]),
+    statusFingerprint: () =>
+      createHash('sha256')
+        .update(run(['status', '--porcelain']))
+        .digest('hex'),
     status: () => run(['status', '--porcelain']),
   };
 }
@@ -3380,6 +3396,16 @@ export async function reviewWorkflowRunCommand(options: WorkflowRunOptions): Pro
     });
     const planPath = resolve(projectDir, options.plan);
     const runtime = createRuntime(db, projectDir);
+    // `run --plan` ALWAYS creates a new workflow; an existing ID must go through
+    // `workflow resume` (or run-resume) so nothing is ever silently resumed.
+    if (
+      runtime.runnerStore.get(workflowId) !== null ||
+      runtime.store.getWorkflow(workflowId) !== null
+    ) {
+      throw new Error(
+        `Workflow ${workflowId} already exists; use \`codemoot workflow resume ${workflowId}\` to continue it`,
+      );
+    }
     // The workflow branch exists BEFORE the repository audit is captured, so refinement's
     // audit verification sees the branch it will actually run on. The base branch and its
     // immutable SHA were recorded above, before the branch switch.
@@ -3453,12 +3479,35 @@ async function runResumeInProcess(
   workflowId: string,
   timeoutSeconds: number,
 ): Promise<void> {
+  // First interrupt signal = graceful pause request: the durable status flips to
+  // PAUSE_REQUESTED, the current atomic action finishes and persists, and the runner
+  // settles to PAUSED_BY_USER. A second signal falls through to the default hard kill.
+  const requestPause = () => {
+    try {
+      if (runtime.runnerStore.requestPause(workflowId)) {
+        runtime.runnerStore.appendLog({
+          workflowId,
+          entryType: 'CHECKPOINT',
+          message: 'Pause requested by interrupt signal; finishing the current action',
+        });
+        console.error(
+          '\n[codemoot] pause requested — finishing the current action (interrupt again to kill)\n',
+        );
+      }
+    } catch {
+      // signal handling must never crash the worker
+    }
+  };
+  process.once('SIGINT', requestPause);
+  process.once('SIGTERM', requestPause);
   // ONE try/finally owns the guard: even a partial installation failure is restored, and
   // no validation, initialization, or spawn failure can leave the sentinel behind.
   try {
     installGitGuard(projectDir);
     await runResumeGuarded(runtime, projectDir, workflowId, timeoutSeconds);
   } finally {
+    process.removeListener('SIGINT', requestPause);
+    process.removeListener('SIGTERM', requestPause);
     uninstallGitGuard(projectDir);
   }
 }
@@ -3554,6 +3603,116 @@ export async function reviewWorkflowRunResumeCommand(
     const runtime = createRuntime(db, projectDir);
     await runResumeInProcess(runtime, projectDir, workflowId, options.timeout);
   });
+}
+
+export async function reviewWorkflowPauseCommand(workflowId: string): Promise<void> {
+  await withDatabase(async (db) => {
+    const runtime = createRuntime(db, process.cwd());
+    if (runtime.runnerStore.get(workflowId) === null) {
+      throw new Error(`Workflow ${workflowId} has no runner state`);
+    }
+    // No read-then-decide: the request is one conditional write (only RUNNING can enter
+    // PAUSE_REQUESTED), then settlement is ATTEMPTED with the dead-lease condition — it
+    // succeeds exactly when no live worker exists to finish an action, and a worker that
+    // acquired concurrently keeps ownership and settles the pause itself.
+    if (!runtime.runnerStore.requestPause(workflowId)) {
+      const current = runtime.runnerStore.require(workflowId);
+      if (current.status === 'PAUSED_BY_USER' || current.status === 'PAUSE_REQUESTED') {
+        printJson({ workflowId, status: current.status, note: 'already pausing or paused' });
+        return;
+      }
+      printJson({ workflowId, status: current.status, note: 'not running; nothing to pause' });
+      return;
+    }
+    const pauseGit = createRunnerGit(process.cwd());
+    const settled = runtime.runnerStore.settleRequestedPause(
+      workflowId,
+      {
+        headSha: pauseGit.headSha(),
+        clean: pauseGit.isClean(),
+        statusFingerprint: pauseGit.statusFingerprint(),
+      },
+      { requireDeadLease: true },
+    );
+    runtime.runnerStore.appendLog({
+      workflowId,
+      entryType: 'CHECKPOINT',
+      message: settled
+        ? 'Workflow paused by user (no live worker held the lease)'
+        : 'Pause requested by user; the worker will finish its current action and pause',
+    });
+    // Report the DURABLE state, not a prediction.
+    const durable = runtime.runnerStore.require(workflowId);
+    printJson({
+      workflowId,
+      status: durable.status,
+      observed: reviewWorkflowRunner.deriveObservedStatus(durable, 120, new Date()).status,
+    });
+  });
+}
+
+export async function reviewWorkflowResumeCommand(
+  workflowId: string,
+  options: { readonly timeout: number; readonly background?: boolean },
+): Promise<void> {
+  await withDatabase(async (db) => {
+    const runtime = createRuntime(db, process.cwd());
+    const state = runtime.runnerStore.get(workflowId);
+    if (state === null) throw new Error(`Workflow ${workflowId} has no runner state`);
+    if (state.status === 'PAUSE_REQUESTED') {
+      // A pause request whose worker died before settling: settle it here — capturing the
+      // repository state exactly like the worker would have — before claiming. The settle
+      // is conditional on the dead lease, so an in-flight graceful pause is untouched.
+      const settleGit = createRunnerGit(process.cwd());
+      runtime.runnerStore.settleRequestedPause(
+        workflowId,
+        {
+          headSha: settleGit.headSha(),
+          clean: settleGit.isClean(),
+          statusFingerprint: settleGit.statusFingerprint(),
+        },
+        { requireDeadLease: true },
+      );
+    }
+    // ONE atomic claim covers both resumable shapes (a settled pause, or a STRANDED
+    // RUNNING workflow whose worker/launcher died): exactly one concurrent resume wins —
+    // the winner holds a short launch lease until the real worker takes over — and an
+    // in-flight graceful pause (live lease) is never cancelled.
+    if (!runtime.runnerStore.claimResume(workflowId)) {
+      const current = runtime.runnerStore.require(workflowId);
+      const leaseLive =
+        current.leaseExpiresAt !== undefined && Date.parse(current.leaseExpiresAt) > Date.now();
+      if (current.status === 'PAUSE_REQUESTED' && leaseLive) {
+        throw new Error(
+          `Workflow ${workflowId} is still pausing (a live worker is finishing its current action); retry once it reports PAUSED_BY_USER`,
+        );
+      }
+      if (current.status === 'RUNNING') {
+        throw new Error(
+          `Workflow ${workflowId} is RUNNING (already claimed by another resume or worker); resume only continues a paused workflow`,
+        );
+      }
+      throw new Error(
+        `Workflow ${workflowId} is ${current.status}; resume only continues a paused workflow (use workflow decide for stopped ones)`,
+      );
+    }
+    runtime.runnerStore.appendLog({
+      workflowId,
+      entryType: 'CHECKPOINT',
+      message: 'Resume requested by user; continuing from the next unfinished action',
+    });
+  });
+  try {
+    await reviewWorkflowRunResumeCommand(workflowId, options);
+  } catch (error) {
+    // A launch that never produced a worker must not strand the workflow in a
+    // publicly-unresumable RUNNING state: the claim is reverted (only when no live
+    // worker exists) and the failure surfaces.
+    await withDatabase(async (db) => {
+      createRuntime(db, process.cwd()).runnerStore.revertResumeClaim(workflowId);
+    });
+    throw error;
+  }
 }
 
 export async function reviewWorkflowWatchCommand(workflowId: string): Promise<void> {

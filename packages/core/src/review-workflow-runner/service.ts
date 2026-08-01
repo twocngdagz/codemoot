@@ -32,6 +32,14 @@ const defaultScheduler: RunnerScheduler = {
   clearInterval: (handle) => clearInterval(handle as ReturnType<typeof setInterval>),
 };
 
+/** Control-flow signal: a user pause was requested; settle gracefully after the current action. */
+class RunnerPause extends Error {
+  constructor() {
+    super('PAUSE_REQUESTED');
+    this.name = 'RunnerPause';
+  }
+}
+
 class RunnerStop extends Error {
   constructor(
     readonly reason: RunnerStopReason,
@@ -99,6 +107,11 @@ export class AutonomousWorkflowRunner {
     if (state.status === 'CANCELLED' || state.status === 'READY_FOR_HUMAN_VERIFICATION') {
       return { status: state.status };
     }
+    if (state.status === 'PAUSED_BY_USER' || state.status === 'PAUSE_REQUESTED') {
+      // A paused workflow only continues through the explicit resume command, which flips
+      // the durable status back to RUNNING before starting a worker.
+      return { status: state.status };
+    }
     const workerId = this.options.workerId ?? `worker-${process.pid}`;
     const leaseSeconds =
       this.options.leaseSeconds ?? this.limits(workflowId).heartbeatExpirySeconds;
@@ -162,6 +175,50 @@ export class AutonomousWorkflowRunner {
       }
     }
 
+    // A crashed worker leaves its in-flight invocation recorded. Classification is
+    // stage-based: PREPARING means the external agent never spawned (its command was
+    // reserved but nothing ran — safe to begin again); AGENT_RUNNING means the agent ran
+    // and its outcome never became durable — NEVER repeated without human reconciliation.
+    state = this.store.require(workflowId);
+    if (state.activeInvocation !== undefined) {
+      if (state.activeInvocation.stage === 'PREPARING') {
+        this.checkpoint(
+          workflowId,
+          null,
+          'RESUMING',
+          `Invocation ${state.activeInvocation.invocationId} was reserved but its agent never started; beginning it safely`,
+        );
+        this.store.update(workflowId, { activeInvocation: null });
+      } else {
+        return this.stop(
+          workflowId,
+          'OUTCOME_UNKNOWN',
+          `Invocation ${state.activeInvocation.invocationId} (${state.activeInvocation.phase ?? 'unknown phase'}) was in flight when the worker died; verify its external outcome, then decide fix_again to continue`,
+        );
+      }
+    }
+    // Repository reconciliation for a resumed pause: the paused HEAD and worktree state
+    // must be exactly as captured — unauthorized drift never reaches an agent action.
+    state = this.store.require(workflowId);
+    if (state.pausedRepo !== undefined) {
+      const headNow = this.git.headSha();
+      const fingerprintNow = this.git.statusFingerprint();
+      if (
+        headNow !== state.pausedRepo.headSha ||
+        fingerprintNow !== state.pausedRepo.statusFingerprint
+      ) {
+        return this.stop(
+          workflowId,
+          'HUMAN_DECISION_REQUIRED',
+          `The repository changed while paused (HEAD ${state.pausedRepo.headSha} -> ${headNow}, worktree drifted: ${fingerprintNow !== state.pausedRepo.statusFingerprint}); inspect and resolve before resuming`,
+        );
+      }
+      this.store.update(workflowId, { pausedRepo: null });
+    }
+    // Durable RESUMING marker for live monitoring; the first real phase overwrites it.
+    this.store.update(workflowId, { phase: 'RESUMING' });
+    this.checkpoint(workflowId, null, 'RESUMING', 'Reconciling durable state before continuing');
+
     const workflowStartedAt = Date.parse(state.startedAt);
     const heartbeatContext = { workerId, leaseSeconds };
     try {
@@ -204,6 +261,9 @@ export class AutonomousWorkflowRunner {
 
       return await this.complete(workflowId, heartbeatContext);
     } catch (error) {
+      if (error instanceof RunnerPause) {
+        return this.settlePause(workflowId);
+      }
       if (error instanceof RunnerStop) {
         return this.stop(workflowId, error.reason, error.details);
       }
@@ -340,6 +400,8 @@ export class AutonomousWorkflowRunner {
         stopDetails: `Decision ${recorded.decisionId} was bound to ${recorded.commitSha} but HEAD is ${head}; decide again on the current commit`,
       });
     }
+    // A decision explicitly reconciles any uncertain in-flight invocation from a crash.
+    this.store.update(state.workflowId, { activeInvocation: null });
     if (counters.batch !== null) {
       // Round/pass budgets are derived from durable coordinator events (including the human
       // grants applied by applyDecision) — counters are never edited to fake capacity.
@@ -417,16 +479,21 @@ export class AutonomousWorkflowRunner {
     await this.pushStage(workflowId, batch, workflowStartedAt, heartbeat);
   }
 
-  /** Durable coordinator events are the round/pass authority; counters mirror them. */
+  /**
+   * Durable coordinator events are the round/pass authority; counters mirror them EXACTLY.
+   * A runner counter incremented just before a pause/crash (whose action never emitted its
+   * durable event) is corrected DOWN here, so the resumed round numbering always matches
+   * the coordinator's own derivation.
+   */
   private async syncPacing(
     workflowId: string,
     batch: RunnerBatchDescriptor,
   ): Promise<RunnerUsedPacing> {
     const used = await this.phases.usedPacing(batch);
     this.mutateBatch(workflowId, (b) => {
-      b.planReviewRounds = Math.max(b.planReviewRounds, used.planReviewRounds);
-      b.codeReviewRounds = Math.max(b.codeReviewRounds, used.codeReviewRounds);
-      b.correctionPasses = Math.max(b.correctionPasses, used.correctionPasses);
+      b.planReviewRounds = used.planReviewRounds;
+      b.codeReviewRounds = used.codeReviewRounds;
+      b.correctionPasses = used.correctionPasses;
     });
     return used;
   }
@@ -743,19 +810,47 @@ export class AutonomousWorkflowRunner {
         `Completion requires matching HEADs: local ${local}, remote ${remote ?? 'missing'}`,
       );
     }
-    this.store.update(workflowId, {
-      status: 'READY_FOR_HUMAN_VERIFICATION',
-      phase: null,
-      stopReason: null,
-      stopDetails: null,
-      notified: true,
-    });
+    // The terminal transition is a single conditional write: if a pause request landed at
+    // ANY point during the final actions, the write loses and the pause settles instead —
+    // READY can never overwrite it.
+    if (!this.store.markReady(workflowId)) {
+      const contested = this.store.require(workflowId);
+      if (contested.status === 'PAUSE_REQUESTED') {
+        return this.settlePause(workflowId);
+      }
+      return { status: contested.status };
+    }
     this.checkpoint(workflowId, null, null, 'Workflow complete: READY_FOR_HUMAN_VERIFICATION');
     this.notify(
       workflowId,
       `Workflow ${workflowId} branch ${state.branch} is ready for human verification`,
     );
     return { status: 'READY_FOR_HUMAN_VERIFICATION' };
+  }
+
+  /**
+   * Settles a graceful pause: the current atomic action already persisted its receipt,
+   * response, and state; branch, worktree, sessions, jobs, events, and counters all stay.
+   */
+  private settlePause(workflowId: string): RunnerRunResult {
+    // Capture the exact repository shape being left behind; resume verifies it untouched.
+    // The settle is CONDITIONAL (only PAUSE_REQUESTED settles) so it can never overwrite a
+    // terminal transition that won a race.
+    const settled = this.store.settleRequestedPause(workflowId, {
+      headSha: this.git.headSha(),
+      clean: this.git.isClean(),
+      statusFingerprint: this.git.statusFingerprint(),
+    });
+    if (!settled) {
+      return { status: this.store.require(workflowId).status };
+    }
+    this.checkpoint(
+      workflowId,
+      null,
+      null,
+      'Workflow paused by user request; resume with codemoot workflow resume',
+    );
+    return { status: 'PAUSED_BY_USER' };
   }
 
   /** Stops autonomous execution: persist reason + checkpoint summary, notify exactly once. */
@@ -827,6 +922,10 @@ export class AutonomousWorkflowRunner {
     fn: () => Promise<T>,
   ): Promise<T> {
     const state = this.store.require(workflowId);
+    if (state.status === 'PAUSE_REQUESTED') {
+      // Action boundary: the previous atomic action fully settled; nothing new starts.
+      throw new RunnerPause();
+    }
     this.assertRepositoryInvariants(state, `before ${phase}`);
     const remoteBefore = this.git.remoteHeadSha(state.branch);
     const now = this.clock().toISOString();
@@ -1013,7 +1112,13 @@ export function deriveObservedStatus(
   heartbeatExpirySeconds: number,
   now: Date,
 ): { status: string; reason?: string } {
+  if (state.status === 'PAUSE_REQUESTED') return { status: 'PAUSING' };
+  if (state.status === 'PAUSED_BY_USER') return { status: 'PAUSED_BY_USER' };
+  if (state.stopReason === 'OUTCOME_UNKNOWN') {
+    return { status: 'OUTCOME_UNKNOWN', reason: 'OUTCOME_UNKNOWN' };
+  }
   if (state.status !== 'RUNNING') return { status: state.status };
+  if (state.phase === 'RESUMING') return { status: 'RESUMING' };
   if (state.lastHeartbeatAt === undefined) return { status: 'RUNNING' };
   const ageSeconds = (now.getTime() - Date.parse(state.lastHeartbeatAt)) / 1000;
   if (ageSeconds > heartbeatExpirySeconds) {

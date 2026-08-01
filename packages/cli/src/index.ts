@@ -59,7 +59,9 @@ import {
   reviewWorkflowJobsRunCommand,
   reviewWorkflowJobsShowCommand,
   reviewWorkflowLogsCommand,
+  reviewWorkflowPauseCommand,
   reviewWorkflowRefineCommand,
+  reviewWorkflowResumeCommand,
   reviewWorkflowRunCommand,
   reviewWorkflowRunResumeCommand,
   reviewWorkflowStartCommand,
@@ -468,6 +470,22 @@ reviewWorkflow
   .option('--timeout <seconds>', 'Per-invocation timeout in seconds', positiveInteger, 1800)
   .option('--id <workflow-id>', 'Explicit workflow ID')
   .action(reviewWorkflowRunCommand);
+
+reviewWorkflow
+  .command('pause')
+  .description('Gracefully pause an autonomous workflow after its current atomic action')
+  .argument('<workflow-id>', 'Review workflow ID')
+  .action(reviewWorkflowPauseCommand);
+
+reviewWorkflow
+  .command('resume')
+  .description('Resume a paused autonomous workflow from its next unfinished action')
+  .argument('<workflow-id>', 'Review workflow ID')
+  .option('--timeout <seconds>', 'Per-invocation timeout in seconds', positiveInteger, 1800)
+  .option('--background', 'Resume detached', false)
+  .action((workflowId: string, options: { timeout: number; background?: boolean }) =>
+    reviewWorkflowResumeCommand(workflowId, options),
+  );
 
 reviewWorkflow
   .command('run-resume')

@@ -27,6 +27,8 @@ import { openDatabase, reviewWorkflowPlan, reviewWorkflowRunner } from '@codemoo
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   reviewWorkflowDecideCommand,
+  reviewWorkflowPauseCommand,
+  reviewWorkflowResumeCommand,
   reviewWorkflowRunCommand,
   reviewWorkflowRunResumeCommand,
 } from '../src/commands/review-workflow.js';
@@ -682,6 +684,121 @@ describe('codemoot workflow run lifecycle (real command, scenario-driven adapter
         expect(state.stopDetails ?? '').toMatch(/uncommitted changes|clean worktree/);
         // The unexpected change was preserved for inspection — never cleaned or reset.
         expect(existsSync(join(projectDir, 'verify-side-effect.txt'))).toBe(true);
+      } finally {
+        db.close();
+      }
+    },
+  );
+
+  it(
+    'pauses gracefully mid-run through the public commands and resumes without repeating phases',
+    { timeout: 180_000 },
+    async () => {
+      const { projectDir, remoteDir } = createProject();
+      const workflowId = 'workflow-lifecycle-pause';
+      // Round-1-approved success path, with a deliberate delay inside the implementation
+      // step so the concurrent pause command deterministically lands while an atomic
+      // action is in flight.
+      writeSteps(projectDir, 'claude', [
+        { response: buildRefinementContract(workflowId) },
+        PREFLIGHT_READY_STEP,
+        {
+          ...IMPLEMENTATION_STEP,
+          shell: `sleep 4; ${IMPLEMENTATION_STEP.shell}`,
+        },
+      ]);
+      writeSteps(projectDir, 'codex', [
+        PLAN_REVIEW_APPROVED_STEP,
+        CODE_REVIEW_APPROVED_STEP,
+        VERIFICATION_ACCEPT_STEP,
+        finalAuditApprovedStep(workflowId),
+      ]);
+
+      // Fire the worker, then pause through the PUBLIC command once plan review is durably
+      // recorded (the implementation action is running or about to).
+      const runPromise = reviewWorkflowRunCommand({
+        plan: 'plan.md',
+        timeout: 120,
+        id: workflowId,
+      });
+      const deadline = Date.now() + 60_000;
+      for (;;) {
+        if (Date.now() > deadline) throw new Error('plan review never appeared in the audit');
+        const probe = openDatabase(getDbPath(projectDir));
+        try {
+          const planStore = new reviewWorkflowPlan.ReviewWorkflowPlanStore(probe);
+          const reviewed = planStore.workflowStore
+            .listInvocationAudit(workflowId)
+            .some((row) => row.phase === 'PLAN_REVIEW');
+          if (reviewed) break;
+        } finally {
+          probe.close();
+        }
+        await new Promise((resolveSleep) => setTimeout(resolveSleep, 100));
+      }
+      await reviewWorkflowPauseCommand(workflowId);
+      await runPromise;
+
+      const pausedDb = openDatabase(getDbPath(projectDir));
+      let countsAtPause: Record<string, number>;
+      try {
+        const runnerStore = new reviewWorkflowRunner.ReviewWorkflowRunnerStore(pausedDb);
+        const paused = runnerStore.require(workflowId);
+        // The in-flight atomic action finished and settled; the workflow is durably paused
+        // with branch, sessions, findings, and counters intact.
+        expect(paused.status).toBe('PAUSED_BY_USER');
+        expect(reviewWorkflowRunner.deriveObservedStatus(paused, 120, new Date()).status).toBe(
+          'PAUSED_BY_USER',
+        );
+        countsAtPause = phaseCounts(pausedDb, workflowId);
+        expect(countsAtPause.PLAN_REVIEW).toBe(1);
+      } finally {
+        pausedDb.close();
+      }
+
+      // `run --plan` NEVER silently resumes an existing workflow.
+      await expect(
+        reviewWorkflowRunCommand({ plan: 'plan.md', timeout: 120, id: workflowId }),
+      ).rejects.toThrow(/already exists.*resume/);
+
+      // The public resume continues from the next unfinished action to READY.
+      await reviewWorkflowResumeCommand(workflowId, { timeout: 120 });
+
+      const db = openDatabase(getDbPath(projectDir));
+      try {
+        const state = requireReady(db, workflowId);
+        const planStore = new reviewWorkflowPlan.ReviewWorkflowPlanStore(db);
+        // Exactly the single-run baseline: no phase was ever repeated across the pause.
+        expect(phaseCounts(db, workflowId)).toEqual({
+          PLAN_REFINEMENT: 1,
+          PLAN_REVIEW: 1,
+          IMPLEMENTATION: 2,
+          CODE_REVIEW: 1,
+          VERIFICATION: 1,
+          FINAL_AUDIT: 1,
+        });
+        // The SAME batch role sessions were reused — never replaced.
+        const batchId = `${workflowId}:batch:1`;
+        expect(planStore.workflowStore.getBatchRoleSession(batchId, 'IMPLEMENTER')).not.toBeNull();
+        expect(planStore.workflowStore.getBatchRoleSession(batchId, 'REVIEWER')).not.toBeNull();
+        const continuity = planStore.workflowStore.listSessionContinuity(batchId);
+        expect(continuity.some((row) => row.outcome === 'RESUMED')).toBe(true);
+        expect(continuity.every((row) => row.outcome !== 'FAILED')).toBe(true);
+        // Counters and limits were preserved, never reset.
+        expect(state.counters.completedBatches[0]?.planReviewRounds).toBe(1);
+        expect(state.counters.completedBatches[0]?.codeReviewRounds).toBe(1);
+        const localHead = git(projectDir, ['rev-parse', 'HEAD']);
+        expect(
+          execFileSync('git', ['rev-parse', state.branch], {
+            cwd: remoteDir,
+            encoding: 'utf8',
+          }).trim(),
+        ).toBe(localHead);
+
+        // Repeated resume on a finished workflow is refused with a clear message.
+        await expect(reviewWorkflowResumeCommand(workflowId, { timeout: 120 })).rejects.toThrow(
+          /READY_FOR_HUMAN_VERIFICATION/,
+        );
       } finally {
         db.close();
       }

@@ -513,6 +513,7 @@ describe('mandatory role-session continuity', () => {
       onStart: () => {
         throw new Error('runner state unavailable');
       },
+      onAgentSpawned: () => {},
       onSettle: () => {},
     });
     const request = input('implementer', { batchId: BATCH_A, role: 'IMPLEMENTER' });
@@ -520,14 +521,77 @@ describe('mandatory role-session continuity', () => {
     expect(implementerBridge.calls).toHaveLength(0);
   });
 
-  it('surfaces settlement-persistence failures as durable invocation failures', async () => {
+  it('settlement failure rolls back the durable write and surfaces as an error', async () => {
     const failing = new RoleInvocationService(store, undefined, {
       onStart: () => {},
+      onAgentSpawned: () => {},
       onSettle: () => {
         throw new Error('settlement write failed');
       },
     });
     const request = input('implementer', { batchId: BATCH_A, role: 'IMPLEMENTER' });
-    await expect(failing.prepare(request)).rejects.toThrow(/settlement/);
+    // Success-path settlement is transactional with the audit write: prepare succeeds, and
+    // the persist step both fails AND rolls the audit row back — nothing half-commits.
+    const prepared = await failing.prepare(request);
+    expect(() => failing.persistPrepared(prepared)).toThrow(/settlement/);
+    expect(
+      store
+        .listInvocationAudit(WORKFLOW_ID)
+        .some((row) => row.invocationId === prepared.invocation.invocationId),
+    ).toBe(false);
+  });
+
+  it('keeps the active-invocation marker until the durable persist settles it', async () => {
+    const events: string[] = [];
+    const observed = new RoleInvocationService(store, undefined, {
+      onStart: (info) => events.push(`start:${info.invocationId}`),
+      onAgentSpawned: (_workflowId, invocationId) => events.push(`spawned:${invocationId}`),
+      onSettle: (_workflowId, invocationId) => events.push(`settle:${invocationId}`),
+    });
+    const request = input('implementer', { batchId: BATCH_A, role: 'IMPLEMENTER' });
+    const prepared = await observed.prepare(request);
+    // The stage promotion fires BEFORE the agent could exist, and the response is NOT
+    // durable yet: no settlement has fired, so a crash here is classified as
+    // unknown-outcome, never silently repeated.
+    expect(events).toEqual([`start:${request.invocationId}`, `spawned:${request.invocationId}`]);
+    observed.persistPrepared(prepared);
+    // Settlement fires exactly once, inside the same transaction as the audit write.
+    expect(events).toEqual([
+      `start:${request.invocationId}`,
+      `spawned:${request.invocationId}`,
+      `settle:${request.invocationId}`,
+    ]);
+  });
+
+  it('never starts the agent when the AGENT_RUNNING promotion cannot be persisted', async () => {
+    const failing = new RoleInvocationService(store, undefined, {
+      onStart: () => {},
+      onAgentSpawned: () => {
+        throw new Error('stage promotion write failed');
+      },
+      onSettle: () => {},
+    });
+    const request = input('implementer', { batchId: BATCH_A, role: 'IMPLEMENTER' });
+    await expect(failing.prepare(request)).rejects.toThrow(/stage promotion write failed/);
+    // Fail closed: the external agent process never spawned.
+    expect(implementerBridge.calls).toHaveLength(0);
+  });
+
+  it('keeps the marker set when the failure audit itself cannot be persisted', async () => {
+    const events: string[] = [];
+    const observed = new RoleInvocationService(store, undefined, {
+      onStart: (info) => events.push(`start:${info.invocationId}`),
+      onAgentSpawned: (_workflowId, invocationId) => events.push(`spawned:${invocationId}`),
+      onSettle: (_workflowId, invocationId) => events.push(`settle:${invocationId}`),
+    });
+    implementerBridge.resumeBehavior = 'throw';
+    await invokeAndPersist(input('implementer', { batchId: BATCH_A, role: 'IMPLEMENTER' }));
+    // Break audit persistence, then fail the next (resuming) invocation.
+    db.exec('DROP TABLE review_workflow_invocation_audit');
+    const request = input('implementer', { batchId: BATCH_A, role: 'IMPLEMENTER' });
+    await expect(observed.prepare(request)).rejects.toThrow(/failure audit could not be persisted/);
+    // Without a durable failure record, the marker is NEVER cleared: the crash stays
+    // visible as an unknown outcome instead of disappearing.
+    expect(events.filter((event) => event.startsWith('settle:'))).toHaveLength(0);
   });
 });

@@ -70,6 +70,10 @@ class FakeGit implements RunnerGit {
   refSha(): string {
     return this.base;
   }
+  fingerprint = 'clean-tree';
+  statusFingerprint(): string {
+    return this.fingerprint;
+  }
 }
 
 type PhaseOverrides = Partial<RunnerPhases>;
@@ -120,10 +124,13 @@ function happyPhases(
       calls.push(`resume-stage:${batch.ordinal}`);
       return 'PLAN_REVIEW';
     },
-    usedPacing: async () => ({
-      planReviewRounds: 0,
-      codeReviewRounds: 0,
-      correctionPasses: 0,
+    usedPacing: async (batch) => ({
+      // Mirrors the coordinator's event-derived truth: exactly what actually completed.
+      planReviewRounds: calls.filter((call) => call.startsWith(`plan-review:${batch.ordinal}:`))
+        .length,
+      codeReviewRounds: calls.filter((call) => call.startsWith(`code-review:${batch.ordinal}:`))
+        .length,
+      correctionPasses: calls.filter((call) => call.startsWith(`correct:${batch.ordinal}:`)).length,
       grantedReviewRounds: 0,
       grantedCorrectionPasses: 0,
     }),
@@ -752,5 +759,188 @@ describe('AutonomousWorkflowRunner', () => {
     expect(result.status).toBe('HUMAN_DECISION_REQUIRED');
     expect(result.stopDetails).toContain('preserved for inspection');
     expect(runnerStore.require(WORKFLOW_ID).status).not.toBe('READY_FOR_HUMAN_VERIFICATION');
+  });
+
+  it('pauses gracefully after the current action and resumes from the next unfinished one', async () => {
+    const singleBatch: RunnerBatchDescriptor[] = [{ ordinal: 1, batchId: 'batch-1' }];
+    let implementations = 0;
+    const phases = happyPhases(singleBatch, {
+      implement: async () => {
+        // A concurrent `workflow pause` lands while this atomic action is running: the
+        // action still completes and settles before anything new is scheduled.
+        runnerStore.update(WORKFLOW_ID, { status: 'PAUSE_REQUESTED' });
+        implementations += 1;
+        return { commitSha: 'b'.repeat(40) };
+      },
+      resumeStage: async () => (implementations > 0 ? 'CODE_REVIEW' : 'PLAN_REVIEW'),
+    });
+    const runner = makeRunner(phases);
+    const paused = await runner.run(WORKFLOW_ID);
+    expect(paused.status).toBe('PAUSED_BY_USER');
+    const pausedState = runnerStore.require(WORKFLOW_ID);
+    expect(pausedState.status).toBe('PAUSED_BY_USER');
+    // The in-flight action completed; the completed plan review's counter survived;
+    // nothing later was scheduled.
+    expect(pausedState.counters.batch?.planReviewRounds).toBe(1);
+    expect(implementations).toBe(1);
+    expect(phases.calls.filter((call) => call.startsWith('plan-review'))).toHaveLength(1);
+    expect(phases.calls.some((call) => call.startsWith('code-review'))).toBe(false);
+
+    // A paused workflow never continues through a bare worker start.
+    expect((await runner.run(WORKFLOW_ID)).status).toBe('PAUSED_BY_USER');
+    expect(phases.calls.some((call) => call.startsWith('code-review'))).toBe(false);
+
+    // The public resume flow flips the durable status, then the worker continues from the
+    // next unfinished action — completed phases are never rerun.
+    runnerStore.update(WORKFLOW_ID, { status: 'RUNNING' });
+    const resumed = await runner.run(WORKFLOW_ID);
+    expect(resumed.status).toBe('READY_FOR_HUMAN_VERIFICATION');
+    expect(phases.calls.filter((call) => call.startsWith('plan-review'))).toHaveLength(1);
+    expect(implementations).toBe(1);
+    expect(phases.calls.filter((call) => call.startsWith('code-review'))).toHaveLength(1);
+    // Counters and limits were preserved, never reset.
+    const final = runnerStore.require(WORKFLOW_ID);
+    expect(final.counters.completedBatches[0]?.planReviewRounds).toBe(1);
+  });
+
+  it('stops with OUTCOME_UNKNOWN for a crashed in-flight invocation and never repeats it', async () => {
+    const phases = happyPhases(batches);
+    runnerStore.update(WORKFLOW_ID, {
+      activeInvocation: {
+        invocationId: 'invocation-crashed',
+        role: 'IMPLEMENTER',
+        adapterKind: 'CLAUDE',
+        model: 'claude-supported',
+        phase: 'IMPLEMENTATION',
+        startedAt: NOW,
+        stage: 'AGENT_RUNNING',
+      },
+    });
+    const result = await makeRunner(phases).run(WORKFLOW_ID);
+    expect(result.stopReason).toBe('OUTCOME_UNKNOWN');
+    expect(result.stopDetails).toContain('invocation-crashed');
+    // No phase ran at all — an uncertain agent invocation is never automatically repeated.
+    expect(phases.calls).toHaveLength(0);
+
+    // Explicit human reconciliation clears the uncertainty and the workflow continues.
+    const runner = makeRunner(phases);
+    runner.decide({
+      workflowId: WORKFLOW_ID,
+      action: 'FIX_AGAIN',
+      actor: 'roy',
+      rationale: 'Verified externally: the crashed invocation produced no commit.',
+    });
+    const resumed = await runner.run(WORKFLOW_ID);
+    expect(resumed.status).toBe('READY_FOR_HUMAN_VERIFICATION');
+    expect(runnerStore.require(WORKFLOW_ID).activeInvocation).toBeUndefined();
+  });
+
+  it('derives PAUSING, PAUSED_BY_USER, RESUMING, and OUTCOME_UNKNOWN observed statuses', () => {
+    const base = runnerStore.require(WORKFLOW_ID);
+    expect(deriveObservedStatus({ ...base, status: 'PAUSE_REQUESTED' }, 120, clockNow).status).toBe(
+      'PAUSING',
+    );
+    expect(deriveObservedStatus({ ...base, status: 'PAUSED_BY_USER' }, 120, clockNow).status).toBe(
+      'PAUSED_BY_USER',
+    );
+    expect(
+      deriveObservedStatus({ ...base, status: 'RUNNING', phase: 'RESUMING' }, 120, clockNow).status,
+    ).toBe('RESUMING');
+    expect(
+      deriveObservedStatus(
+        { ...base, status: 'HUMAN_DECISION_REQUIRED', stopReason: 'OUTCOME_UNKNOWN' },
+        120,
+        clockNow,
+      ).status,
+    ).toBe('OUTCOME_UNKNOWN');
+  });
+
+  it('safely restarts an invocation that was reserved but whose agent never spawned', async () => {
+    const phases = happyPhases(batches);
+    runnerStore.update(WORKFLOW_ID, {
+      activeInvocation: {
+        invocationId: 'invocation-never-started',
+        role: 'IMPLEMENTER',
+        adapterKind: 'CLAUDE',
+        model: 'claude-supported',
+        phase: 'IMPLEMENTATION',
+        startedAt: NOW,
+        stage: 'PREPARING',
+      },
+    });
+    const result = await makeRunner(phases).run(WORKFLOW_ID);
+    // Nothing external ever ran: the workflow continues normally to completion.
+    expect(result.status).toBe('READY_FOR_HUMAN_VERIFICATION');
+    expect(runnerStore.require(WORKFLOW_ID).activeInvocation).toBeUndefined();
+  });
+
+  it('a pause arriving during the terminal workflow audit settles as PAUSED, never READY', async () => {
+    const phases = happyPhases(batches, {
+      workflowAudit: async () => {
+        // The pause command lands while the final atomic action is running.
+        runnerStore.update(WORKFLOW_ID, { status: 'PAUSE_REQUESTED' });
+        return { approved: true, issues: [] };
+      },
+    });
+    const runner = makeRunner(phases);
+    const result = await runner.run(WORKFLOW_ID);
+    expect(result.status).toBe('PAUSED_BY_USER');
+    expect(runnerStore.require(WORKFLOW_ID).status).toBe('PAUSED_BY_USER');
+
+    // Resume completes without repeating the batches.
+    runnerStore.update(WORKFLOW_ID, { status: 'RUNNING' });
+    const resumed = await makeRunner(happyPhases(batches)).run(WORKFLOW_ID);
+    expect(resumed.status).toBe('READY_FOR_HUMAN_VERIFICATION');
+  });
+
+  it('refuses to resume when HEAD or the worktree changed while paused', async () => {
+    let implementations = 0;
+    const phases = happyPhases([{ ordinal: 1, batchId: 'batch-1' }], {
+      implement: async () => {
+        runnerStore.update(WORKFLOW_ID, { status: 'PAUSE_REQUESTED' });
+        implementations += 1;
+        return { commitSha: 'b'.repeat(40) };
+      },
+      resumeStage: async () => (implementations > 0 ? 'CODE_REVIEW' : 'PLAN_REVIEW'),
+    });
+    const runner = makeRunner(phases);
+    expect((await runner.run(WORKFLOW_ID)).status).toBe('PAUSED_BY_USER');
+    const paused = runnerStore.require(WORKFLOW_ID);
+    expect(paused.pausedRepo?.headSha).toBe(git.headSha());
+
+    // Someone commits (or dirties the tree) while the workflow is paused.
+    git.head = 'e'.repeat(40);
+    git.fingerprint = 'tampered-tree';
+    runnerStore.update(WORKFLOW_ID, { status: 'RUNNING' });
+    const drifted = await runner.run(WORKFLOW_ID);
+    expect(drifted.status).toBe('HUMAN_DECISION_REQUIRED');
+    expect(drifted.stopDetails).toContain('changed while paused');
+    // The drifted repository was preserved untouched for inspection.
+    expect(git.head).toBe('e'.repeat(40));
+  });
+
+  it('a pause request racing an already-successful READY always loses', () => {
+    // The reverse race: READY landed first; a stale pause command's write must no-op.
+    runnerStore.markReady(WORKFLOW_ID);
+    expect(runnerStore.requestPause(WORKFLOW_ID)).toBe(false);
+    expect(
+      runnerStore.settleRequestedPause(WORKFLOW_ID, {
+        headSha: 'a'.repeat(40),
+        clean: true,
+        statusFingerprint: 'fp',
+      }),
+    ).toBe(false);
+    expect(runnerStore.require(WORKFLOW_ID).status).toBe('READY_FOR_HUMAN_VERIFICATION');
+  });
+
+  it('the terminal READY write is conditional: a pause request always wins the race', () => {
+    // markReady only succeeds while RUNNING — the exact interleaving where a pause lands
+    // between the completion checks and the READY write is impossible by construction.
+    runnerStore.update(WORKFLOW_ID, { status: 'PAUSE_REQUESTED' });
+    expect(runnerStore.markReady(WORKFLOW_ID)).toBe(false);
+    expect(runnerStore.require(WORKFLOW_ID).status).toBe('PAUSE_REQUESTED');
+    runnerStore.update(WORKFLOW_ID, { status: 'RUNNING' });
+    expect(runnerStore.markReady(WORKFLOW_ID)).toBe(true);
+    expect(runnerStore.require(WORKFLOW_ID).status).toBe('READY_FOR_HUMAN_VERIFICATION');
   });
 });

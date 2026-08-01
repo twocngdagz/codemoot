@@ -2,9 +2,12 @@
 
 import Database from 'better-sqlite3';
 import { DatabaseError } from '../utils/errors.js';
-import { REVIEW_WORKFLOW_MIGRATIONS } from './review-workflow-schema.js';
+import {
+  REVIEW_WORKFLOW_MIGRATIONS,
+  REVIEW_WORKFLOW_RUNNER_STATE_DDL,
+} from './review-workflow-schema.js';
 
-const SCHEMA_VERSION = '14';
+const SCHEMA_VERSION = '15';
 
 const MIGRATIONS = [
   // Sessions
@@ -359,6 +362,11 @@ export function runMigrations(db: Database.Database): void {
       }
     }
 
+    // v15: the runner-state status CHECK gained pause states and the paused-repo column.
+    // SQLite cannot alter a CHECK in place, so an existing v14 table is rebuilt: rename,
+    // recreate from the authoritative DDL, copy every row, drop the old table.
+    migrateRunnerStateToV15(db);
+
     // Set schema version
     db.prepare("INSERT OR REPLACE INTO schema_meta(key, value) VALUES ('version', ?)").run(
       SCHEMA_VERSION,
@@ -367,6 +375,49 @@ export function runMigrations(db: Database.Database): void {
       "INSERT OR IGNORE INTO schema_meta(key, value) VALUES ('created_at', datetime('now'))",
     ).run();
   })();
+}
+
+function migrateRunnerStateToV15(db: Database.Database): void {
+  const existing = db
+    .prepare(
+      "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'review_workflow_runner_state'",
+    )
+    .get() as { sql: string } | undefined;
+  if (existing === undefined || existing.sql.includes('PAUSE_REQUESTED')) {
+    return; // fresh database or already migrated
+  }
+  db.exec('ALTER TABLE review_workflow_runner_state RENAME TO review_workflow_runner_state_v14');
+  db.exec(REVIEW_WORKFLOW_RUNNER_STATE_DDL);
+  const V14_COLUMNS = [
+    'workflow_id',
+    'status',
+    'branch',
+    'base_branch',
+    'base_sha',
+    'total_batches',
+    'current_ordinal',
+    'phase',
+    'review_round',
+    'correction_pass',
+    'phase_started_at',
+    'last_heartbeat_at',
+    'last_checkpoint',
+    'stop_reason',
+    'stop_details',
+    'notified',
+    'worker_id',
+    'lease_expires_at',
+    'limits_json',
+    'active_invocation_json',
+    'counters_json',
+    'started_at',
+    'updated_at',
+  ].join(', ');
+  db.exec(
+    `INSERT INTO review_workflow_runner_state (${V14_COLUMNS})
+     SELECT ${V14_COLUMNS} FROM review_workflow_runner_state_v14`,
+  );
+  db.exec('DROP TABLE review_workflow_runner_state_v14');
 }
 
 /** Get the current schema version. */

@@ -8,10 +8,17 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { openDatabase, reviewWorkflowPlan, reviewWorkflowRunner } from '@codemoot/core';
+import {
+  openDatabase,
+  reviewWorkflowPersistence,
+  reviewWorkflowPlan,
+  reviewWorkflowRunner,
+} from '@codemoot/core';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   installGitGuard,
+  reviewWorkflowPauseCommand,
+  reviewWorkflowResumeCommand,
   reviewWorkflowRunCommand,
   uninstallGitGuard,
 } from '../src/commands/review-workflow.js';
@@ -350,5 +357,187 @@ describe('codemoot workflow run (real command, scripted adapters)', () => {
         timeout: 15_000,
       }),
     ).toThrow();
+  });
+
+  function seedRunnerState(status: 'RUNNING' | 'PAUSED_BY_USER', leaseLiveMs?: number): void {
+    const db = openDatabase(getDbPath(projectDir));
+    try {
+      new reviewWorkflowPersistence.ReviewWorkflowStore(db).createWorkflow({
+        workflowId: WORKFLOW_ID,
+        status: 'ACTIVE',
+        generalPlanVersionId: `${WORKFLOW_ID}:general-plan`,
+        implementerAssignmentId: 'assignment-implementer',
+        reviewerAssignmentId: 'assignment-reviewer',
+        configurationHash: 'configuration-hash',
+        createdAt: '2026-08-01T00:00:00.000Z',
+        updatedAt: '2026-08-01T00:00:00.000Z',
+      });
+      const runnerStore = new reviewWorkflowRunner.ReviewWorkflowRunnerStore(db);
+      runnerStore.initState({
+        workflowId: WORKFLOW_ID,
+        branch: 'codemoot/x',
+        baseBranch: 'main',
+        baseSha: 'a'.repeat(40),
+      });
+      runnerStore.update(WORKFLOW_ID, {
+        status,
+        ...(leaseLiveMs === undefined
+          ? {}
+          : {
+              workerId: 'live-worker',
+              leaseExpiresAt: new Date(Date.now() + leaseLiveMs).toISOString(),
+            }),
+      });
+    } finally {
+      db.close();
+    }
+  }
+
+  it('pause on a live worker requests a graceful pause; resume mid-pause is refused', async () => {
+    seedRunnerState('RUNNING', 60_000);
+    await reviewWorkflowPauseCommand(WORKFLOW_ID);
+    const db = openDatabase(getDbPath(projectDir));
+    try {
+      const runnerStore = new reviewWorkflowRunner.ReviewWorkflowRunnerStore(db);
+      expect(runnerStore.require(WORKFLOW_ID).status).toBe('PAUSE_REQUESTED');
+      // Repeated pause is a no-op.
+      await reviewWorkflowPauseCommand(WORKFLOW_ID);
+      expect(runnerStore.require(WORKFLOW_ID).status).toBe('PAUSE_REQUESTED');
+    } finally {
+      db.close();
+    }
+    // Resuming an in-flight graceful pause would cancel it mid-settlement — refused.
+    await expect(reviewWorkflowResumeCommand(WORKFLOW_ID, { timeout: 60 })).rejects.toThrow(
+      /still pausing/,
+    );
+  });
+
+  it('resume is atomically claimed: a second resume can never start another worker', async () => {
+    seedRunnerState('PAUSED_BY_USER');
+    const db = openDatabase(getDbPath(projectDir));
+    try {
+      const runnerStore = new reviewWorkflowRunner.ReviewWorkflowRunnerStore(db);
+      // The durable claim: exactly one caller wins.
+      expect(runnerStore.claimResume(WORKFLOW_ID)).toBe(true);
+      expect(runnerStore.claimResume(WORKFLOW_ID)).toBe(false);
+    } finally {
+      db.close();
+    }
+    // The losing (repeated/concurrent) resume command is refused outright.
+    await expect(reviewWorkflowResumeCommand(WORKFLOW_ID, { timeout: 60 })).rejects.toThrow(
+      /is RUNNING/,
+    );
+  });
+
+  it('resume refuses non-paused workflows', async () => {
+    seedRunnerState('RUNNING', 60_000);
+    await expect(reviewWorkflowResumeCommand(WORKFLOW_ID, { timeout: 60 })).rejects.toThrow(
+      /resume only continues a paused workflow/,
+    );
+  });
+
+  it('settles and claims dead-worker states atomically; live workers are never disturbed', () => {
+    seedRunnerState('RUNNING');
+    const db = openDatabase(getDbPath(projectDir));
+    try {
+      const runnerStore = new reviewWorkflowRunner.ReviewWorkflowRunnerStore(db);
+      // Live worker still settling its graceful pause: neither settle nor claim may touch it.
+      runnerStore.update(WORKFLOW_ID, {
+        status: 'PAUSE_REQUESTED',
+        workerId: 'live',
+        leaseExpiresAt: new Date(Date.now() + 60_000).toISOString(),
+      });
+      const capture = { headSha: 'a'.repeat(40), clean: true, statusFingerprint: 'fp' };
+      expect(
+        runnerStore.settleRequestedPause(WORKFLOW_ID, capture, { requireDeadLease: true }),
+      ).toBe(false);
+      expect(runnerStore.claimResume(WORKFLOW_ID)).toBe(false);
+      // The pausing worker died: the settle captures the repository state (dead-lease
+      // conditional), then exactly one resume claims — the winner stamps a launch lease.
+      runnerStore.update(WORKFLOW_ID, {
+        leaseExpiresAt: new Date(Date.now() - 1_000).toISOString(),
+      });
+      expect(
+        runnerStore.settleRequestedPause(WORKFLOW_ID, capture, { requireDeadLease: true }),
+      ).toBe(true);
+      expect(runnerStore.require(WORKFLOW_ID).pausedRepo?.headSha).toBe('a'.repeat(40));
+      expect(runnerStore.claimResume(WORKFLOW_ID)).toBe(true);
+      expect(runnerStore.claimResume(WORKFLOW_ID)).toBe(false);
+      // The real worker takes over the launcher's handoff lease.
+      expect(runnerStore.acquireLease(WORKFLOW_ID, 'worker-real', 60)).toBe(true);
+      // A stranded RUNNING workflow (worker died mid-run, lease expired) is claimable too.
+      runnerStore.update(WORKFLOW_ID, {
+        leaseExpiresAt: new Date(Date.now() - 1_000).toISOString(),
+      });
+      expect(runnerStore.claimResume(WORKFLOW_ID)).toBe(true);
+    } finally {
+      db.close();
+    }
+  });
+
+  it('reverts a claimed resume whose launch failed, keeping the workflow resumable', async () => {
+    seedRunnerState('PAUSED_BY_USER');
+    // Break the background launch: the CLI entry point cannot be resolved.
+    const originalEntry = process.argv[1];
+    process.argv[1] = undefined as unknown as string;
+    try {
+      await expect(
+        reviewWorkflowResumeCommand(WORKFLOW_ID, { timeout: 60, background: true }),
+      ).rejects.toThrow(/entry point/);
+    } finally {
+      process.argv[1] = originalEntry;
+    }
+    const db = openDatabase(getDbPath(projectDir));
+    try {
+      const runnerStore = new reviewWorkflowRunner.ReviewWorkflowRunnerStore(db);
+      // The claim was reverted: the workflow is still publicly resumable.
+      expect(runnerStore.require(WORKFLOW_ID).status).toBe('PAUSED_BY_USER');
+    } finally {
+      db.close();
+    }
+  });
+
+  it('covers both pause/acquisition interleavings: neither side can strand the other', () => {
+    seedRunnerState('RUNNING');
+    const db = openDatabase(getDbPath(projectDir));
+    try {
+      const runnerStore = new reviewWorkflowRunner.ReviewWorkflowRunnerStore(db);
+      const capture = { headSha: 'a'.repeat(40), clean: true, statusFingerprint: 'fp' };
+
+      // Interleaving 1: the pause settles first (no live worker). A worker that read
+      // RUNNING beforehand can NOT acquire afterwards — acquisition requires an
+      // executable status, never a paused one.
+      expect(runnerStore.requestPause(WORKFLOW_ID)).toBe(true);
+      expect(
+        runnerStore.settleRequestedPause(WORKFLOW_ID, capture, { requireDeadLease: true }),
+      ).toBe(true);
+      expect(runnerStore.acquireLease(WORKFLOW_ID, 'late-worker', 60)).toBe(false);
+      expect(runnerStore.require(WORKFLOW_ID).status).toBe('PAUSED_BY_USER');
+
+      // Interleaving 2: a worker acquires first. The pause request lands, but the
+      // dead-lease settle LOSES against the live lease — the running worker keeps
+      // ownership and settles the pause itself at its next action boundary.
+      expect(runnerStore.claimResume(WORKFLOW_ID)).toBe(true);
+      expect(runnerStore.acquireLease(WORKFLOW_ID, 'live-worker', 60)).toBe(true);
+      expect(runnerStore.requestPause(WORKFLOW_ID)).toBe(true);
+      expect(
+        runnerStore.settleRequestedPause(WORKFLOW_ID, capture, { requireDeadLease: true }),
+      ).toBe(false);
+      expect(runnerStore.require(WORKFLOW_ID).status).toBe('PAUSE_REQUESTED');
+      // The worker's own graceful settle (under its live lease) still succeeds.
+      expect(runnerStore.settleRequestedPause(WORKFLOW_ID, capture)).toBe(true);
+      expect(runnerStore.require(WORKFLOW_ID).status).toBe('PAUSED_BY_USER');
+
+      // Acquisition is allowed for decision-resume (HUMAN_DECISION_REQUIRED) but never
+      // for paused states.
+      runnerStore.update(WORKFLOW_ID, {
+        status: 'HUMAN_DECISION_REQUIRED',
+        workerId: null,
+        leaseExpiresAt: null,
+      });
+      expect(runnerStore.acquireLease(WORKFLOW_ID, 'decide-worker', 60)).toBe(true);
+    } finally {
+      db.close();
+    }
   });
 });
