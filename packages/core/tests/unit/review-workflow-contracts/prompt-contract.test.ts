@@ -83,4 +83,35 @@ describe('buildContractInstruction', () => {
       expect(instruction, field.name).toContain(field.name);
     }
   });
+
+  it('describes NESTED strict shapes, not just the top level', () => {
+    // Regression for the second real rejection: the model produced `batchIds` and invented
+    // `notes`/`sourceReference` inside requirementCoverage[] because only top-level fields
+    // were ever named.
+    const instruction = buildContractInstruction(
+      refinementResultContractSchema,
+      'REFINEMENT_RESULT',
+    );
+    expect(instruction).toContain('requirementCoverage[]:');
+    for (const field of ['requirementId', 'batchPlanVersionIds', 'acceptanceCriterionIds']) {
+      expect(instruction, field).toContain(field);
+    }
+    // The nested shapes are strict too, and the exact confusion is called out.
+    expect(instruction).toContain('strict as well');
+    expect(instruction).toContain('batchPlanVersionIds is not batchIds');
+    expect(instruction).toContain('sourceReference');
+    // Deeper batch-plan shapes are reached as well.
+    expect(instruction).toContain('batchPlans[]:');
+  });
+
+  it('bounds recursion so a prompt cannot explode', () => {
+    const shallow = buildContractInstruction(refinementResultContractSchema, 'REFINEMENT_RESULT', {
+      maxNestedDepth: 1,
+    });
+    const deep = buildContractInstruction(refinementResultContractSchema, 'REFINEMENT_RESULT', {
+      maxNestedDepth: 3,
+    });
+    expect(shallow.length).toBeLessThan(deep.length);
+    expect(deep.length).toBeLessThan(20_000);
+  });
 });

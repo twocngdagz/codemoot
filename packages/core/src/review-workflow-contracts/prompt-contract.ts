@@ -74,25 +74,94 @@ export function describeContractFields(schema: z.ZodTypeAny): readonly ContractF
   }));
 }
 
+/** The object schema behind a field, whether it is `object` or `object[]`. */
+function nestedObjectOf(field: z.ZodTypeAny): z.ZodTypeAny | undefined {
+  let current: z.ZodTypeAny = field;
+  if (current instanceof z.ZodOptional || current instanceof z.ZodNullable) {
+    current = current.unwrap();
+  }
+  if (current instanceof z.ZodEffects) current = current.innerType();
+  if (current instanceof z.ZodArray) current = current.element;
+  return unwrapObject(current) === undefined ? undefined : current;
+}
+
+/**
+ * Nested shapes, breadth-first, deduplicated by path. A top-level-only description is what
+ * let a model guess `batchIds` for `requirementCoverage[].batchPlanVersionIds` and invent
+ * `notes` — the nested schemas are `.strict()` too, so they must be spelled out as well.
+ */
+function describeNestedShapes(
+  schema: z.ZodTypeAny,
+  maxDepth: number,
+): readonly { readonly path: string; readonly fields: readonly ContractFieldSummary[] }[] {
+  const out: { path: string; fields: readonly ContractFieldSummary[] }[] = [];
+  const seen = new Set<string>();
+  let frontier: { path: string; schema: z.ZodTypeAny }[] = [{ path: '', schema }];
+  for (let depth = 0; depth < maxDepth && frontier.length > 0; depth += 1) {
+    const next: { path: string; schema: z.ZodTypeAny }[] = [];
+    for (const entry of frontier) {
+      const object = unwrapObject(entry.schema);
+      if (object === undefined) continue;
+      for (const [name, field] of Object.entries(object.shape)) {
+        const nested = nestedObjectOf(field as z.ZodTypeAny);
+        if (nested === undefined) continue;
+        const isArray = describeType(field as z.ZodTypeAny).endsWith('[]');
+        const path = `${entry.path}${entry.path === '' ? '' : '.'}${name}${isArray ? '[]' : ''}`;
+        if (seen.has(path)) continue;
+        seen.add(path);
+        const fields = describeContractFields(nested);
+        if (fields.length === 0) continue;
+        out.push({ path, fields });
+        next.push({ path, schema: nested });
+      }
+    }
+    frontier = next;
+  }
+  return out;
+}
+
 /**
  * The authoritative instruction block for a contract response. Every required field is
  * named with its type, optional fields are listed separately, and the strict-mode rule
  * (unknown keys are rejected outright) is stated explicitly.
  */
-export function buildContractInstruction(schema: z.ZodTypeAny, contractKind: string): string {
-  const fields = describeContractFields(schema);
-  const required = fields.filter((field) => field.required);
-  const optional = fields.filter((field) => !field.required);
+export function buildContractInstruction(
+  schema: z.ZodTypeAny,
+  contractKind: string,
+  options?: { readonly maxNestedDepth?: number },
+): string {
+  const describe = (fields: readonly ContractFieldSummary[]): string[] => [
+    ...fields
+      .filter((field) => field.required)
+      .map((field) => `  ${field.name}: ${field.type}   (REQUIRED)`),
+    ...fields
+      .filter((field) => !field.required)
+      .map((field) => `  ${field.name}: ${field.type}   (optional)`),
+  ];
+  const nested = describeNestedShapes(schema, options?.maxNestedDepth ?? 3);
   const lines = [
     `Return EXACTLY one JSON object satisfying the ${contractKind} contract. These are its`,
     'authoritative TOP-LEVEL fields, spelled exactly as shown:',
-    ...required.map((field) => `  ${field.name}: ${field.type}   (REQUIRED)`),
-    ...optional.map((field) => `  ${field.name}: ${field.type}   (optional)`),
+    ...describe(describeContractFields(schema)),
+  ];
+  if (nested.length > 0) {
+    lines.push(
+      '',
+      'Nested objects — EVERY one of these is strict as well, so their field names must be',
+      'exact and no extra keys may be added:',
+    );
+    for (const shape of nested) {
+      lines.push(`  ${shape.path}:`, ...describe(shape.fields).map((line) => `  ${line}`));
+    }
+  }
+  lines.push(
     '',
     `Every REQUIRED field above must be present, including "contractKind": "${contractKind}"`,
     '(the field name is contractKind — NOT "kind", NOT "type").',
-    'The contract is STRICT: any key not listed above causes outright rejection, so do not',
-    'add fields such as producedAt, status, repository, notes, or metadata.',
-  ];
+    'The contract is STRICT at EVERY level: any key not listed above — at the top level or',
+    'inside any nested object — causes outright rejection. Do not add fields such as',
+    'producedAt, status, repository, notes, sourceReference, or metadata, and do not',
+    'shorten a field name (batchPlanVersionIds is not batchIds).',
+  );
   return lines.join('\n');
 }

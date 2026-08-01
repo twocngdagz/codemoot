@@ -1,4 +1,4 @@
-import { type reviewWorkflow, reviewWorkflowContracts } from '@codemoot/core';
+import { reviewWorkflow, reviewWorkflowContracts } from '@codemoot/core';
 import { describe, expect, it } from 'vitest';
 import {
   buildFinalAuditPrompt,
@@ -415,6 +415,21 @@ describe('contract instructions are derived from the schemas', () => {
       expect(prompt).toContain('STRICT');
     },
   );
+
+  it('names nested strict shapes so a model cannot guess their field names', () => {
+    // Second real rejection: requirementCoverage[].batchPlanVersionIds became `batchIds`.
+    const prompt = CONTRACT_PROMPTS[0]?.prompt ?? '';
+    const nested = reviewWorkflowContracts.describeContractFields(
+      reviewWorkflow.requirementCoverageSchema,
+    );
+    expect(nested.length).toBeGreaterThanOrEqual(3);
+    for (const field of nested) {
+      expect(prompt, `refinement prompt must name requirementCoverage[].${field.name}`).toContain(
+        field.name,
+      );
+    }
+    expect(prompt).toContain('requirementCoverage[]:');
+  });
 
   it('names the exact refinement fields that a real run omitted', () => {
     // Regression for the $5.07 / 21-minute rejection: contractKind was only the FIRST
