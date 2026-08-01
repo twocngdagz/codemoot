@@ -35,10 +35,18 @@ codemoot shipit --profile safe
 
 ## Prerequisites
 
-- Node.js 22 (22.23.1 is pinned for source development)
-- pnpm 9.15.9 for source development (managed through Corepack)
-- [Codex CLI](https://github.com/openai/codex) installed (`npm install -g @openai/codex`)
-- ChatGPT subscription (Codex CLI uses your existing subscription — $0 API cost)
+- Node.js 22; version 22.23.1 is pinned for source development.
+- pnpm 9.15.9 for source development, managed through Corepack.
+- At least one supported agent CLI:
+  - [Claude Code CLI](https://claude.com/claude-code) for Anthropic models.
+  - [Codex CLI](https://github.com/openai/codex) for OpenAI models (`npm install -g @openai/codex`).
+- Authentication or a subscription for every configured CLI.
+- A clean Git repository for autonomous review-gated workflows.
+
+The default `review-gated` preset uses Claude Code as implementer and Codex CLI as reviewer.
+Projects may configure two separate Claude models instead, provided role sessions remain
+separate and `requireDifferentAdapterKinds` is disabled explicitly — see
+[docs/configuration.md](docs/configuration.md).
 
 ## Commands
 
