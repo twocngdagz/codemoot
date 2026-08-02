@@ -1,6 +1,8 @@
 # `.cowork.yml` — Complete Configuration Reference
 
-The canonical reference for every configuration value. The source of truth is the zod schema
+The canonical reference for every configuration value. **`codemoot relay` uses only
+`models` and `roles`** — everything under `reviewGated` applies to the review-gated
+workflow alone; see [relay.md](relay.md) for the message-bus loop. The source of truth is the zod schema
 in [`packages/core/src/config/schema.ts`](../packages/core/src/config/schema.ts); this
 document mirrors it field-by-field. Scaffold a valid starting file with
 `codemoot init --preset review-gated`.

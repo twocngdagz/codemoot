@@ -25,7 +25,10 @@ codemoot fix src/         # autofix loop: review → fix → re-review
 # Debate architecture with GPT
 codemoot debate start "Should we use REST or GraphQL?"
 
-# Build features the review-gated way (recommended)
+# Run a Markdown plan through the implementer⇄reviewer loop (recommended)
+codemoot relay run --plan plan.md
+
+# Or the full review-gated machinery (contracts, receipts, merge gate)
 codemoot init --preset review-gated
 codemoot workflow run --plan plan.md --background
 codemoot workflow watch <workflow-id>
@@ -84,7 +87,26 @@ separate and `requireDifferentAdapterKinds` is disabled explicitly — see
 | `codemoot debate history <id>` | Full message history (`--output <file>` for untruncated export) |
 | `codemoot debate complete <id>` | Mark debate as done |
 
-### Autonomous Workflow Runner (recommended)
+### Relay — the message-bus loop (recommended)
+
+The lightweight way to run a plan: CodeMoot is the wiring and the reviewer is the
+intelligence. Both models read the plan off disk themselves; its own `### Batch N` headings
+are the batches. The relay carries messages verbatim, health-checks by silence (never by
+elapsed time), counts feedback cycles and pauses at the cap for the operator, and records
+every prompt and response for human audit. No contracts, schemas, budgets, or reservations —
+the only structure in the system is the reviewer's closing `VERDICT: FIX | PROCEED |
+COMPLETE` line, and when it is missing the relay pauses rather than guesses. The git guard
+still applies to every call (commit locally, never push). See [docs/relay.md](docs/relay.md).
+
+| Command | Description |
+|---------|-------------|
+| `codemoot relay run --plan <file>` | Start the loop; `--max-cycles` (default 3) caps review rounds per batch |
+| `codemoot relay resume <id>` | Continue from wherever the event log says it stopped — no ceremony |
+| `codemoot relay resume <id> --decision continue\|accept\|proceed` | Operator's call at a cycle-cap pause |
+| `codemoot relay status <id>` | Where the run is, per the event log |
+| `codemoot relay log <id> [--full]` | The recorded exchange — the transcript is the audit |
+
+### Autonomous Workflow Runner (full machinery)
 
 One command runs a complete review-gated workflow end to end — refinement, plan review,
 implementation, bounded code reviews and corrections, verification, final audit, merge gate,
@@ -219,7 +241,8 @@ at `READY_FOR_HUMAN_VERIFICATION`. CodeMoot never merges.
 ## Configuration
 
 CodeMoot reads `.cowork.yml` from the project root. Full field-by-field reference:
-[docs/configuration.md](docs/configuration.md).
+[docs/configuration.md](docs/configuration.md). The relay needs only `models` and `roles`;
+the `reviewGated` block applies to the review-gated workflow alone.
 
 Example using Claude Code for both roles:
 
