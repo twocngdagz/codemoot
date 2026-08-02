@@ -374,17 +374,41 @@ describe('review-workflow role invocation', () => {
     ).toThrow();
   });
 
-  it('rejects assignment snapshots after the active configuration changes', () => {
+  it('rejects assignment snapshots after the ROLE CONFIGURATION changes', () => {
     const { config, snapshot } = setup();
     const changedConfig = {
       ...config,
-      project: { ...config.project, description: 'Configuration changed after assignment.' },
+      models: {
+        ...config.models,
+        implementer: { ...config.models.implementer, model: 'claude-sonnet-5' },
+      },
     };
     const registry = ModelRegistry.fromConfig(changedConfig, '/repository');
 
     expect(() =>
       new RoleManager(changedConfig).resolveReviewWorkflowRoles(snapshot, registry),
     ).toThrow('active configuration');
+  });
+
+  it('does NOT reject when something unrelated to the assignment changes', () => {
+    // This used to throw, because the hash covered the entire ProjectConfig. That conflated
+    // "the roles moved" with "any setting changed", and it is why a workflow that hit a
+    // too-small token budget could not be continued: the limit was frozen, and raising it
+    // invalidated the assignments. A project description cannot make an assignment stale.
+    const { config, snapshot } = setup();
+    const changedConfig = {
+      ...config,
+      project: { ...config.project, description: 'Edited long after assignment.' },
+      reviewGated: {
+        ...config.reviewGated,
+        autonomous: { ...config.reviewGated?.autonomous, maxInputTokensPerBatch: 40_000_000 },
+      },
+    };
+    const registry = ModelRegistry.fromConfig(changedConfig, '/repository');
+
+    expect(() =>
+      new RoleManager(changedConfig).resolveReviewWorkflowRoles(snapshot, registry),
+    ).not.toThrow();
   });
 
   it('rejects a session assigned to the opposite role before invoking an adapter', async () => {

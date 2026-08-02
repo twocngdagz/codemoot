@@ -89,6 +89,23 @@ const debateConfigSchema = z.object({
   consensusThreshold: z.number().min(0).max(1).default(0.7),
 });
 
+/**
+ * Trusted-operator mode: one human, one machine, every step watched and approved.
+ *
+ * The review-gated guards are built for a fleet of untrusted agents nobody is observing.
+ * Under that assumption they are all defensible. Under THIS one — a single operator
+ * approving each decision — several of them cost time without protecting anything: over two
+ * days of real use not one caught a genuine problem, while every one of them fired on
+ * itself. This flag is opt-in and never inferred, because the assumption it changes is about
+ * who is in the room, and only the operator knows that.
+ *
+ * It does NOT relax what prevents real damage: the git guard, push blocking, the merge gate,
+ * immutable evidence, and reviewer/implementer separation all stay exactly as they are.
+ */
+export const reviewGatedOperatorModeSchema = z
+  .enum(['untrusted_fleet', 'trusted_local'])
+  .default('untrusted_fleet');
+
 export const reviewGatedIdentityConfigSchema = z.object({
   minimumAssurance: z
     .enum(['authenticated_subject', 'cli_asserted', 'process_attested', 'config_only'])
@@ -183,6 +200,7 @@ export const reviewGatedConfigSchema = z.object({
   gates: reviewGatedGateConfigSchema.default(COMPATIBILITY_REVIEW_GATED_CONFIG.gates),
   pacing: reviewGatedPacingConfigSchema.default(COMPATIBILITY_REVIEW_GATED_CONFIG.pacing),
   autonomous: reviewGatedAutonomousConfigSchema.default({}),
+  operatorMode: reviewGatedOperatorModeSchema,
 });
 
 const memoryConfigSchema = z.object({
@@ -284,7 +302,13 @@ export const projectConfigSchema = z
         message: 'Review-gated workflows must prohibit shared implementer/reviewer sessions',
       });
     }
-    if (data.reviewGated.identity.minimumAssurance === 'config_only') {
+    // Trusted-operator mode accepts weaker assurance: attestation proves WHICH PROCESS
+    // spoke, and a single operator watching each step already knows. Session isolation
+    // above is NOT relaxed — that is reviewer independence, the product rather than a guard.
+    if (
+      data.reviewGated.identity.minimumAssurance === 'config_only' &&
+      data.reviewGated.operatorMode !== 'trusted_local'
+    ) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
         path: ['reviewGated', 'identity', 'minimumAssurance'],

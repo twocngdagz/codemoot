@@ -132,6 +132,7 @@ export interface ReviewGatedConfig {
   gates: ReviewGatedGateConfig;
   pacing: ReviewGatedPacingConfig;
   autonomous: ReviewGatedAutonomousConfig;
+  operatorMode?: 'untrusted_fleet' | 'trusted_local';
 }
 
 export interface ProjectConfig {

@@ -85,8 +85,31 @@ export function resolveConfiguredAdapterKind(model: ModelConfig): AgentAdapterKi
   return configuredKind === 'claude' ? 'CLAUDE' : 'CODEX';
 }
 
+/**
+ * Hashes the configuration the ROLE ASSIGNMENTS depend on — deliberately not the whole file.
+ *
+ * This hash answers one question: are the assignments recorded for this workflow still the
+ * ones the current configuration would produce? Models, roles, the workflow kind and the
+ * identity policy decide that. `reviewGated.autonomous` does not — those are operational
+ * limits, and they are frozen separately into runner state at start.
+ *
+ * Hashing the entire ProjectConfig conflated the two, so raising a token budget invalidated
+ * the assignments and blocked resume. A workflow that hit a limit which turned out to be
+ * structurally too small could not be continued at all: the limit was frozen, and editing it
+ * broke the hash. Two things frozen for different reasons should not share one check.
+ */
 export function hashReviewWorkflowConfiguration(config: ProjectConfig): string {
-  return createHash('sha256').update(canonicalJson(config)).digest('hex');
+  const { autonomous: _operationalLimits, ...assignmentPolicy } = config.reviewGated ?? {};
+  return createHash('sha256')
+    .update(
+      canonicalJson({
+        workflow: config.workflow,
+        models: config.models,
+        roles: config.roles,
+        reviewGated: config.reviewGated === undefined ? undefined : assignmentPolicy,
+      }),
+    )
+    .digest('hex');
 }
 
 export function createReviewWorkflowConfigurationSnapshot(
@@ -100,8 +123,12 @@ export function createReviewWorkflowConfigurationSnapshot(
       'workflow "review-gated-batches" and reviewGated configuration are required',
     );
   }
+  // Trusted-operator mode accepts cli_asserted: attestation proves WHICH PROCESS spoke, and
+  // in a single-operator local run the operator watched it speak. Session isolation is NOT
+  // relaxed — that is reviewer independence, which is the product rather than a guard.
+  const trustedLocal = policy.operatorMode === 'trusted_local';
   if (
-    policy.identity.minimumAssurance === 'config_only' ||
+    (policy.identity.minimumAssurance === 'config_only' && !trustedLocal) ||
     !policy.identity.prohibitSharedSessions
   ) {
     throw new ReviewWorkflowIdentityError(

@@ -3732,6 +3732,9 @@ function buildRunner(
     undefined,
     {
       ...(contract === undefined ? {} : { contract }),
+      // Opt-in only. Under trusted_local the CURRENT limits apply instead of the ones frozen
+      // at start, so an operator who discovers a limit is too small can raise it and resume.
+      trustedOperator: config.reviewGated?.operatorMode === 'trusted_local',
       workerId: `${process.pid}:${workflowId.slice(-8)}`,
       leaseSeconds: autonomous.heartbeatExpirySeconds,
     },

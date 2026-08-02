@@ -73,8 +73,15 @@ export class AutonomousWorkflowRunner {
   /**
    * The limits frozen into the runner state at workflow start. Editing configuration
    * between workers can never raise or lower enforcement mid-workflow.
+   *
+   * EXCEPT in trusted-operator mode, where the current configuration wins. Freezing exists
+   * so an agent cannot quietly widen its own allowance; with one operator approving each
+   * step there is no such agent, and the freeze only stopped the human. Combined with a
+   * configuration hash that covered the whole file, a workflow that hit a limit which turned
+   * out to be structurally too small could not be continued at all.
    */
   private limits(workflowId: string): RunnerConfig {
+    if (this.options.trustedOperator === true) return this.config;
     return this.store.require(workflowId).limits ?? this.config;
   }
 

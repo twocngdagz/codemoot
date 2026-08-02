@@ -312,6 +312,12 @@ export interface RunnerContractPacing {
 
 export interface RunnerOptions {
   readonly contract?: RunnerContractPacing;
+  /**
+   * Trusted-operator mode: the CURRENT configuration limits apply rather than the ones
+   * frozen at workflow start. Opt-in only, and never inferred — the assumption it changes
+   * is about who is in the room.
+   */
+  readonly trustedOperator?: boolean;
   /** Stable identity of this worker process; required for the exclusive lease. */
   readonly workerId?: string;
   readonly leaseSeconds?: number;
