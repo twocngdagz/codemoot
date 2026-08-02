@@ -538,6 +538,87 @@ export class ReviewWorkflowStore {
     return updated;
   }
 
+  /**
+   * Rewrites the persisted configuration hash after the HASH FUNCTION itself changed.
+   *
+   * `1f7d011` scoped operational limits out of `hashReviewWorkflowConfiguration`, which
+   * changed the value produced for an UNCHANGED configuration — and the old value was
+   * already on disk in three places (the workflow row and both assignment rows, each with a
+   * column copy, a payload copy, and a record hash over that payload). Every workflow
+   * created before the change was rejected with "Assignment scope and configuration hash
+   * must match the snapshot" even though nothing about its configuration had moved.
+   *
+   * The caller must FIRST prove the assignment identity is unchanged by comparing the
+   * stored identity fields (role, agent key, alias, adapter kind, provider, model, commit
+   * permission) against a freshly derived assignment — a direct comparison, deliberately
+   * not hash archaeology, because schema-default drift means the original parse output
+   * cannot be reconstructed from today's file. This method only rewrites the fingerprint.
+   *
+   * The agent-assignments table is protected by immutability triggers; they are dropped and
+   * recreated inside the same transaction. This is the one sanctioned place to do that: a
+   * migration of stored shape, after the code that reads it changed underneath it.
+   */
+  migrateConfigurationHash(input: {
+    readonly workflowId: string;
+    readonly assignmentIds: readonly string[];
+    readonly toHash: string;
+  }): void {
+    this.db.transaction(() => {
+      const workflowRow = this.db
+        .prepare('SELECT payload_json FROM review_workflows WHERE workflow_id = ?')
+        .get(input.workflowId);
+      if (workflowRow !== undefined) {
+        const payload = parseJsonObject(payloadRowSchema.parse(workflowRow).payload_json);
+        const updated = { ...payload, configurationHash: input.toHash };
+        this.db
+          .prepare(
+            `UPDATE review_workflows
+             SET configuration_hash = ?, payload_json = ?, record_hash = ?
+             WHERE workflow_id = ?`,
+          )
+          .run(
+            input.toHash,
+            serializeJson(updated),
+            hashRecord({ kind: 'WORKFLOW', value: updated }),
+            input.workflowId,
+          );
+      }
+      this.db.exec('DROP TRIGGER IF EXISTS review_workflow_agent_assignments_immutable_update');
+      try {
+        for (const assignmentId of input.assignmentIds) {
+          const row = this.db
+            .prepare(
+              'SELECT payload_json FROM review_workflow_agent_assignments WHERE assignment_id = ?',
+            )
+            .get(assignmentId);
+          if (row === undefined) continue;
+          const payload = parseJsonObject(payloadRowSchema.parse(row).payload_json);
+          const updated = { ...payload, configurationHash: input.toHash };
+          this.db
+            .prepare(
+              `UPDATE review_workflow_agent_assignments
+               SET configuration_hash = ?, payload_json = ?, record_hash = ?
+               WHERE assignment_id = ?`,
+            )
+            .run(
+              input.toHash,
+              serializeJson(updated),
+              hashRecord({ kind: 'AGENT_ASSIGNMENT', value: updated }),
+              assignmentId,
+            );
+        }
+      } finally {
+        this.db.exec(
+          `CREATE TRIGGER IF NOT EXISTS review_workflow_agent_assignments_immutable_update
+            BEFORE UPDATE ON review_workflow_agent_assignments
+            BEGIN
+              SELECT RAISE(ABORT, 'review_workflow_agent_assignments is immutable');
+            END`,
+        );
+      }
+    })();
+  }
+
   createWorkflow(workflow: WorkflowRun): ImmutableSaveResult {
     const parsed = workflowRunSchema.parse(workflow);
     const payloadJson = serializeJson(parsed);

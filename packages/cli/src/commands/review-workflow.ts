@@ -2308,6 +2308,23 @@ function createFilePatchArtifactSink(projectDir: string): reviewWorkflowGit.GitP
   };
 }
 
+/** The identity a role assignment actually pins — everything except the fingerprint. */
+function assignmentIdentity(assignment: reviewWorkflow.AgentAssignment): string {
+  return JSON.stringify({
+    assignmentId: assignment.assignmentId,
+    workflowId: assignment.workflowId,
+    assignedRole: assignment.assignedRole,
+    configuredAgentKey: assignment.configuredAgentKey,
+    configuredModelAlias: assignment.configuredModelAlias,
+    expectedAdapterKind: assignment.expectedAdapterKind,
+    provider: assignment.provider,
+    configuredModel: assignment.configuredModel,
+    executable: assignment.executable ?? null,
+    versionConstraint: assignment.versionConstraint ?? null,
+    commitPermission: assignment.commitPermission,
+  });
+}
+
 function resolveRuntimeContext(
   store: reviewWorkflowPlan.ReviewWorkflowPlanStore,
   workflowId: string,
@@ -2315,8 +2332,8 @@ function resolveRuntimeContext(
 ) {
   const workflow = store.getWorkflow(workflowId);
   if (workflow === null) throw new Error(`Workflow ${workflowId} does not exist`);
-  const implementer = store.getAssignment(workflow.implementerAssignmentId);
-  const reviewer = store.getAssignment(workflow.reviewerAssignmentId);
+  let implementer = store.getAssignment(workflow.implementerAssignmentId);
+  let reviewer = store.getAssignment(workflow.reviewerAssignmentId);
   if (implementer === null || reviewer === null) {
     throw new Error(`Workflow ${workflowId} is missing its immutable role assignments`);
   }
@@ -2327,6 +2344,34 @@ function resolveRuntimeContext(
     reviewerAssignmentId: reviewer.assignmentId,
     assignedAt: implementer.assignedAt,
   });
+  // Heal a fingerprint written by an OLDER hash function. `1f7d011` changed what
+  // `hashReviewWorkflowConfiguration` produces for an unchanged configuration, which
+  // bricked every in-flight workflow: the stored hash could never again match, and there
+  // was no config edit to revert because the input never changed. A hash cannot be
+  // migrated by recomputation (the original parse output is unreconstructable once schema
+  // DEFAULTS drift), so equivalence is proven the direct way: if every identity-bearing
+  // field of both stored assignments matches the freshly derived ones, the roles never
+  // moved and only the fingerprint format did. That comparison is STRONGER than the hash
+  // check it stands in for — it compares the identity itself rather than a proxy.
+  if (
+    implementer.configurationHash !== fresh.configurationHash &&
+    assignmentIdentity(implementer) === assignmentIdentity(fresh.assignments.implementer) &&
+    assignmentIdentity(reviewer) === assignmentIdentity(fresh.assignments.reviewer)
+  ) {
+    store.workflowStore.migrateConfigurationHash({
+      workflowId,
+      assignmentIds: [implementer.assignmentId, reviewer.assignmentId],
+      toHash: fresh.configurationHash,
+    });
+    implementer = store.getAssignment(workflow.implementerAssignmentId);
+    reviewer = store.getAssignment(workflow.reviewerAssignmentId);
+    if (implementer === null || reviewer === null) {
+      throw new Error(`Workflow ${workflowId} lost its assignments during hash migration`);
+    }
+    console.error(
+      `[codemoot] Migrated configuration hash for ${workflowId}: the fingerprint function changed, the role assignments did not.`,
+    );
+  }
   const snapshot = reviewWorkflowIdentity.reviewWorkflowConfigurationSnapshotSchema.parse({
     ...fresh,
     assignments: { implementer, reviewer },

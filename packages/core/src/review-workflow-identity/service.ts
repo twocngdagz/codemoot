@@ -99,7 +99,15 @@ export function resolveConfiguredAdapterKind(model: ModelConfig): AgentAdapterKi
  * broke the hash. Two things frozen for different reasons should not share one check.
  */
 export function hashReviewWorkflowConfiguration(config: ProjectConfig): string {
-  const { autonomous: _operationalLimits, ...assignmentPolicy } = config.reviewGated ?? {};
+  // `operatorMode` is excluded for the same reason `autonomous` is: it says nothing about
+  // which model holds which role. It is ALSO the setting most wanted mid-flight — a stuck
+  // workflow is exactly when an operator reaches for trusted_local — so including it made
+  // the rescue hatch itself invalidating.
+  const {
+    autonomous: _operationalLimits,
+    operatorMode: _operatorMode,
+    ...assignmentPolicy
+  } = config.reviewGated ?? {};
   return createHash('sha256')
     .update(
       canonicalJson({
