@@ -2540,7 +2540,11 @@ export function installGitGuard(projectDir: string): string {
   // The guarded PATH is injected ONLY into agent CLI subprocesses (via invocation options);
   // CodeMoot's own git/verification subprocesses keep the unguarded environment.
   guardedAgentPath = `${guardDir}:${process.env.PATH ?? ''}`;
-  return guardPath;
+  // Return the COMPOSED guarded PATH — the value a caller wants for a subprocess `PATH`.
+  // This used to return the guard SCRIPT's file path, which the relay then handed to a
+  // subprocess as its entire PATH: one file, nothing resolvable, `claude not found`. An API
+  // whose return value looks like the useful thing but isn't is a trap, and it fired.
+  return guardedAgentPath;
 }
 
 const PUSH_URL_SENTINEL = 'file:///codemoot-push-blocked';

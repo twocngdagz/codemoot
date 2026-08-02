@@ -31,7 +31,16 @@ writeFileSync(counterFile, String(index + 1));
 
 appendFileSync(
   `${responseFile}.prompts.jsonl`,
-  `${JSON.stringify({ index, resumedSessionId: resumedSessionId ?? null, prompt })}\n`,
+  `${JSON.stringify({
+    index,
+    resumedSessionId: resumedSessionId ?? null,
+    prompt,
+    // The subprocess environment, so tests can assert what the relay actually handed over.
+    // The original relay tests invoked this fake by ABSOLUTE path, so a poisoned PATH was
+    // invisible to them — a live run then failed instantly with `claude not found in PATH`.
+    envPath: process.env.PATH ?? null,
+    envUser: process.env.USER ?? null,
+  })}\n`,
 );
 
 const sequence = JSON.parse(readFileSync(responseFile, 'utf8'));

@@ -453,6 +453,10 @@ function buildContext(db: RelayDb, projectDir: string): RelayContext {
     const seconds = config.models[alias]?.cliAdapter?.timeout;
     return seconds === undefined ? undefined : seconds * 1000;
   };
+  // The composed guarded PATH: guard dir first, then the operator's real PATH, so `claude`
+  // resolves while `git` hits the deny-by-default wrapper. The adapter overlays this env on
+  // its ALLOWLISTED base (claude-cli-adapter.ts), so USER/HOME/LANG survive — these six
+  // keys are an overlay, not the whole environment.
   const guardedPath = installGitGuard(projectDir);
   let stopRequested = false;
   const requestStop = (): void => {
