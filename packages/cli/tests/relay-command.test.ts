@@ -160,6 +160,11 @@ describe('codemoot relay (real command, two scripted models)', () => {
     const log = events('relay-e2e');
     const firstReviewerPrompt = log.find((e) => e.role === 'REVIEWER' && e.kind === 'PROMPT');
     expect(firstReviewerPrompt?.content).toContain('I wrote sample.txt. Commit abc.');
+    // Both roles are told the turn is all they get — a live reviewer once armed watchers on
+    // a browser suite and deferred its verdict to a follow-up that could never come.
+    const firstImplementerPrompt = log.find((e) => e.role === 'IMPLEMENTER' && e.kind === 'PROMPT');
+    expect(firstImplementerPrompt?.content).toContain('exactly one reply');
+    expect(firstReviewerPrompt?.content).toContain('exactly one reply');
     const fixForward = log.filter((e) => e.role === 'IMPLEMENTER' && e.kind === 'PROMPT')[1];
     expect(fixForward?.content).toContain('Missing trailing newline.');
 

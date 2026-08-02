@@ -100,6 +100,15 @@ export function countPlanBatches(planContent: string): number {
 // Prompts — short by design; the models read the plan themselves
 // ---------------------------------------------------------------------------
 
+// Demonstrated cost, live: a reviewer armed watchers on a browser suite and replied that it
+// would "close out the review" once they fired. Its session ended when it replied, the
+// watchers died with it, and the suite was orphaned — it could never have observed the
+// result it was waiting for. The relay paused correctly on the unclear verdict, but the
+// prompt had never told either model the turn is all it gets.
+const SINGLE_TURN_NOTICE =
+  'You get exactly one reply. Complete all verification before answering — you will not ' +
+  'be asked again, and any background work you start is killed when you reply.';
+
 const INTERRUPTION_PREFACE =
   'NOTE: a previous attempt at this step may have been interrupted. The working tree may ' +
   'contain partial or uncommitted work from it. Reconcile whatever you find with the task ' +
@@ -110,7 +119,9 @@ function implementerBatchPrompt(run: RelayRun, preface = ''): string {
 
 Work on Batch ${run.batch} of ${run.totalBatches} ONLY. Implement it fully per the plan. Commit your work locally as you go. Do NOT push.
 
-When the batch is complete, stop and reply with a summary for the reviewer: what you did, the files you created or changed, the commands you ran and their results, and the resulting git commits.`;
+When the batch is complete, stop and reply with a summary for the reviewer: what you did, the files you created or changed, the commands you ran and their results, and the resulting git commits.
+
+${SINGLE_TURN_NOTICE}`;
 }
 
 function reviewerPrompt(run: RelayRun, implementerSummary: string): string {
@@ -121,6 +132,8 @@ The implementer reports the following for Batch ${run.batch} of ${run.totalBatch
 ${implementerSummary}
 
 Read Batch ${run.batch} in the plan. Verify the implementer's claims against the repository — the diff, the files, and whatever verification you judge necessary; you may run commands. Reply with your findings, written for the implementer.
+
+${SINGLE_TURN_NOTICE}
 
 End your reply with exactly ONE line, and nothing after it:
 VERDICT: FIX        (problems that must be addressed)
@@ -133,7 +146,9 @@ function fixPrompt(run: RelayRun, review: string, preface = ''): string {
 
 ${review}
 
-Address them, commit locally, do NOT push, then reply with a summary of what you changed.`;
+Address them, commit locally, do NOT push, then reply with a summary of what you changed.
+
+${SINGLE_TURN_NOTICE}`;
 }
 
 function acceptPrompt(run: RelayRun, review: string): string {
@@ -141,7 +156,9 @@ function acceptPrompt(run: RelayRun, review: string): string {
 
 ${review}
 
-The operator has decided this feedback is FINAL for this batch: apply what is quick and essential, commit locally, do NOT push, and reply with a brief summary. There will be no further review round for this batch.`;
+The operator has decided this feedback is FINAL for this batch: apply what is quick and essential, commit locally, do NOT push, and reply with a brief summary. There will be no further review round for this batch.
+
+${SINGLE_TURN_NOTICE}`;
 }
 
 function unclearVerdictPrompt(): string {
