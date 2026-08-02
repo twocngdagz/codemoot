@@ -247,11 +247,16 @@ export class ClaudeCliAdapter implements CliBridge {
       parsed = parseClaudeCliStream(processResult.stdout);
     } catch (error) {
       if (error instanceof ClaudeCliProtocolError) {
-        throw new ModelError(
+        const modelError = new ModelError(
           `Invalid Claude CLI output: ${error.message}`,
           'anthropic',
           this.model,
         );
+        // A protocol rejection arrives AFTER the process ran to completion — a 28-minute
+        // call once lost its entire transcript here (`partialOutput: undefined`) while the
+        // timeout paths preserved theirs. Whatever the CLI emitted is evidence; attach it.
+        modelError.partialOutput = { stdout: processResult.stdout, stderr: '' };
+        throw modelError;
       }
       throw error;
     }

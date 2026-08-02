@@ -255,6 +255,56 @@ describe('codemoot relay (real command, two scripted models)', () => {
     expect(implCalls[0].prompt).toContain('Work on Batch 1');
   });
 
+  it('survives an adapter exception mid-call: records it, stops, and resumes clean', async () => {
+    // The 28-minute crash, reproduced: a paused-unclear run is resumed, the direct re-ask
+    // call dies at the adapter level (process exits without a result), and the old code let
+    // that exception escape relayResumeCommand and kill the runner — losing the guarantee
+    // that every failure becomes a resumable note. Now it is recorded like any other.
+    writeFileSync(implFile, JSON.stringify(['Did batch 1.', 'Did batch 2.']));
+    writeFileSync(
+      revFile,
+      JSON.stringify([
+        'Looks fine, probably.',
+        '__CRASH__',
+        'Verified.\nVERDICT: PROCEED',
+        'Verified.\nVERDICT: COMPLETE',
+      ]),
+    );
+    await relayRunCommand({ plan: 'plan.md', id: 'relay-boundary' });
+    expect(printedStatus().status).toBe('PAUSED_UNCLEAR_VERDICT');
+
+    // The re-ask itself dies at the adapter level. No throw, no dead process — a note.
+    await relayResumeCommand('relay-boundary', {});
+    expect(printedStatus().status).toBe('STOPPED');
+    const afterCrash = events('relay-boundary');
+    expect(
+      afterCrash.some(
+        (e) => e.role === 'RELAY' && e.kind === 'NOTE' && e.content.includes('Call failed'),
+      ),
+    ).toBe(true);
+
+    // Resume again: the log ends with the unanswered re-ask, so it is re-sent with the
+    // reconcile preface — not stacked with a second re-ask — and the run completes.
+    await relayResumeCommand('relay-boundary', {});
+    expect(printedStatus().status).toBe('COMPLETE');
+    const log = events('relay-boundary');
+    const resent = log.find(
+      (e) =>
+        e.role === 'REVIEWER' &&
+        e.kind === 'PROMPT' &&
+        e.content.includes('may have been interrupted'),
+    );
+    expect(
+      resent,
+      'the unanswered re-ask must be re-sent with the reconcile preface',
+    ).toBeDefined();
+    expect(
+      log.filter(
+        (e) => e.content.includes('did not end with a clear VERDICT') && e.kind === 'PROMPT',
+      ),
+    ).toHaveLength(2);
+  });
+
   it('records the whole exchange — the transcript is the audit', async () => {
     writeFileSync(implFile, JSON.stringify(['b1.', 'b2.']));
     writeFileSync(revFile, JSON.stringify(['ok\nVERDICT: PROCEED', 'ok\nVERDICT: COMPLETE']));

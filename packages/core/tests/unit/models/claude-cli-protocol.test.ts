@@ -47,13 +47,43 @@ describe('parseClaudeCliStream', () => {
     );
   });
 
-  it('rejects mismatched session identities', () => {
+  it('rejects a result session that NO init ever announced', () => {
+    // The corruption check, restated precisely: a foreign result is corruption; a long
+    // session announcing itself again is not.
     const output = fixture('success.jsonl').replace(
       '"session_id":"550e8400-e29b-41d4-a716-446655440000","total_cost_usd"',
       '"session_id":"different-session","total_cost_usd"',
     );
 
-    expect(() => parseClaudeCliStream(output)).toThrow('session IDs do not match');
+    expect(() => parseClaudeCliStream(output)).toThrow('matches none of the announced');
+  });
+
+  it('tolerates a REPEATED init — long sessions refresh, and that is not corruption', () => {
+    // A live 28-minute reviewer call emitted two init messages (session refresh /
+    // compaction boundary) and the old single-init rule threw the whole call away AFTER
+    // the work was done. Metadata comes from the first init.
+    const lines = fixture('success.jsonl').trimEnd().split('\n');
+    const firstInit = lines[0] ?? '';
+    const repeated = [firstInit, firstInit, ...lines.slice(1)].join('\n');
+    const parsed = parseClaudeCliStream(repeated);
+    expect(parsed.sessionId).toBe('550e8400-e29b-41d4-a716-446655440000');
+  });
+
+  it('accepts a session that ROLLS: a later init announces the id the result carries', () => {
+    const lines = fixture('success.jsonl').trimEnd().split('\n');
+    const firstInit = lines[0] ?? '';
+    const rolledInit = firstInit.replace(
+      '550e8400-e29b-41d4-a716-446655440000',
+      '550e8400-e29b-41d4-a716-446655440099',
+    );
+    const rolledResult = (lines.at(-1) ?? '').replace(
+      '550e8400-e29b-41d4-a716-446655440000',
+      '550e8400-e29b-41d4-a716-446655440099',
+    );
+    const rolled = [firstInit, rolledInit, ...lines.slice(1, -1), rolledResult].join('\n');
+    const parsed = parseClaudeCliStream(rolled);
+    // The RESULT's session is authoritative for resume — the rolled id, not the first.
+    expect(parsed.sessionId).toBe('550e8400-e29b-41d4-a716-446655440099');
   });
 
   it('requires init and result messages', () => {

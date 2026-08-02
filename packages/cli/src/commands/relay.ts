@@ -561,42 +561,69 @@ export async function relayResumeCommand(
     }
     const context = buildContext(db, run.projectDir);
 
-    if (run.status === 'PAUSED_CYCLE_CAP') {
-      if (options.decision === undefined) {
-        throw new Error(
-          `Batch ${run.batch} is paused at the cycle cap. Choose: --decision continue (one more review cycle) | accept (implementer applies the last feedback as final, then the batch advances) | proceed (advance as-is)`,
-        );
-      }
-      const review = lastEvent(db, runId);
-      appendEvent(db, run, { role: 'OPERATOR', kind: 'DECISION', content: options.decision });
-      if (options.decision === 'continue') {
-        run.maxCycles += 1; // one more cycle, explicitly granted — the count stays honest
-        run.cycle += 1;
-        updateRun(db, run);
-        if (review === null) throw new Error('no review to continue from');
-        await callRole(context, run, 'IMPLEMENTER', fixPrompt(run, review.content));
-      } else if (options.decision === 'accept') {
-        run.pending = 'ADVANCE_AFTER_RESPONSE';
-        updateRun(db, run);
-        if (review === null) throw new Error('no review to accept');
-        await callRole(context, run, 'IMPLEMENTER', acceptPrompt(run, review.content));
-      } else {
-        appendEvent(db, run, {
-          role: 'RELAY',
-          kind: 'NOTE',
-          content: `Batch ${run.batch} advanced as-is by operator decision`,
-        });
-        advanceBatch(context, run);
-      }
-    } else if (run.status === 'PAUSED_UNCLEAR_VERDICT') {
-      await callRole(context, run, 'REVIEWER', unclearVerdictPrompt());
+    // Every call below runs inside ONE error boundary. runLoop guards its own calls — that
+    // is why the two PATH failures cost $0 and two minutes — but these direct decision and
+    // re-ask calls used to sit OUTSIDE it, so an adapter exception here escaped as an
+    // unhandled rejection and killed the process: a 28-minute reviewer call died on a
+    // protocol error and the runner died with it. The "record events, resume is automatic"
+    // guarantee must hold for adapter exceptions exactly as it holds for model outcomes.
+    // Operator-input validation happens BEFORE the boundary: a missing --decision is the
+    // human's error to correct, not a call failure to record.
+    if (run.status === 'PAUSED_CYCLE_CAP' && options.decision === undefined) {
+      throw new Error(
+        `Batch ${run.batch} is paused at the cycle cap. Choose: --decision continue (one more review cycle) | accept (implementer applies the last feedback as final, then the batch advances) | proceed (advance as-is)`,
+      );
     }
-
     try {
+      if (run.status === 'PAUSED_CYCLE_CAP') {
+        const review = lastEvent(db, runId);
+        // Narrowed above: PAUSED_CYCLE_CAP without a decision already threw.
+        const decision = options.decision as 'continue' | 'accept' | 'proceed';
+        appendEvent(db, run, { role: 'OPERATOR', kind: 'DECISION', content: decision });
+        if (decision === 'continue') {
+          run.maxCycles += 1; // one more cycle, explicitly granted — the count stays honest
+          run.cycle += 1;
+          updateRun(db, run);
+          if (review === null) throw new Error('no review to continue from');
+          await callRole(context, run, 'IMPLEMENTER', fixPrompt(run, review.content));
+        } else if (decision === 'accept') {
+          run.pending = 'ADVANCE_AFTER_RESPONSE';
+          updateRun(db, run);
+          if (review === null) throw new Error('no review to accept');
+          await callRole(context, run, 'IMPLEMENTER', acceptPrompt(run, review.content));
+        } else {
+          appendEvent(db, run, {
+            role: 'RELAY',
+            kind: 'NOTE',
+            content: `Batch ${run.batch} advanced as-is by operator decision`,
+          });
+          advanceBatch(context, run);
+        }
+      } else if (run.status === 'PAUSED_UNCLEAR_VERDICT') {
+        // Only re-ask when the reviewer's unclear REPLY is the last word. If the last event
+        // is an unanswered PROMPT, the re-ask itself crashed mid-call — runLoop's
+        // interrupted-prompt path re-sends it with the reconcile preface instead of
+        // stacking a second re-ask on top.
+        const last = lastEvent(db, runId);
+        if (last !== null && last.kind === 'RESPONSE') {
+          await callRole(context, run, 'REVIEWER', unclearVerdictPrompt());
+        }
+      }
+
       // Every mutation above persisted through updateRun, so the row is the truth — and a
       // `proceed` on the final batch may have just completed the run.
       const current = getRun(db, runId);
       if (current !== null && current.status !== 'COMPLETE') await runLoop(context, current);
+    } catch (error) {
+      // Decision-state mutations (cycle grants, pending advances) were persisted BEFORE the
+      // failed call, so recording the failure and stopping loses nothing: resume re-derives
+      // from the log, and an unanswered prompt takes the interrupted-call path.
+      pause(
+        context,
+        run,
+        'STOPPED',
+        `Call failed: ${error instanceof Error ? error.message : String(error)}. Resume with: codemoot relay resume ${runId}`,
+      );
     } finally {
       context.dispose();
       uninstallGitGuard(run.projectDir);

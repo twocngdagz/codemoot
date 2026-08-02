@@ -61,6 +61,7 @@ export class ClaudeCliProtocolError extends Error {
 
 export function parseClaudeCliStream(stdout: string): ParsedClaudeCliOutput {
   let init: z.infer<typeof claudeInitMessageSchema> | undefined;
+  const initSessionIds = new Set<string>();
   let result: z.infer<typeof claudeResultMessageSchema> | undefined;
 
   for (const [index, line] of stdout.split('\n').entries()) {
@@ -82,16 +83,20 @@ export function parseClaudeCliStream(stdout: string): ParsedClaudeCliOutput {
     }
 
     if (message.data.type === 'system' && message.data.subtype === 'init') {
-      if (init !== undefined) {
-        throw new ClaudeCliProtocolError('Claude CLI emitted more than one system/init message');
-      }
       const parsedInit = claudeInitMessageSchema.safeParse(value);
       if (!parsedInit.success) {
         throw new ClaudeCliProtocolError(
           `Invalid Claude CLI system/init message: ${formatIssues(parsedInit.error)}`,
         );
       }
-      init = parsedInit.data;
+      // Long sessions REPEAT init: a 28-minute reviewer call emitted two on what appears to
+      // be a session refresh/compaction boundary, and the old single-init rule killed the
+      // call after the work was done. The strictness existed to catch a corrupted stream,
+      // not a long one — corruption is caught below, as a RESULT no init ever announced.
+      // Metadata (version, cwd, model) comes from the FIRST init; every session_id seen is
+      // kept so the result can be checked against all of them.
+      if (init === undefined) init = parsedInit.data;
+      initSessionIds.add(parsedInit.data.session_id);
     }
 
     if (message.data.type === 'result') {
@@ -119,8 +124,10 @@ export function parseClaudeCliStream(stdout: string): ParsedClaudeCliOutput {
       `Unsupported Claude CLI version ${init.claude_code_version}; expected ${SUPPORTED_CLAUDE_CLI_VERSION_RANGE}`,
     );
   }
-  if (init.session_id !== result.session_id) {
-    throw new ClaudeCliProtocolError('Claude CLI init and result session IDs do not match');
+  if (!initSessionIds.has(result.session_id)) {
+    throw new ClaudeCliProtocolError(
+      'Claude CLI result session ID matches none of the announced init sessions',
+    );
   }
   if (result.subtype !== 'success' || result.is_error || result.result === undefined) {
     throw new ClaudeCliProtocolError(`Claude CLI reported unsuccessful result ${result.subtype}`);

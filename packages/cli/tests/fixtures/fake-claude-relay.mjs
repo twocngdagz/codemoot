@@ -45,6 +45,13 @@ appendFileSync(
 
 const sequence = JSON.parse(readFileSync(responseFile, 'utf8'));
 const responseText = String(sequence[Math.min(index, sequence.length - 1)]);
+// '__CRASH__' simulates an adapter-level failure AFTER the model ran: the process dies
+// without a result message, which the adapter surfaces as a thrown ModelError — the class
+// of exception that once escaped the relay's boundary and killed the whole runner.
+if (responseText === '__CRASH__') {
+  process.stderr.write('fake-claude-relay: simulated mid-call death\n');
+  process.exit(1);
+}
 const sessionId = resumedSessionId ?? `00000000-0000-4000-8000-${String(index).padStart(12, '0')}`;
 
 process.stdout.write(
