@@ -7,7 +7,7 @@ import {
   REVIEW_WORKFLOW_RUNNER_STATE_DDL,
 } from './review-workflow-schema.js';
 
-const SCHEMA_VERSION = '17';
+const SCHEMA_VERSION = '18';
 
 const MIGRATIONS = [
   // Sessions
@@ -310,6 +310,44 @@ const MIGRATIONS = [
     value TEXT NOT NULL
   )`,
   ...REVIEW_WORKFLOW_MIGRATIONS,
+
+  // ── Relay: the message-bus loop. CodeMoot carries messages between the implementer and
+  // the reviewer, health-checks liveness, counts feedback cycles, and records everything.
+  // It holds NO model of the work: no contracts, no criteria, no coverage, no reservations.
+  // The plan lives on disk and both models read it themselves; the event log is the entire
+  // state, kept for HUMAN audit and for deriving where to resume — never for enforcement.
+  `CREATE TABLE IF NOT EXISTS relay_runs (
+    run_id               TEXT PRIMARY KEY,
+    plan_path            TEXT NOT NULL,
+    project_dir          TEXT NOT NULL,
+    total_batches        INTEGER NOT NULL CHECK(total_batches > 0),
+    max_cycles           INTEGER NOT NULL CHECK(max_cycles > 0),
+    batch                INTEGER NOT NULL CHECK(batch > 0),
+    cycle                INTEGER NOT NULL CHECK(cycle >= 0),
+    status               TEXT NOT NULL CHECK(status IN (
+      'ACTIVE', 'PAUSED_CYCLE_CAP', 'PAUSED_UNCLEAR_VERDICT', 'STOPPED', 'COMPLETE'
+    )),
+    pending              TEXT,
+    implementer_session  TEXT,
+    reviewer_session     TEXT,
+    created_at           TEXT NOT NULL,
+    updated_at           TEXT NOT NULL
+  )`,
+  `CREATE TABLE IF NOT EXISTS relay_events (
+    event_id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id        TEXT NOT NULL REFERENCES relay_runs(run_id),
+    batch         INTEGER NOT NULL,
+    cycle         INTEGER NOT NULL,
+    role          TEXT NOT NULL CHECK(role IN ('IMPLEMENTER', 'REVIEWER', 'OPERATOR', 'RELAY')),
+    kind          TEXT NOT NULL CHECK(kind IN ('PROMPT', 'RESPONSE', 'NOTE', 'DECISION')),
+    content       TEXT NOT NULL,
+    session_id    TEXT,
+    input_tokens  INTEGER,
+    output_tokens INTEGER,
+    duration_ms   INTEGER,
+    created_at    TEXT NOT NULL
+  )`,
+  'CREATE INDEX IF NOT EXISTS idx_relay_events_run ON relay_events(run_id, event_id)',
 ];
 
 /**

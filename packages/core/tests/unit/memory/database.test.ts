@@ -74,7 +74,7 @@ describe('openDatabase', () => {
   it('sets schema version', () => {
     const db = openDatabase(':memory:');
     const version = getSchemaVersion(db);
-    expect(version).toBe('17');
+    expect(version).toBe('18');
     db.close();
   });
 
@@ -83,7 +83,7 @@ describe('openDatabase', () => {
     // Run migrations again -- should be idempotent
     runMigrations(db);
     const version = getSchemaVersion(db);
-    expect(version).toBe('17');
+    expect(version).toBe('18');
     db.close();
   });
 
@@ -105,7 +105,7 @@ describe('openDatabase', () => {
 
     runMigrations(db);
 
-    expect(getSchemaVersion(db)).toBe('17');
+    expect(getSchemaVersion(db)).toBe('18');
     expect(
       db.prepare('SELECT value FROM legacy_sentinel WHERE id = ?').pluck().get('legacy-1'),
     ).toBe('preserve-me');
@@ -199,7 +199,7 @@ describe('openDatabase', () => {
 
     // The rebuilt table accepts the pause statuses, kept the existing row intact, and
     // carries the new paused-repo column.
-    expect(getSchemaVersion(db)).toBe('17');
+    expect(getSchemaVersion(db)).toBe('18');
     db.prepare(
       "UPDATE review_workflow_runner_state SET status = 'PAUSE_REQUESTED' WHERE workflow_id = 'wf-migrate'",
     ).run();

@@ -36,6 +36,12 @@ import {
 } from './commands/jobs.js';
 import { planGenerateCommand, planReviewCommand } from './commands/plan.js';
 import {
+  relayLogCommand,
+  relayResumeCommand,
+  relayRunCommand,
+  relayStatusCommand,
+} from './commands/relay.js';
+import {
   reviewWorkflowBatchAttestVerificationCommand,
   reviewWorkflowBatchCompleteImplementationCommand,
   reviewWorkflowBatchFinalAuditCommand,
@@ -799,6 +805,56 @@ jobs
   .description('Retry a failed job')
   .argument('<job-id>', 'Job ID')
   .action(jobsRetryCommand);
+
+// ── Relay: the message-bus loop (implementer ⇄ reviewer; CodeMoot is the wiring) ──
+
+const relay = program
+  .command('relay')
+  .description('Run a plan through the implementer⇄reviewer loop; CodeMoot only carries messages');
+
+relay
+  .command('run')
+  .description('Start the loop on a Markdown plan (its own "Batch N" headings are the batches)')
+  .requiredOption('--plan <file>', 'Markdown plan file; both models read it from disk')
+  .option('--id <run-id>', 'Explicit run ID')
+  .option(
+    '--max-cycles <n>',
+    'Review cycles per batch before pausing for the operator',
+    positiveInteger,
+    3,
+  )
+  .option(
+    '--batches <n>',
+    'Override the batch count parsed from the plan headings',
+    positiveInteger,
+  )
+  .option('--start-batch <n>', 'Start at this batch', positiveInteger)
+  .action(relayRunCommand);
+
+relay
+  .command('resume')
+  .description('Continue a run from wherever the event log says it stopped')
+  .argument('<run-id>', 'Relay run ID')
+  .addOption(
+    new Option(
+      '--decision <choice>',
+      'Required only at a cycle-cap pause: continue | accept | proceed',
+    ).choices(['continue', 'accept', 'proceed']),
+  )
+  .action(relayResumeCommand);
+
+relay
+  .command('status')
+  .description('Where the run is, per the event log')
+  .argument('<run-id>', 'Relay run ID')
+  .action(relayStatusCommand);
+
+relay
+  .command('log')
+  .description('The recorded exchange (use --full for complete prompts and responses)')
+  .argument('<run-id>', 'Relay run ID')
+  .option('--full', 'Print full message bodies')
+  .action(relayLogCommand);
 
 // ── Fix (autofix loop: review → fix → re-review) ──
 

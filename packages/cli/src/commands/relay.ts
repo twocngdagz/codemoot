@@ -1,0 +1,645 @@
+// The relay: CodeMoot as a message bus, not a judge.
+//
+// Two days of real use produced thirteen stops, every one in the harness and none in the
+// work — contracts, reservations, frozen budgets, coverage derivation, a hash migration.
+// The diagnosis that survived all of it: the reviewer is the intelligence; CodeMoot is the
+// wiring. The plan is a file in the repo, both models read it off disk themselves, and the
+// plan's own `### Batch N` headings ARE the decomposition — nothing transmits, restructures
+// or re-derives it.
+//
+// The relay does exactly four things:
+//   1. Carry messages — implementer output to the reviewer and back. It does not read,
+//      parse, validate, score or restructure what it carries.
+//   2. Health-check the running model. Silence is the signal (the adapter's idleTimeout);
+//      elapsed time is not. A model that is working is left alone however long it takes.
+//   3. Count feedback cycles, and pause gracefully at the cap so the HUMAN decides.
+//   4. Record every prompt and every response, so a person (or another model) can audit
+//      the whole exchange afterwards. The transcript is for humans, never for enforcement.
+//
+// One deliberate exception to "carries but never reads": the bus must know which wire to
+// put the reviewer's reply on. That is a single routing token — a final `VERDICT:` line —
+// and when it is missing or ambiguous the bus never guesses; it pauses and asks.
+//
+// Recovery follows the same principle as everything else here: no crash-state machine. If
+// the log ends with a prompt that has no reply, resume re-sends it with one sentence telling
+// the model its previous attempt may have been interrupted — and lets the intelligence
+// reconcile the working tree itself.
+
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
+import { ModelRegistry, generateId, loadConfig, type openDatabase } from '@codemoot/core';
+import { withDatabase } from '../utils.js';
+import { installGitGuard, uninstallGitGuard } from './review-workflow.js';
+
+type RelayDb = ReturnType<typeof openDatabase>;
+type RelayRole = 'IMPLEMENTER' | 'REVIEWER';
+type Verdict = 'FIX' | 'PROCEED' | 'COMPLETE';
+
+interface RelayRun {
+  runId: string;
+  planPath: string;
+  projectDir: string;
+  totalBatches: number;
+  maxCycles: number;
+  batch: number;
+  cycle: number;
+  status: 'ACTIVE' | 'PAUSED_CYCLE_CAP' | 'PAUSED_UNCLEAR_VERDICT' | 'STOPPED' | 'COMPLETE';
+  pending: string | null;
+  implementerSession: string | null;
+  reviewerSession: string | null;
+}
+
+interface RelayEvent {
+  eventId: number;
+  batch: number;
+  cycle: number;
+  role: 'IMPLEMENTER' | 'REVIEWER' | 'OPERATOR' | 'RELAY';
+  kind: 'PROMPT' | 'RESPONSE' | 'NOTE' | 'DECISION';
+  content: string;
+}
+
+// ---------------------------------------------------------------------------
+// The one piece of structure in the whole system
+// ---------------------------------------------------------------------------
+
+/**
+ * Extracts the routing token from the reviewer's reply: the LAST `VERDICT:` line among its
+ * closing lines. Only the tail is searched so that a reviewer *discussing* verdicts mid-text
+ * cannot accidentally route the loop; only a verdict *stated at the end* counts. Returns
+ * null when none is found or the tail states more than one distinct verdict — and null
+ * always means "pause and ask the operator", never a guess.
+ */
+export function parseVerdict(reply: string): Verdict | null {
+  const tail = reply
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0)
+    .slice(-10);
+  const found: Verdict[] = [];
+  for (const line of tail) {
+    const match = /^VERDICT:\s*(FIX|PROCEED|COMPLETE)\b/i.exec(line);
+    if (match !== null) found.push(match[1]?.toUpperCase() as Verdict);
+  }
+  const distinct = [...new Set(found)];
+  if (distinct.length === 1 && distinct[0] !== undefined) return distinct[0];
+  return null;
+}
+
+/**
+ * The plan's own headings are the decomposition. Counting them is the closest the relay
+ * ever comes to reading the plan — and it reads a NUMBER, not the work.
+ */
+export function countPlanBatches(planContent: string): number {
+  const numbers = [...planContent.matchAll(/^#{1,6}\s+Batch\s+(\d+)\b/gim)]
+    .map((match) => Number.parseInt(match[1] ?? '0', 10))
+    .filter((value) => Number.isInteger(value) && value > 0);
+  return numbers.length === 0 ? 1 : Math.max(...numbers);
+}
+
+// ---------------------------------------------------------------------------
+// Prompts — short by design; the models read the plan themselves
+// ---------------------------------------------------------------------------
+
+const INTERRUPTION_PREFACE =
+  'NOTE: a previous attempt at this step may have been interrupted. The working tree may ' +
+  'contain partial or uncommitted work from it. Reconcile whatever you find with the task ' +
+  'below and continue.\n\n';
+
+function implementerBatchPrompt(run: RelayRun, preface = ''): string {
+  return `${preface}You are the IMPLEMENTER in a two-model loop. The execution plan is the file at ${run.planPath} — read it from disk yourself.
+
+Work on Batch ${run.batch} of ${run.totalBatches} ONLY. Implement it fully per the plan. Commit your work locally as you go. Do NOT push.
+
+When the batch is complete, stop and reply with a summary for the reviewer: what you did, the files you created or changed, the commands you ran and their results, and the resulting git commits.`;
+}
+
+function reviewerPrompt(run: RelayRun, implementerSummary: string): string {
+  return `You are the REVIEWER in a two-model loop. The execution plan is the file at ${run.planPath} — read it from disk yourself.
+
+The implementer reports the following for Batch ${run.batch} of ${run.totalBatches}:
+
+${implementerSummary}
+
+Read Batch ${run.batch} in the plan. Verify the implementer's claims against the repository — the diff, the files, and whatever verification you judge necessary; you may run commands. Reply with your findings, written for the implementer.
+
+End your reply with exactly ONE line, and nothing after it:
+VERDICT: FIX        (problems that must be addressed)
+VERDICT: PROCEED    (the batch is acceptable; move to the next)
+VERDICT: COMPLETE   (this was the final batch and the plan is done)`;
+}
+
+function fixPrompt(run: RelayRun, review: string, preface = ''): string {
+  return `${preface}The reviewer examined your Batch ${run.batch} work and requires fixes:
+
+${review}
+
+Address them, commit locally, do NOT push, then reply with a summary of what you changed.`;
+}
+
+function acceptPrompt(run: RelayRun, review: string): string {
+  return `The reviewer examined your Batch ${run.batch} work:
+
+${review}
+
+The operator has decided this feedback is FINAL for this batch: apply what is quick and essential, commit locally, do NOT push, and reply with a brief summary. There will be no further review round for this batch.`;
+}
+
+function unclearVerdictPrompt(): string {
+  return 'Your previous reply did not end with a clear VERDICT line, so the loop cannot route it. Restate your conclusion and end with exactly one line: VERDICT: FIX, VERDICT: PROCEED, or VERDICT: COMPLETE.';
+}
+
+// ---------------------------------------------------------------------------
+// Storage — an append-only log and one counters row; the log is the truth
+// ---------------------------------------------------------------------------
+
+function getRun(db: RelayDb, runId: string): RelayRun | null {
+  const row = db.prepare('SELECT * FROM relay_runs WHERE run_id = ?').get(runId) as
+    | Record<string, unknown>
+    | undefined;
+  if (row === undefined) return null;
+  return {
+    runId: String(row.run_id),
+    planPath: String(row.plan_path),
+    projectDir: String(row.project_dir),
+    totalBatches: Number(row.total_batches),
+    maxCycles: Number(row.max_cycles),
+    batch: Number(row.batch),
+    cycle: Number(row.cycle),
+    status: String(row.status) as RelayRun['status'],
+    pending: row.pending === null ? null : String(row.pending),
+    implementerSession: row.implementer_session === null ? null : String(row.implementer_session),
+    reviewerSession: row.reviewer_session === null ? null : String(row.reviewer_session),
+  };
+}
+
+function updateRun(db: RelayDb, run: RelayRun): void {
+  db.prepare(
+    `UPDATE relay_runs SET total_batches = ?, max_cycles = ?, batch = ?, cycle = ?, status = ?,
+       pending = ?, implementer_session = ?, reviewer_session = ?, updated_at = ?
+     WHERE run_id = ?`,
+  ).run(
+    run.totalBatches,
+    run.maxCycles,
+    run.batch,
+    run.cycle,
+    run.status,
+    run.pending,
+    run.implementerSession,
+    run.reviewerSession,
+    new Date().toISOString(),
+    run.runId,
+  );
+}
+
+function appendEvent(
+  db: RelayDb,
+  run: RelayRun,
+  event: {
+    role: RelayEvent['role'];
+    kind: RelayEvent['kind'];
+    content: string;
+    sessionId?: string;
+    inputTokens?: number;
+    outputTokens?: number;
+    durationMs?: number;
+  },
+): void {
+  db.prepare(
+    `INSERT INTO relay_events
+       (run_id, batch, cycle, role, kind, content, session_id, input_tokens, output_tokens, duration_ms, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    run.runId,
+    run.batch,
+    run.cycle,
+    event.role,
+    event.kind,
+    event.content,
+    event.sessionId ?? null,
+    event.inputTokens ?? null,
+    event.outputTokens ?? null,
+    event.durationMs ?? null,
+    new Date().toISOString(),
+  );
+}
+
+function lastEvent(db: RelayDb, runId: string): RelayEvent | null {
+  const row = db
+    .prepare(
+      `SELECT event_id, batch, cycle, role, kind, content FROM relay_events
+       WHERE run_id = ? AND kind IN ('PROMPT', 'RESPONSE') ORDER BY event_id DESC LIMIT 1`,
+    )
+    .get(runId) as Record<string, unknown> | undefined;
+  if (row === undefined) return null;
+  return {
+    eventId: Number(row.event_id),
+    batch: Number(row.batch),
+    cycle: Number(row.cycle),
+    role: String(row.role) as RelayEvent['role'],
+    kind: String(row.kind) as RelayEvent['kind'],
+    content: String(row.content),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// The loop
+// ---------------------------------------------------------------------------
+
+interface RelayContext {
+  db: RelayDb;
+  registry: ModelRegistry;
+  roleAliases: { IMPLEMENTER: string; REVIEWER: string };
+  timeouts: { IMPLEMENTER: number | undefined; REVIEWER: number | undefined };
+  guardEnv: Readonly<Record<string, string>>;
+  stopRequested: () => boolean;
+  dispose: () => void;
+}
+
+async function callRole(
+  context: RelayContext,
+  run: RelayRun,
+  role: RelayRole,
+  prompt: string,
+): Promise<string> {
+  appendEvent(context.db, run, { role, kind: 'PROMPT', content: prompt });
+  const adapter = context.registry.getAdapter(context.roleAliases[role]);
+  const sessionId = role === 'IMPLEMENTER' ? run.implementerSession : run.reviewerSession;
+  const options = {
+    ...(context.timeouts[role] === undefined ? {} : { timeout: context.timeouts[role] }),
+    env: context.guardEnv,
+  };
+  const startedAt = Date.now();
+  const call =
+    sessionId === null
+      ? await adapter.send(prompt, options)
+      : await adapter.resume(sessionId, prompt, options);
+  const newSession = call.sessionId ?? sessionId;
+  if (role === 'IMPLEMENTER') run.implementerSession = newSession ?? null;
+  else run.reviewerSession = newSession ?? null;
+  appendEvent(context.db, run, {
+    role,
+    kind: 'RESPONSE',
+    content: call.text,
+    ...(newSession == null ? {} : { sessionId: newSession }),
+    inputTokens: call.usage.inputTokens,
+    outputTokens: call.usage.outputTokens,
+    durationMs: Date.now() - startedAt,
+  });
+  updateRun(context.db, run);
+  return call.text;
+}
+
+function pause(
+  context: RelayContext,
+  run: RelayRun,
+  status: 'PAUSED_CYCLE_CAP' | 'PAUSED_UNCLEAR_VERDICT' | 'STOPPED' | 'COMPLETE',
+  note: string,
+): void {
+  run.status = status;
+  appendEvent(context.db, run, { role: 'RELAY', kind: 'NOTE', content: note });
+  updateRun(context.db, run);
+}
+
+/**
+ * One step: look at the last logged exchange, do the single thing it implies, return
+ * whether the loop should keep going. The log IS the state — nothing else records where
+ * the process is, so resume is "run the same loop again" with no ceremony.
+ */
+async function step(context: RelayContext, run: RelayRun): Promise<boolean> {
+  const last = lastEvent(context.db, run.runId);
+
+  // Nothing yet: open the first batch.
+  if (last === null) {
+    process.stderr.write(`[relay] batch ${run.batch}/${run.totalBatches} → implementer\n`);
+    await callRole(context, run, 'IMPLEMENTER', implementerBatchPrompt(run));
+    return true;
+  }
+
+  // A prompt with no reply: the call was interrupted. Re-send it with the one-sentence
+  // preface and let the model reconcile whatever half-finished state it left behind.
+  if (last.kind === 'PROMPT') {
+    const role = last.role === 'REVIEWER' ? 'REVIEWER' : 'IMPLEMENTER';
+    process.stderr.write(`[relay] re-sending interrupted ${role.toLowerCase()} prompt\n`);
+    await callRole(context, run, role, `${INTERRUPTION_PREFACE}${last.content}`);
+    return true;
+  }
+
+  // Implementer replied: forward the summary to the reviewer — unless the operator already
+  // decided this batch is final, in which case the reply closes the batch.
+  if (last.role === 'IMPLEMENTER') {
+    if (run.pending === 'ADVANCE_AFTER_RESPONSE') {
+      run.pending = null;
+      return advanceBatch(context, run);
+    }
+    process.stderr.write(
+      `[relay] batch ${run.batch}/${run.totalBatches} · cycle ${run.cycle} → reviewer\n`,
+    );
+    await callRole(context, run, 'REVIEWER', reviewerPrompt(run, last.content));
+    return true;
+  }
+
+  // Reviewer replied: the only routing decision in the system.
+  if (last.role === 'REVIEWER') {
+    const verdict = parseVerdict(last.content);
+    if (verdict === null) {
+      pause(
+        context,
+        run,
+        'PAUSED_UNCLEAR_VERDICT',
+        `The reviewer reply has no single clear VERDICT line; pausing rather than guessing. Resume with: codemoot relay resume ${run.runId}`,
+      );
+      return false;
+    }
+    if (verdict === 'COMPLETE') {
+      pause(context, run, 'COMPLETE', 'The reviewer declared the plan complete.');
+      return false;
+    }
+    if (verdict === 'PROCEED') {
+      return advanceBatch(context, run);
+    }
+    // FIX — the only place a counter matters.
+    if (run.cycle >= run.maxCycles) {
+      pause(
+        context,
+        run,
+        'PAUSED_CYCLE_CAP',
+        `Batch ${run.batch} has been through ${run.cycle} review cycles (cap ${run.maxCycles}). ` +
+          `The operator decides: codemoot relay resume ${run.runId} --decision continue | accept | proceed`,
+      );
+      return false;
+    }
+    run.cycle += 1;
+    updateRun(context.db, run);
+    process.stderr.write(
+      `[relay] batch ${run.batch}/${run.totalBatches} · fix cycle ${run.cycle} → implementer\n`,
+    );
+    await callRole(context, run, 'IMPLEMENTER', fixPrompt(run, last.content));
+    return true;
+  }
+
+  throw new Error(`Unroutable last event: ${last.role} ${last.kind}`);
+}
+
+function advanceBatch(context: RelayContext, run: RelayRun): boolean {
+  if (run.batch >= run.totalBatches) {
+    pause(context, run, 'COMPLETE', `Batch ${run.batch} accepted; all batches are done.`);
+    return false;
+  }
+  run.batch += 1;
+  run.cycle = 1;
+  updateRun(context.db, run);
+  appendEvent(context.db, run, {
+    role: 'RELAY',
+    kind: 'NOTE',
+    content: `Advanced to batch ${run.batch}/${run.totalBatches}`,
+  });
+  return true;
+}
+
+async function runLoop(context: RelayContext, run: RelayRun): Promise<void> {
+  run.status = 'ACTIVE';
+  updateRun(context.db, run);
+  try {
+    for (;;) {
+      if (context.stopRequested()) {
+        pause(context, run, 'STOPPED', 'Stopped by operator between calls.');
+        return;
+      }
+      // The implementer prompt for a NEW batch is issued here rather than inside step() so
+      // an advance and its first prompt are two separate log entries around one call.
+      const last = lastEvent(context.db, run.runId);
+      if (last !== null && last.batch < run.batch) {
+        process.stderr.write(`[relay] batch ${run.batch}/${run.totalBatches} → implementer\n`);
+        await callRole(
+          context,
+          run,
+          'IMPLEMENTER',
+          implementerBatchPrompt(run, `Batch ${run.batch - 1} was accepted.\n\n`),
+        );
+        continue;
+      }
+      const keepGoing = await step(context, run);
+      if (!keepGoing) return;
+    }
+  } catch (error) {
+    // A failed or killed call is recorded and the run stops cleanly; resume re-derives
+    // everything from the log, including the interrupted-prompt case.
+    pause(
+      context,
+      run,
+      'STOPPED',
+      `Call failed: ${error instanceof Error ? error.message : String(error)}. Resume with: codemoot relay resume ${run.runId}`,
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Wiring
+// ---------------------------------------------------------------------------
+
+function buildContext(db: RelayDb, projectDir: string): RelayContext {
+  const config = loadConfig({ projectDir });
+  const implementerAlias = config.roles.implementer?.model;
+  const reviewerAlias = config.roles.reviewer?.model;
+  if (implementerAlias === undefined || reviewerAlias === undefined) {
+    throw new Error('The relay requires "implementer" and "reviewer" roles in .cowork.yml');
+  }
+  if (implementerAlias === reviewerAlias) {
+    // Reviewer independence is the product, not a guard: one alias would mean one session
+    // reviewing itself.
+    throw new Error('implementer and reviewer must be different model aliases');
+  }
+  const timeoutOf = (alias: string): number | undefined => {
+    const seconds = config.models[alias]?.cliAdapter?.timeout;
+    return seconds === undefined ? undefined : seconds * 1000;
+  };
+  const guardedPath = installGitGuard(projectDir);
+  let stopRequested = false;
+  const requestStop = (): void => {
+    stopRequested = true;
+    process.stderr.write('\n[relay] finishing the current call, then stopping…\n');
+  };
+  process.on('SIGINT', requestStop);
+  process.on('SIGTERM', requestStop);
+  return {
+    dispose: () => {
+      process.removeListener('SIGINT', requestStop);
+      process.removeListener('SIGTERM', requestStop);
+    },
+    db,
+    registry: ModelRegistry.fromConfig(config, projectDir),
+    roleAliases: { IMPLEMENTER: implementerAlias, REVIEWER: reviewerAlias },
+    timeouts: { IMPLEMENTER: timeoutOf(implementerAlias), REVIEWER: timeoutOf(reviewerAlias) },
+    guardEnv: {
+      PATH: guardedPath,
+      GIT_CONFIG_GLOBAL: '/dev/null',
+      GIT_CONFIG_SYSTEM: '/dev/null',
+      GIT_TERMINAL_PROMPT: '0',
+      GIT_ASKPASS: '/usr/bin/false',
+      GIT_SSH_COMMAND: '/usr/bin/false',
+    },
+    stopRequested: () => stopRequested,
+  };
+}
+
+export async function relayRunCommand(options: {
+  readonly plan: string;
+  readonly id?: string;
+  readonly maxCycles?: number;
+  readonly batches?: number;
+  readonly startBatch?: number;
+}): Promise<void> {
+  await withDatabase(async (db) => {
+    const projectDir = process.cwd();
+    const planPath = resolve(projectDir, options.plan);
+    const planContent = readFileSync(planPath, 'utf8');
+    const totalBatches = options.batches ?? countPlanBatches(planContent);
+    const runId = options.id ?? generateId('relay');
+    const now = new Date().toISOString();
+    db.prepare(
+      `INSERT INTO relay_runs
+         (run_id, plan_path, project_dir, total_batches, max_cycles, batch, cycle, status,
+          pending, implementer_session, reviewer_session, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, 1, 'ACTIVE', NULL, NULL, NULL, ?, ?)`,
+    ).run(
+      runId,
+      planPath,
+      projectDir,
+      totalBatches,
+      options.maxCycles ?? 3,
+      options.startBatch ?? 1,
+      now,
+      now,
+    );
+    process.stderr.write(
+      `[relay] ${runId}: ${totalBatches} batches per the plan's own headings, cycle cap ${options.maxCycles ?? 3}\n`,
+    );
+    const context = buildContext(db, projectDir);
+    const run = getRun(db, runId);
+    if (run === null) throw new Error('run row vanished');
+    try {
+      await runLoop(context, run);
+    } finally {
+      context.dispose();
+      uninstallGitGuard(projectDir);
+    }
+    printRelayStatus(db, runId);
+  });
+}
+
+export async function relayResumeCommand(
+  runId: string,
+  options: { readonly decision?: 'continue' | 'accept' | 'proceed' },
+): Promise<void> {
+  await withDatabase(async (db) => {
+    const run = getRun(db, runId);
+    if (run === null) throw new Error(`Relay run ${runId} does not exist`);
+    if (run.status === 'COMPLETE') {
+      printRelayStatus(db, runId);
+      return;
+    }
+    const context = buildContext(db, run.projectDir);
+
+    if (run.status === 'PAUSED_CYCLE_CAP') {
+      if (options.decision === undefined) {
+        throw new Error(
+          `Batch ${run.batch} is paused at the cycle cap. Choose: --decision continue (one more review cycle) | accept (implementer applies the last feedback as final, then the batch advances) | proceed (advance as-is)`,
+        );
+      }
+      const review = lastEvent(db, runId);
+      appendEvent(db, run, { role: 'OPERATOR', kind: 'DECISION', content: options.decision });
+      if (options.decision === 'continue') {
+        run.maxCycles += 1; // one more cycle, explicitly granted — the count stays honest
+        run.cycle += 1;
+        updateRun(db, run);
+        if (review === null) throw new Error('no review to continue from');
+        await callRole(context, run, 'IMPLEMENTER', fixPrompt(run, review.content));
+      } else if (options.decision === 'accept') {
+        run.pending = 'ADVANCE_AFTER_RESPONSE';
+        updateRun(db, run);
+        if (review === null) throw new Error('no review to accept');
+        await callRole(context, run, 'IMPLEMENTER', acceptPrompt(run, review.content));
+      } else {
+        appendEvent(db, run, {
+          role: 'RELAY',
+          kind: 'NOTE',
+          content: `Batch ${run.batch} advanced as-is by operator decision`,
+        });
+        advanceBatch(context, run);
+      }
+    } else if (run.status === 'PAUSED_UNCLEAR_VERDICT') {
+      await callRole(context, run, 'REVIEWER', unclearVerdictPrompt());
+    }
+
+    try {
+      // Every mutation above persisted through updateRun, so the row is the truth — and a
+      // `proceed` on the final batch may have just completed the run.
+      const current = getRun(db, runId);
+      if (current !== null && current.status !== 'COMPLETE') await runLoop(context, current);
+    } finally {
+      context.dispose();
+      uninstallGitGuard(run.projectDir);
+    }
+    printRelayStatus(db, runId);
+  });
+}
+
+export async function relayStatusCommand(runId: string): Promise<void> {
+  await withDatabase(async (db) => {
+    printRelayStatus(db, runId);
+  });
+}
+
+export async function relayLogCommand(
+  runId: string,
+  options: { readonly full?: boolean },
+): Promise<void> {
+  await withDatabase(async (db) => {
+    const rows = db
+      .prepare(
+        `SELECT event_id, batch, cycle, role, kind, content, input_tokens, output_tokens, duration_ms, created_at
+         FROM relay_events WHERE run_id = ? ORDER BY event_id`,
+      )
+      .all(runId) as Record<string, unknown>[];
+    for (const row of rows) {
+      const content = String(row.content);
+      const body = options.full === true ? content : content.split('\n')[0]?.slice(0, 160);
+      console.log(
+        `#${row.event_id} b${row.batch}c${row.cycle} ${String(row.role).padEnd(11)} ${String(row.kind).padEnd(8)} ${body}`,
+      );
+    }
+  });
+}
+
+function printRelayStatus(db: RelayDb, runId: string): void {
+  const run = getRun(db, runId);
+  if (run === null) throw new Error(`Relay run ${runId} does not exist`);
+  const totals = db
+    .prepare(
+      `SELECT COUNT(*) AS calls, COALESCE(SUM(input_tokens), 0) AS input, COALESCE(SUM(output_tokens), 0) AS output
+       FROM relay_events WHERE run_id = ? AND kind = 'RESPONSE'`,
+    )
+    .get(runId) as { calls: number; input: number; output: number };
+  console.log(
+    JSON.stringify(
+      {
+        runId: run.runId,
+        status: run.status,
+        batch: run.batch,
+        totalBatches: run.totalBatches,
+        cycle: run.cycle,
+        maxCycles: run.maxCycles,
+        calls: totals.calls,
+        inputTokens: totals.input,
+        outputTokens: totals.output,
+        plan: run.planPath,
+        resume:
+          run.status === 'COMPLETE'
+            ? null
+            : `codemoot relay resume ${run.runId}${run.status === 'PAUSED_CYCLE_CAP' ? ' --decision continue|accept|proceed' : ''}`,
+      },
+      null,
+      2,
+    ),
+  );
+}
