@@ -388,30 +388,47 @@ async function performRefinement(
       additionalAuthorities: ['PLAN_REFINER'],
       auditPhase: 'PLAN_REFINEMENT',
     });
-    outline = reviewWorkflowContracts.parseRefinementOutline(outlinePrepared.call.text);
-    // Drafts staged before pinning existed belong to a decomposition we never recorded. The
-    // re-authored outline must therefore MATCH them exactly, or the run would assemble ten
-    // drafts under an eleven-batch partition — which is precisely what happened once, and
-    // was silent because every individual draft was correct. Fail closed and say what to do.
-    const stagedOrdinals = runtime.store.workflowStore
-      .listRefinementDrafts(workflowId)
-      .map((entry) => entry.ordinal)
-      .sort((left, right) => left - right);
-    if (stagedOrdinals.length > 0) {
-      const outlineOrdinals = outline.batches
-        .map((batch) => batch.ordinal)
-        .sort((left, right) => left - right);
-      if (JSON.stringify(stagedOrdinals) !== JSON.stringify(outlineOrdinals)) {
-        throw new Error(
-          [
-            `The re-authored outline decomposes this plan into ${outlineOrdinals.length} batches,`,
-            `but ${stagedOrdinals.length} batch plans are already staged (ordinals`,
-            `${stagedOrdinals.join(', ')}). Assembling staged drafts under a different`,
-            'decomposition would silently mix two partitions of the same plan. Discard the',
-            'drafts that do not belong with `codemoot workflow discard-drafts <id> --discard N`.',
-          ].join(' '),
-        );
-      }
+    // Audited the MOMENT it returns, not when capture succeeds. Bound to `persistPrepared`,
+    // a refinement that failed validation lost its outline from the cost ledger entirely.
+    runtime.store.workflowStore.recordInvocationAudit(outlinePrepared.audit);
+    const authored = reviewWorkflowContracts.parseRefinementOutline(outlinePrepared.call.text);
+    // Once batch plans exist, THE STAGED DRAFTS ARE THE DECOMPOSITION. They were authored
+    // against a partition and validated under it; a fresh outline call is not a second
+    // opinion on how many batches there are, it is a different question being asked twice.
+    //
+    // Asking it twice does not give the same answer: three calls on an unchanged ten-batch
+    // plan returned 10, then 11, then 11 — the model splitting one migration batch in two
+    // and inventing a dependency between the halves. Refusing the mismatch protected the
+    // staged work but deadlocked, because the outline wanted an ELEVENTH batch and no draft
+    // can be discarded to supply one.
+    //
+    // So the outline is asked only for what the drafts cannot carry — the plan prose — and
+    // the batch set is adopted from the drafts. This is then pinned, so the question is
+    // never asked again for this workflow.
+    const stagedDrafts = runtime.store.workflowStore.listRefinementDrafts(workflowId);
+    if (stagedDrafts.length > 0) {
+      const adopted = stagedDrafts
+        .map((entry) => reviewWorkflowContracts.parseStoredBatchPlanDraft(entry.draft))
+        .sort((left, right) => left.ordinal - right.ordinal)
+        .map((draft) => ({
+          batchId: draft.batchId,
+          batchPlanVersionId: draft.batchPlanVersionId,
+          ordinal: draft.ordinal,
+          objective: draft.objective,
+        }));
+      // Re-parsed rather than trusted: this must satisfy the same outline contract as an
+      // authored one, so non-sequential ordinals left by an earlier discard fail loudly.
+      outline = reviewWorkflowContracts.parseRefinementOutline(
+        JSON.stringify({ ...authored, batches: adopted }),
+      );
+      runtime.runnerStore.appendLog({
+        workflowId,
+        entryType: 'CHECKPOINT',
+        phase: 'PLAN_REFINEMENT',
+        message: `Adopted the staged ${adopted.length}-batch decomposition; the outline supplied plan content only (it proposed ${authored.batches.length})`,
+      });
+    } else {
+      outline = authored;
     }
     // Pinned the moment it is accepted — BEFORE any batch is authored against it, so the
     // decomposition the drafts belong to is durable even if the run dies mid-refinement.

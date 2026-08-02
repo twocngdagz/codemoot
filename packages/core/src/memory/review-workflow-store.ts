@@ -718,11 +718,21 @@ export class ReviewWorkflowStore {
       );
   }
 
-  /** Append-only, immutable invocation audit: full prompt and response before advancement. */
+  /**
+   * Append-only, immutable invocation audit: full prompt and response before advancement.
+   *
+   * INSERT OR IGNORE, because the row is immutable and keyed by invocation ID — first write
+   * wins is already this table's contract, so a second write of the same invocation is by
+   * definition the same evidence. That makes it safe to audit a call the MOMENT it returns
+   * rather than waiting for the command that consumes it to succeed. The outline invocation
+   * used to be recorded only via `persistPrepared` at capture, so every refinement that
+   * failed validation lost its outline from the ledger: one workflow reported $27.94 spent
+   * against roughly $32 actual, understating by one outline per failed run.
+   */
   recordInvocationAudit(audit: InvocationAuditRecord): void {
     this.db
       .prepare(
-        `INSERT INTO review_workflow_invocation_audit (
+        `INSERT OR IGNORE INTO review_workflow_invocation_audit (
           invocation_id, workflow_id, batch_id, phase, command_id, role,
           actor_execution_id, adapter_kind, configured_model, reported_model,
           vendor_session_id, session_outcome, prompt, prompt_hash, response, response_hash,
