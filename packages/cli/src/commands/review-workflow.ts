@@ -3378,6 +3378,27 @@ function buildRunnerPhases(
     applyDecision: async (batch, action, decision) => {
       if (action === 'CANCEL_WORKFLOW') return;
       let stored = requireBatchByOrdinal(runtime.store, workflowId, batch.ordinal);
+      // Reserve-before-invoke means ANY stop between a reservation and its completion —
+      // token budget, runtime limit, review limit, crash, pause — leaves a command that can
+      // never be retried, because the canonical hash covers the requester's actor execution
+      // and a new run is honestly a new actor. Releasing one hard-coded ID rescued
+      // refinement and left the identical wall standing at plan review, implementation,
+      // code review and the merge gate. The release belongs to the RETRY, not to a phase:
+      // a human authorising this batch to continue frees every reservation that failed
+      // without building anything.
+      const released = runtime.commandStore.releaseRetryableReservations(
+        workflowId,
+        stored.batchId,
+        `Human-authorised ${action} (${decision.decisionId})`,
+      );
+      if (released.length > 0) {
+        runtime.runnerStore.appendLog({
+          workflowId,
+          batchId: stored.batchId,
+          entryType: 'DECISION',
+          message: `Released ${released.length} terminally-failed reservation(s) for retry: ${released.join(', ')}`,
+        });
+      }
       // A DISTINCT execution from the decide command's recorder (immutable records
       // cannot be re-persisted with new timestamps).
       const owner = persistCliActor(runtime.store, {

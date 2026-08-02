@@ -126,6 +126,65 @@ describe('releaseFailedFinalReservation', () => {
     expect(commands.releaseFailedFinalReservation(COMMAND_ID, 'retry')).toBe(false);
   });
 
+  it('releases a command whose batch ALREADY EXISTS', () => {
+    // The guard used to ask "does the batch exist?", which is the right question for exactly
+    // one of twelve command types. Every other command REQUIRES the batch to exist — you
+    // cannot plan-review a batch that was never created — so the old check refused all
+    // eleven unconditionally, and the release could only rescue the one case it was written
+    // for. That is the START_PLAN_REVIEW deadlock that stopped a live workflow.
+    reserveThenFail('run-9');
+    db.prepare(
+      `INSERT INTO review_workflow_batches
+         (batch_id, workflow_id, ordinal, persisted_state, aggregate_version,
+          last_event_sequence, current_plan_version_id, implementer_assignment_id,
+          reviewer_assignment_id, payload_json, record_hash, created_at, updated_at)
+       VALUES (?, ?, 1, 'DRAFT', 1, 1, 'plan-1', 'assignment-implementer',
+               'assignment-reviewer', '{}', 'hash', ?, ?)`,
+    ).run(BATCH_ID, WORKFLOW_ID, '2026-08-02T00:00:00.000Z', '2026-08-02T00:00:00.000Z');
+
+    // The receipt recorded no durable state, so the retry is safe regardless of the batch.
+    expect(commands.releaseFailedFinalReservation(COMMAND_ID, 'retry')).toBe(true);
+    expect(commands.get(COMMAND_ID)).toBeNull();
+  });
+
+  it('still refuses a command that DID record durable state', () => {
+    // The replacement guard has to be able to say no, or it is not a guard.
+    reserveThenFail('run-9');
+    db.prepare(
+      'UPDATE review_workflow_command_receipts SET resulting_aggregate_version = 1 WHERE command_id = ?',
+    ).run(COMMAND_ID);
+    expect(() => commands.releaseFailedFinalReservation(COMMAND_ID, 'retry')).toThrow(
+      /recorded durable state/,
+    );
+  });
+
+  it('sweeps every retryable reservation for the batch in one authorised retry', () => {
+    // One release call per phase is how the same wall reappeared at plan review after being
+    // cleared at refinement. The retry frees them all.
+    for (const suffix of ['create', 'review-1', 'implement']) {
+      const id = `${BATCH_ID}:${suffix}`;
+      commands.reserve({ ...request(suffix), commandId: id });
+      commands.recordOutcome({
+        commandId: id,
+        status: 'FAILED_FINAL',
+        errorCode: 'STOPPED',
+        resultHash: 'h',
+        result: { code: 'STOPPED' },
+      });
+    }
+    const released = commands.releaseRetryableReservations(WORKFLOW_ID, BATCH_ID, 'retry');
+    expect(released).toHaveLength(3);
+    for (const suffix of ['create', 'review-1', 'implement']) {
+      expect(commands.get(`${BATCH_ID}:${suffix}`)).toBeNull();
+    }
+  });
+
+  it('sweeps nothing when there is nothing terminally failed', () => {
+    commands.reserve(request('run-1'));
+    expect(commands.releaseRetryableReservations(WORKFLOW_ID, BATCH_ID, 'retry')).toEqual([]);
+    expect(commands.get(COMMAND_ID)?.receipt.status).toBe('RESERVED');
+  });
+
   it('is idempotent enough to call unconditionally before a retry', () => {
     // The refinement path calls this every time; a clean first run must not be disturbed.
     expect(commands.releaseFailedFinalReservation(COMMAND_ID, 'retry')).toBe(false);

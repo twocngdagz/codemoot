@@ -251,6 +251,40 @@ export class ReviewWorkflowCommandStore {
    *
    * Returns false when there is nothing to release.
    */
+  /**
+   * Releases EVERY terminally-failed reservation for a batch that produced no durable state.
+   *
+   * Reserve-before-invoke means any stop between a reservation and its completion — token
+   * budget, runtime limit, review limit, crash, pause — leaves a command that can never be
+   * retried, because the canonical hash covers the requester's actor execution and a new run
+   * is honestly a new actor. Releasing one hard-coded command ID fixed refinement and left
+   * the same wall standing at plan review, implementation, code review and the merge gate,
+   * each discoverable only after paying to reach it.
+   *
+   * So the sweep is driven by the RETRY rather than by the phase: when a human authorises a
+   * batch to continue, every reservation that failed without building anything is freed.
+   * Returns the command IDs released.
+   */
+  releaseRetryableReservations(
+    workflowId: string,
+    batchId: string,
+    reason: string,
+  ): readonly string[] {
+    const candidates = this.db
+      .prepare(
+        `SELECT command_id FROM review_workflow_command_receipts
+         WHERE workflow_id = ? AND batch_id = ? AND status = 'FAILED_FINAL'
+           AND resulting_aggregate_version IS NULL AND resulting_event_sequence IS NULL`,
+      )
+      .all(workflowId, batchId)
+      .map((row) => z.object({ command_id: z.string() }).parse(row).command_id);
+    const released: string[] = [];
+    for (const commandId of candidates) {
+      if (this.releaseFailedFinalReservation(commandId, reason)) released.push(commandId);
+    }
+    return released;
+  }
+
   releaseFailedFinalReservation(commandId: string, reason: string): boolean {
     return this.db.transaction(() => {
       const stored = this.get(commandId);
@@ -261,19 +295,33 @@ export class ReviewWorkflowCommandStore {
           `Command ${commandId} is ${stored.receipt.status}, not FAILED_FINAL, and cannot be superseded`,
         );
       }
-      // Nothing may have been created under this command, or releasing it would allow a
-      // second aggregate to be built over the first.
-      if (this.getBatchRow(stored.request.batchId) !== null) {
+      // Ask whether THIS COMMAND produced durable state — not whether the batch exists.
+      //
+      // The first version of this guard checked batch existence, which is the right question
+      // for exactly one of the twelve command types. CREATE_BATCH is the only command for
+      // which "the batch exists" means "this command succeeded". For START_PLAN_REVIEW,
+      // START_IMPLEMENTATION, APPROVE_FOR_MERGE and the rest, the batch MUST already exist —
+      // so a check written for CREATE_BATCH refused every other command unconditionally, and
+      // the release could only ever rescue the one member of the class it was written for.
+      //
+      // A command that produced state recorded its resulting aggregate version and event
+      // sequence. That question is meaningful for all twelve.
+      if (
+        stored.receipt.resultingAggregateVersion !== undefined ||
+        stored.receipt.resultingEventSequence !== undefined
+      ) {
         throw new ReviewWorkflowPersistenceError(
           'COMMAND_STATE_CONFLICT',
-          `Command ${commandId} already created batch ${stored.request.batchId}`,
+          `Command ${commandId} recorded durable state (aggregate version ${stored.receipt.resultingAggregateVersion ?? 'unset'}, event ${stored.receipt.resultingEventSequence ?? 'unset'}) and cannot be superseded`,
         );
       }
-      // A RECORDED side effect is deliberately NOT a reason to refuse. The failed refinement
+      // Re-reserving cannot duplicate an aggregate even so: assertExpectedVersionAtReservation
+      // still holds the retry to the version it declares, so a CREATE_BATCH retry against an
+      // existing batch fails there rather than silently building a second one.
+      //
+      // A RECORDED side effect is deliberately NOT a reason to refuse. The failed command
       // really did invoke an agent, and that invocation stays in the immutable invocation
-      // audit either way — releasing the reservation neither erases it nor causes it to be
-      // replayed. What must never be duplicated is durable aggregate state, and the batch
-      // check above is what guarantees that.
+      // audit either way — releasing the reservation neither erases it nor replays it.
       const archive = this.db
         .prepare(
           `INSERT INTO review_workflow_superseded_commands
