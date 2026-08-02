@@ -35,14 +35,22 @@ export class BuildStore {
         `INSERT INTO build_runs (build_id, task, status, current_phase, current_loop, last_event_seq, phase_cursor, debate_id, baseline_ref, created_at, updated_at)
          VALUES (?, ?, 'planning', 'debate', 0, 0, ?, ?, ?, ?, ?)`,
       )
-      .run(params.buildId, params.task, JSON.stringify(cursor), params.debateId ?? null, params.baselineRef ?? null, now, now);
+      .run(
+        params.buildId,
+        params.task,
+        JSON.stringify(cursor),
+        params.debateId ?? null,
+        params.baselineRef ?? null,
+        now,
+        now,
+      );
   }
 
   /** Get a build run by build_id. */
   get(buildId: string): BuildRun | null {
-    const row = this.db
-      .prepare('SELECT * FROM build_runs WHERE build_id = ?')
-      .get(buildId) as Record<string, unknown> | undefined;
+    const row = this.db.prepare('SELECT * FROM build_runs WHERE build_id = ?').get(buildId) as
+      | Record<string, unknown>
+      | undefined;
     return row ? this.toRun(row) : null;
   }
 
@@ -131,17 +139,50 @@ export class BuildStore {
       const sets: string[] = ['last_event_seq = ?', 'updated_at = ?'];
       const values: unknown[] = [nextSeq, now];
 
-      if (updates.status !== undefined) { sets.push('status = ?'); values.push(updates.status); }
-      if (updates.currentPhase !== undefined) { sets.push('current_phase = ?'); values.push(updates.currentPhase); }
-      if (updates.currentLoop !== undefined) { sets.push('current_loop = ?'); values.push(updates.currentLoop); }
-      if (updates.debateId !== undefined) { sets.push('debate_id = ?'); values.push(updates.debateId); }
-      if (updates.baselineRef !== undefined) { sets.push('baseline_ref = ?'); values.push(updates.baselineRef); }
-      if (updates.planCodexSession !== undefined) { sets.push('plan_codex_session = ?'); values.push(updates.planCodexSession); }
-      if (updates.reviewCodexSession !== undefined) { sets.push('review_codex_session = ?'); values.push(updates.reviewCodexSession); }
-      if (updates.planVersion !== undefined) { sets.push('plan_version = ?'); values.push(updates.planVersion); }
-      if (updates.reviewCycles !== undefined) { sets.push('review_cycles = ?'); values.push(updates.reviewCycles); }
-      if (updates.completedAt !== undefined) { sets.push('completed_at = ?'); values.push(updates.completedAt); }
-      if (updates.metadata !== undefined) { sets.push('metadata = ?'); values.push(JSON.stringify(updates.metadata)); }
+      if (updates.status !== undefined) {
+        sets.push('status = ?');
+        values.push(updates.status);
+      }
+      if (updates.currentPhase !== undefined) {
+        sets.push('current_phase = ?');
+        values.push(updates.currentPhase);
+      }
+      if (updates.currentLoop !== undefined) {
+        sets.push('current_loop = ?');
+        values.push(updates.currentLoop);
+      }
+      if (updates.debateId !== undefined) {
+        sets.push('debate_id = ?');
+        values.push(updates.debateId);
+      }
+      if (updates.baselineRef !== undefined) {
+        sets.push('baseline_ref = ?');
+        values.push(updates.baselineRef);
+      }
+      if (updates.planCodexSession !== undefined) {
+        sets.push('plan_codex_session = ?');
+        values.push(updates.planCodexSession);
+      }
+      if (updates.reviewCodexSession !== undefined) {
+        sets.push('review_codex_session = ?');
+        values.push(updates.reviewCodexSession);
+      }
+      if (updates.planVersion !== undefined) {
+        sets.push('plan_version = ?');
+        values.push(updates.planVersion);
+      }
+      if (updates.reviewCycles !== undefined) {
+        sets.push('review_cycles = ?');
+        values.push(updates.reviewCycles);
+      }
+      if (updates.completedAt !== undefined) {
+        sets.push('completed_at = ?');
+        values.push(updates.completedAt);
+      }
+      if (updates.metadata !== undefined) {
+        sets.push('metadata = ?');
+        values.push(JSON.stringify(updates.metadata));
+      }
 
       // Update cursor
       const cursor: PhaseCursor = {
@@ -190,7 +231,11 @@ export class BuildStore {
     }
     let metadata: Record<string, unknown> | null = null;
     if (row.metadata) {
-      try { metadata = JSON.parse(row.metadata as string); } catch { /* ignore */ }
+      try {
+        metadata = JSON.parse(row.metadata as string);
+      } catch {
+        /* ignore */
+      }
     }
     return {
       id: row.id as number,
@@ -217,7 +262,11 @@ export class BuildStore {
   private toEvent(row: Record<string, unknown>): BuildEvent {
     let payload: Record<string, unknown> | null = null;
     if (row.payload) {
-      try { payload = JSON.parse(row.payload as string); } catch { /* ignore */ }
+      try {
+        payload = JSON.parse(row.payload as string);
+      } catch {
+        /* ignore */
+      }
     }
     return {
       id: row.id as number,

@@ -1,5 +1,7 @@
 // packages/cli/src/commands/debate.ts — CLI debate commands wired to core backend
 
+import { mkdirSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 import type { BridgeCallResult, DebateEngineState, DebateTurnRow } from '@codemoot/core';
 import {
   DebateStore,
@@ -16,8 +18,6 @@ import {
   preflightTokenCheck,
 } from '@codemoot/core';
 import chalk from 'chalk';
-import { mkdirSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
 
 import { createProgressCallbacks } from '../progress.js';
 import { getDbPath } from '../utils.js';
@@ -51,7 +51,12 @@ export async function debateStartCommand(topic: string, options: StartOptions): 
       thread: [],
       runningSummary: '',
       stanceHistory: [],
-      usage: { totalPromptTokens: 0, totalCompletionTokens: 0, totalCalls: 0, startedAt: Date.now() },
+      usage: {
+        totalPromptTokens: 0,
+        totalCompletionTokens: 0,
+        totalCalls: 0,
+        startedAt: Date.now(),
+      },
       status: 'running',
       sessionIds: {},
       resumeStats: { attempted: 0, succeeded: 0, fallbacks: 0 },
@@ -97,7 +102,13 @@ function buildResponseOutput(
   responseText: string | null | undefined,
   cap: number,
   explicitOutput: string | undefined,
-): { response: string; responseTruncated: boolean; responseBytes: number; responseCap: number; responseFile: string | undefined } {
+): {
+  response: string;
+  responseTruncated: boolean;
+  responseBytes: number;
+  responseCap: number;
+  responseFile: string | undefined;
+} {
   const text = responseText ?? '';
   const byteLen = Buffer.byteLength(text, 'utf-8');
   const truncated = byteLen > cap;
@@ -161,7 +172,11 @@ export async function debateTurnCommand(
     }
     if (criticRow.status === 'completed') {
       db.close();
-      console.error(chalk.red(`Debate ${debateId} is already completed. Start a new debate to continue discussion.`));
+      console.error(
+        chalk.red(
+          `Debate ${debateId} is already completed. Start a new debate to continue discussion.`,
+        ),
+      );
       process.exit(1);
     }
 
@@ -173,7 +188,7 @@ export async function debateTurnCommand(
       process.exit(1);
     }
 
-    const rawRound = options.round ?? (criticRow.round + 1);
+    const rawRound = options.round ?? criticRow.round + 1;
     const newRound = Number.isFinite(rawRound) && rawRound > 0 ? rawRound : criticRow.round + 1;
     const responseCap = Math.min(
       options.responseCap && options.responseCap > 0 ? options.responseCap : DEFAULT_RESPONSE_CAP,
@@ -183,15 +198,23 @@ export async function debateTurnCommand(
 
     // Load persisted state for maxRounds and default timeout
     const proposerStateForLimit = store.loadState(debateId, 'proposer');
-    const storedTimeout = (proposerStateForLimit as (typeof proposerStateForLimit & { defaultTimeout?: number }))?.defaultTimeout;
+    const storedTimeout = (
+      proposerStateForLimit as typeof proposerStateForLimit & { defaultTimeout?: number }
+    )?.defaultTimeout;
     const rawTimeout = options.timeout ?? storedTimeout ?? 600;
     const timeout = (Number.isFinite(rawTimeout) && rawTimeout > 0 ? rawTimeout : 600) * 1000;
 
     // Enforce maxRounds from persisted state
-    const rawMax = (proposerStateForLimit as (typeof proposerStateForLimit & { maxRounds?: number }))?.maxRounds ?? 5;
+    const rawMax =
+      (proposerStateForLimit as typeof proposerStateForLimit & { maxRounds?: number })?.maxRounds ??
+      5;
     const maxRounds = Number.isFinite(rawMax) && rawMax > 0 ? rawMax : 5;
     if (newRound > maxRounds) {
-      console.error(chalk.red(`Round ${newRound} exceeds max rounds (${maxRounds}). Complete or increase limit.`));
+      console.error(
+        chalk.red(
+          `Round ${newRound} exceeds max rounds (${maxRounds}). Complete or increase limit.`,
+        ),
+      );
       db.close();
       process.exit(1);
     }
@@ -214,7 +237,13 @@ export async function debateTurnCommand(
         writeFileSync(options.output, existing.responseText, 'utf-8');
         if (!quiet) console.error(chalk.dim(`Full response written to ${options.output}`));
       }
-      const responseFields = buildResponseOutput(debateId, newRound, existing.responseText, responseCap, options.output);
+      const responseFields = buildResponseOutput(
+        debateId,
+        newRound,
+        existing.responseText,
+        responseCap,
+        options.output,
+      );
       const output = {
         debateId,
         round: newRound,
@@ -222,7 +251,15 @@ export async function debateTurnCommand(
         sessionId: existing.sessionId,
         resumed: false,
         cached: true,
-        usage: existing.usageJson ? (() => { try { return JSON.parse(existing.usageJson); } catch { return null; } })() : null,
+        usage: existing.usageJson
+          ? (() => {
+              try {
+                return JSON.parse(existing.usageJson);
+              } catch {
+                return null;
+              }
+            })()
+          : null,
         durationMs: existing.durationMs,
       };
       console.log(JSON.stringify(output, null, 2));
@@ -266,7 +303,13 @@ export async function debateTurnCommand(
           writeFileSync(options.output, recheckRow.responseText, 'utf-8');
           if (!quiet) console.error(chalk.dim(`Full response written to ${options.output}`));
         }
-        const recheckResponseFields = buildResponseOutput(debateId, newRound, recheckRow.responseText, responseCap, options.output);
+        const recheckResponseFields = buildResponseOutput(
+          debateId,
+          newRound,
+          recheckRow.responseText,
+          responseCap,
+          options.output,
+        );
         const output = {
           debateId,
           round: newRound,
@@ -274,7 +317,15 @@ export async function debateTurnCommand(
           sessionId: recheckRow.sessionId,
           resumed: false,
           cached: true,
-          usage: recheckRow.usageJson ? (() => { try { return JSON.parse(recheckRow.usageJson); } catch { return null; } })() : null,
+          usage: recheckRow.usageJson
+            ? (() => {
+                try {
+                  return JSON.parse(recheckRow.usageJson);
+                } catch {
+                  return null;
+                }
+              })()
+            : null,
           durationMs: recheckRow.durationMs,
         };
         console.log(JSON.stringify(output, null, 2));
@@ -282,7 +333,11 @@ export async function debateTurnCommand(
         return;
       }
       db.close();
-      console.error(chalk.red(`Cannot transition message ${msgId} to running (current status: ${recheckRow?.status})`));
+      console.error(
+        chalk.red(
+          `Cannot transition message ${msgId} to running (current status: ${recheckRow?.status})`,
+        ),
+      );
       process.exit(1);
     }
 
@@ -293,17 +348,31 @@ export async function debateTurnCommand(
     const attemptedResume = existingSessionId != null;
 
     // Token budget preflight check (only completed rows = real conversation context)
-    const completedHistory = msgStore.getHistory(debateId).filter(m => m.status === 'completed');
+    const completedHistory = msgStore.getHistory(debateId).filter((m) => m.status === 'completed');
     const maxContext = adapter.capabilities.maxContextTokens;
     const preflight = preflightTokenCheck(completedHistory, prompt, maxContext);
     if (preflight.shouldStop && !options.force) {
-      console.error(chalk.red(`Token budget at ${Math.round(preflight.utilizationRatio * 100)}% (${preflight.totalTokensUsed}/${maxContext}). Debate blocked — use --force to override.`));
+      console.error(
+        chalk.red(
+          `Token budget at ${Math.round(preflight.utilizationRatio * 100)}% (${preflight.totalTokensUsed}/${maxContext}). Debate blocked — use --force to override.`,
+        ),
+      );
       db.close();
       process.exit(1);
     } else if (preflight.shouldStop && options.force) {
-      if (!quiet) console.error(chalk.yellow(`  Token budget at ${Math.round(preflight.utilizationRatio * 100)}% (${preflight.totalTokensUsed}/${maxContext}) — forced past budget limit.`));
+      if (!quiet)
+        console.error(
+          chalk.yellow(
+            `  Token budget at ${Math.round(preflight.utilizationRatio * 100)}% (${preflight.totalTokensUsed}/${maxContext}) — forced past budget limit.`,
+          ),
+        );
     } else if (preflight.shouldSummarize) {
-      if (!quiet) console.error(chalk.yellow(`  Token budget at ${Math.round(preflight.utilizationRatio * 100)}%. Older rounds will be summarized on resume failure.`));
+      if (!quiet)
+        console.error(
+          chalk.yellow(
+            `  Token budget at ${Math.round(preflight.utilizationRatio * 100)}%. Older rounds will be summarized on resume failure.`,
+          ),
+        );
     }
 
     try {
@@ -335,7 +404,10 @@ export async function debateTurnCommand(
 
       // If resume failed, reconstruct context from stored history and retry
       if (resumeFailed && result.text.length < 50) {
-        if (!quiet) console.error(chalk.yellow('  Resume failed with minimal response. Reconstructing from ledger...'));
+        if (!quiet)
+          console.error(
+            chalk.yellow('  Resume failed with minimal response. Reconstructing from ledger...'),
+          );
         const history = msgStore.getHistory(debateId);
         const reconstructed = buildReconstructionPrompt(history, prompt);
         result = await callBridge(adapter, reconstructed, {
@@ -346,7 +418,12 @@ export async function debateTurnCommand(
 
       // Warn about possible codex output truncation
       if (result.text.length < 200 && (result.durationMs ?? 0) > 60_000) {
-        if (!quiet) console.error(chalk.yellow(`  Warning: GPT response is only ${result.text.length} chars after ${Math.round((result.durationMs ?? 0) / 1000)}s — possible output truncation (codex may have spent its turn on tool calls).`));
+        if (!quiet)
+          console.error(
+            chalk.yellow(
+              `  Warning: GPT response is only ${result.text.length} chars after ${Math.round((result.durationMs ?? 0) / 1000)}s — possible output truncation (codex may have spent its turn on tool calls).`,
+            ),
+          );
       }
 
       // Parse verdict from response
@@ -361,7 +438,11 @@ export async function debateTurnCommand(
         sessionId: result.sessionId ?? null,
       });
       if (!completed) {
-        console.error(chalk.red(`Message ${msgId} ledger transition to completed failed (possible concurrent invocation or state drift).`));
+        console.error(
+          chalk.red(
+            `Message ${msgId} ledger transition to completed failed (possible concurrent invocation or state drift).`,
+          ),
+        );
         db.close();
         process.exit(1);
       }
@@ -417,7 +498,13 @@ export async function debateTurnCommand(
         if (!quiet) console.error(chalk.dim(`Full response written to ${options.output}`));
       }
       // Output JSON for the /debate skill to parse
-      const freshResponseFields = buildResponseOutput(debateId, newRound, result.text, responseCap, options.output);
+      const freshResponseFields = buildResponseOutput(
+        debateId,
+        newRound,
+        result.text,
+        responseCap,
+        options.output,
+      );
       const output = {
         debateId,
         round: newRound,
@@ -431,15 +518,26 @@ export async function debateTurnCommand(
       };
       // Human-readable summary on stderr
       if (!quiet) {
-        const stanceColor = verdict.stance === 'SUPPORT' ? chalk.green :
-          verdict.stance === 'OPPOSE' ? chalk.red : chalk.yellow;
+        const stanceColor =
+          verdict.stance === 'SUPPORT'
+            ? chalk.green
+            : verdict.stance === 'OPPOSE'
+              ? chalk.red
+              : chalk.yellow;
         console.error(stanceColor(`\nRound ${newRound} — Stance: ${verdict.stance}`));
         // Show first 3 meaningful lines of the response
-        const previewLines = result.text.split('\n').filter(l => l.trim().length > 10).slice(0, 3);
+        const previewLines = result.text
+          .split('\n')
+          .filter((l) => l.trim().length > 10)
+          .slice(0, 3);
         for (const line of previewLines) {
           console.error(chalk.dim(`  ${line.trim().slice(0, 120)}`));
         }
-        console.error(chalk.dim(`Duration: ${(result.durationMs / 1000).toFixed(1)}s | Output: ${result.usage?.outputTokens ?? '?'} tokens | Input: ${result.usage?.inputTokens ?? '?'} (includes sandbox) | Resumed: ${resumed}`));
+        console.error(
+          chalk.dim(
+            `Duration: ${(result.durationMs / 1000).toFixed(1)}s | Output: ${result.usage?.outputTokens ?? '?'} tokens | Input: ${result.usage?.inputTokens ?? '?'} (includes sandbox) | Resumed: ${resumed}`,
+          ),
+        );
       }
 
       console.log(JSON.stringify(output, null, 2));
@@ -459,11 +557,9 @@ export async function debateTurnCommand(
 
 // ── codemoot debate next ──
 
-export async function debateNextCommand(
-  debateId: string,
-  options: TurnOptions,
-): Promise<void> {
-  const prompt = 'Continue your analysis. Respond to the previous round\'s arguments and refine your position.';
+export async function debateNextCommand(debateId: string, options: TurnOptions): Promise<void> {
+  const prompt =
+    "Continue your analysis. Respond to the previous round's arguments and refine your position.";
   return debateTurnCommand(debateId, prompt, options);
 }
 
@@ -548,16 +644,22 @@ export async function debateListCommand(options: ListOptions): Promise<void> {
       debates.set(row.debateId, existing);
     }
 
-    const output = Array.from(debates.entries()).slice(0, desiredLimit).map(([id, turns]) => {
-      const state = store.loadState(id, 'proposer');
-      return {
-        debateId: id,
-        topic: state?.question ?? 'unknown',
-        status: turns.some((t: DebateTurnRow) => t.status === 'active') ? 'active' : turns[0].status,
-        round: Math.max(...turns.map((t: DebateTurnRow) => t.round)),
-        lastActivity: new Date(Math.max(...turns.map((t: DebateTurnRow) => t.lastActivityAt))).toISOString(),
-      };
-    });
+    const output = Array.from(debates.entries())
+      .slice(0, desiredLimit)
+      .map(([id, turns]) => {
+        const state = store.loadState(id, 'proposer');
+        return {
+          debateId: id,
+          topic: state?.question ?? 'unknown',
+          status: turns.some((t: DebateTurnRow) => t.status === 'active')
+            ? 'active'
+            : turns[0].status,
+          round: Math.max(...turns.map((t: DebateTurnRow) => t.round)),
+          lastActivity: new Date(
+            Math.max(...turns.map((t: DebateTurnRow) => t.lastActivityAt)),
+          ).toISOString(),
+        };
+      });
 
     console.log(JSON.stringify(output, null, 2));
 
@@ -571,7 +673,10 @@ export async function debateListCommand(options: ListOptions): Promise<void> {
 
 // ── codemoot debate history ──
 
-export async function debateHistoryCommand(debateId: string, options: { output?: string } = {}): Promise<void> {
+export async function debateHistoryCommand(
+  debateId: string,
+  options: { output?: string } = {},
+): Promise<void> {
   let db: ReturnType<typeof openDatabase> | undefined;
   try {
     const dbPath = getDbPath();
@@ -584,7 +689,11 @@ export async function debateHistoryCommand(debateId: string, options: { output?:
       const debateStore = new DebateStore(db);
       const turns = debateStore.getByDebateId(debateId);
       if (turns.length > 0) {
-        console.error(chalk.yellow(`No messages stored for debate ${debateId} — this debate predates message persistence (schema v4). Only metadata is available via "debate status".`));
+        console.error(
+          chalk.yellow(
+            `No messages stored for debate ${debateId} — this debate predates message persistence (schema v4). Only metadata is available via "debate status".`,
+          ),
+        );
       } else {
         console.error(chalk.red(`No debate found with ID: ${debateId}`));
       }
@@ -602,7 +711,7 @@ export async function debateHistoryCommand(debateId: string, options: { output?:
         max: tokenStatus.maxContextTokens,
         utilization: `${Math.round(tokenStatus.utilizationRatio * 100)}%`,
       },
-      messages: history.map(m => ({
+      messages: history.map((m) => ({
         round: m.round,
         role: m.role,
         bridge: m.bridge,
@@ -624,7 +733,7 @@ export async function debateHistoryCommand(debateId: string, options: { output?:
     if (options.output) {
       const fullOutput = {
         ...output,
-        messages: history.map(m => ({
+        messages: history.map((m) => ({
           round: m.round,
           role: m.role,
           bridge: m.bridge,

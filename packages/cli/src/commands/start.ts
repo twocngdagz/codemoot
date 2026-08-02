@@ -1,10 +1,10 @@
 // packages/cli/src/commands/start.ts — First-run concierge: verify → init → quick review
 
-import { existsSync } from 'node:fs';
 import { execFileSync, execSync } from 'node:child_process';
-import { join, basename } from 'node:path';
+import { existsSync } from 'node:fs';
+import { basename, join } from 'node:path';
+import { type PresetName, loadConfig, writeConfig } from '@codemoot/core';
 import chalk from 'chalk';
-import { loadConfig, writeConfig, type PresetName } from '@codemoot/core';
 
 export async function startCommand(): Promise<void> {
   const cwd = process.cwd();
@@ -48,9 +48,22 @@ export async function startCommand(): Promise<void> {
   let reviewTarget = '';
   if (hasGit) {
     try {
-      const diff = execSync('git diff --name-only HEAD', { cwd, encoding: 'utf-8', stdio: 'pipe' }).trim();
+      const diff = execSync('git diff --name-only HEAD', {
+        cwd,
+        encoding: 'utf-8',
+        stdio: 'pipe',
+      }).trim();
       if (diff) {
-        const files = diff.split('\n').filter(f => f.endsWith('.ts') || f.endsWith('.js') || f.endsWith('.tsx') || f.endsWith('.jsx') || f.endsWith('.py'));
+        const files = diff
+          .split('\n')
+          .filter(
+            (f) =>
+              f.endsWith('.ts') ||
+              f.endsWith('.js') ||
+              f.endsWith('.tsx') ||
+              f.endsWith('.jsx') ||
+              f.endsWith('.py'),
+          );
         if (files.length > 0) {
           reviewTarget = files.slice(0, 10).join(' ');
           console.error(chalk.green(`  Found ${files.length} changed file(s) — reviewing those.`));
@@ -108,9 +121,13 @@ export async function startCommand(): Promise<void> {
         console.error(chalk.cyan('  Next steps:'));
         console.error(chalk.dim('    codemoot review --preset security-audit  # security scan'));
         console.error(chalk.dim('    codemoot debate start "your question"    # debate with GPT'));
-        console.error(chalk.dim('    codemoot watch                           # watch for changes'));
+        console.error(
+          chalk.dim('    codemoot watch                           # watch for changes'),
+        );
       } else {
-        console.error(chalk.dim(`  Review complete. Verdict: ${verdict}, Score: ${score ?? '?'}/10`));
+        console.error(
+          chalk.dim(`  Review complete. Verdict: ${verdict}, Score: ${score ?? '?'}/10`),
+        );
       }
     } catch {
       // Raw output if not JSON

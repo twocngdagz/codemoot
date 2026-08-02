@@ -358,24 +358,85 @@ async function performRefinement(
   runtime.service.verifyRepositoryContext(workflowId, audit.repositoryAuditId, actorExecutionId);
 
   // --- Invocation 0: the outline. Small by construction — no batch bodies.
-  const outlinePrepared = await runtime.roleInvocation.prepare({
-    resolution: context.roles.implementer,
-    workflowId,
-    commandId: reviewWorkflowPlan.derivePlanCommandId(firstBatchId, 'create'),
-    actorExecutionId,
-    invocationId: `${workflowId}:refiner-outline:${generateId('invocation')}`,
-    sessionIdentityId: `${workflowId}:refiner:${generateId('session')}`,
-    prompt: buildRefinementOutlinePrompt({
+  //
+  // PINNED once accepted. The outline decides which work each ordinal contains, and staged
+  // drafts are keyed by ordinal — so re-asking a non-deterministic model on every resume
+  // let the decomposition move underneath drafts authored against the previous one. A real
+  // resume returned eleven batches for a ten-batch plan, correctly reused ten byte-identical
+  // drafts, and authored a near-duplicate of batch 10 as batch 11 that then depended on
+  // batch 10. Reusing the pinned outline also stops a resume re-paying for it.
+  const pinnedOutline = runtime.store.workflowStore.getRefinementOutline(workflowId);
+  let outlinePrepared: Awaited<ReturnType<typeof runtime.roleInvocation.prepare>> | undefined;
+  let outline: ReturnType<typeof reviewWorkflowContracts.parseRefinementOutline>;
+  if (pinnedOutline !== null) {
+    outline = reviewWorkflowContracts.parseRefinementOutline(JSON.stringify(pinnedOutline));
+  } else {
+    outlinePrepared = await runtime.roleInvocation.prepare({
+      resolution: context.roles.implementer,
       workflowId,
-      repositoryAudit: audit,
-      generalPlanContent: generalPlan.content,
-      requirements: requirementSummaries,
-    }),
-    options: agentInvocationOptions(timeoutSeconds),
-    additionalAuthorities: ['PLAN_REFINER'],
-    auditPhase: 'PLAN_REFINEMENT',
-  });
-  const outline = reviewWorkflowContracts.parseRefinementOutline(outlinePrepared.call.text);
+      commandId: reviewWorkflowPlan.derivePlanCommandId(firstBatchId, 'create'),
+      actorExecutionId,
+      invocationId: `${workflowId}:refiner-outline:${generateId('invocation')}`,
+      sessionIdentityId: `${workflowId}:refiner:${generateId('session')}`,
+      prompt: buildRefinementOutlinePrompt({
+        workflowId,
+        repositoryAudit: audit,
+        generalPlanContent: generalPlan.content,
+        requirements: requirementSummaries,
+      }),
+      options: agentInvocationOptions(timeoutSeconds),
+      additionalAuthorities: ['PLAN_REFINER'],
+      auditPhase: 'PLAN_REFINEMENT',
+    });
+    outline = reviewWorkflowContracts.parseRefinementOutline(outlinePrepared.call.text);
+    // Drafts staged before pinning existed belong to a decomposition we never recorded. The
+    // re-authored outline must therefore MATCH them exactly, or the run would assemble ten
+    // drafts under an eleven-batch partition — which is precisely what happened once, and
+    // was silent because every individual draft was correct. Fail closed and say what to do.
+    const stagedOrdinals = runtime.store.workflowStore
+      .listRefinementDrafts(workflowId)
+      .map((entry) => entry.ordinal)
+      .sort((left, right) => left - right);
+    if (stagedOrdinals.length > 0) {
+      const outlineOrdinals = outline.batches
+        .map((batch) => batch.ordinal)
+        .sort((left, right) => left - right);
+      if (JSON.stringify(stagedOrdinals) !== JSON.stringify(outlineOrdinals)) {
+        throw new Error(
+          [
+            `The re-authored outline decomposes this plan into ${outlineOrdinals.length} batches,`,
+            `but ${stagedOrdinals.length} batch plans are already staged (ordinals`,
+            `${stagedOrdinals.join(', ')}). Assembling staged drafts under a different`,
+            'decomposition would silently mix two partitions of the same plan. Discard the',
+            'drafts that do not belong with `codemoot workflow discard-drafts <id> --discard N`.',
+          ].join(' '),
+        );
+      }
+    }
+    // Pinned the moment it is accepted — BEFORE any batch is authored against it, so the
+    // decomposition the drafts belong to is durable even if the run dies mid-refinement.
+    runtime.store.workflowStore.saveRefinementOutline({
+      workflowId,
+      outline,
+      createdAt: outlinePrepared.invocation.finishedAt ?? new Date().toISOString(),
+    });
+  }
+
+  // Drafts from a decomposition that was never accepted — e.g. an eleventh batch authored
+  // by a resume for a ten-batch plan — are staging residue, not evidence: the invocation
+  // audit keeps the full record of what was asked, answered and spent.
+  const discarded = runtime.store.workflowStore.discardRefinementDraftsOutside(
+    workflowId,
+    outline.batches.map((batch) => batch.ordinal),
+  );
+  if (discarded > 0) {
+    runtime.runnerStore.appendLog({
+      workflowId,
+      entryType: 'CHECKPOINT',
+      phase: 'PLAN_REFINEMENT',
+      message: `Discarded ${discarded} staged batch plan(s) outside the pinned decomposition`,
+    });
+  }
 
   // --- Invocations 1..N: one batch plan each, staged the moment it completes.
   // Staged drafts are re-validated on reuse rather than trusted: a resumed run replays data
@@ -461,20 +522,46 @@ async function performRefinement(
       return draft;
     }),
   });
+  // An earlier attempt that failed VALIDATION left this command terminally failed. Its
+  // canonical hash covers the requester's actor execution, which is honestly new on every
+  // run, so a retry can never hash identically and idempotency would reject it — making
+  // `fix_again` unable to retry the very thing it exists to fix. Releasing is refused
+  // unless nothing was created, and the failed receipt is preserved.
+  const firstCommandId = reviewWorkflowPlan.derivePlanCommandId(firstBatchId, 'create');
+  runtime.commandStore.releaseFailedFinalReservation(
+    firstCommandId,
+    'Human-authorised refinement retry',
+  );
+
   return runtime.service.captureRefinement({
     transcriptId: `${workflowId}:refinement:${generateId('transcript')}`,
     workflowId,
     actorExecutionId,
-    invocationId: outlinePrepared.invocation.invocationId,
-    sessionIdentityId: outlinePrepared.session.sessionIdentityId,
     rawTranscript: JSON.stringify(assembled),
-    createdAt: outlinePrepared.invocation.finishedAt ?? new Date().toISOString(),
+    createdAt: new Date().toISOString(),
     expectedFirstBatchId: firstBatchId,
     refinedPlanVersionId: `${workflowId}:refined-plan:1`,
     repositoryAuditId: audit.repositoryAuditId,
     version: 1,
-    actor: outlinePrepared.execution,
-    preparedInvocation: outlinePrepared,
+    // On a resume from the pinned outline NO agent call was made, so there is no invocation
+    // to bind and no side effect to claim: the command materializes evidence that is already
+    // durable. Claiming a side effect here would be exactly the fabrication the receipt
+    // machinery exists to prevent.
+    ...(outlinePrepared === undefined
+      ? {
+          actor: persistCliActor(runtime.store, {
+            actorExecutionId,
+            actorType: 'SYSTEM',
+            authorities: ['PLAN_REFINER'],
+            assurance: 'PROCESS_ATTESTED',
+          }),
+        }
+      : {
+          invocationId: outlinePrepared.invocation.invocationId,
+          sessionIdentityId: outlinePrepared.session.sessionIdentityId,
+          actor: outlinePrepared.execution,
+          preparedInvocation: outlinePrepared,
+        }),
   });
 }
 
@@ -4411,4 +4498,42 @@ export async function reviewWorkflowPreflightCommand(options: {
   const ok = results.every((result) => (result as { ok: boolean }).ok);
   printJson({ ok, timeoutSeconds, results });
   if (!ok) process.exitCode = 1;
+}
+
+/**
+ * Discards staged batch plans by ordinal.
+ *
+ * Refinement stages one draft per batch, keyed by ordinal — but which work an ordinal
+ * contains is decided by the outline. Before the outline was pinned, a resume could
+ * re-partition the plan and author a draft for an ordinal the accepted decomposition never
+ * had. Those drafts are staging residue and must be removed before the run can continue.
+ *
+ * This removes staging rows only. Every invocation that produced them stays in the immutable
+ * invocation audit with its full prompt, response and cost, so the record of what happened
+ * and what it cost is unchanged.
+ */
+export async function reviewWorkflowDiscardDraftsCommand(
+  workflowId: string,
+  options: { readonly discard: string },
+): Promise<void> {
+  await withDatabase(async (db) => {
+    const runtime = createRuntime(db, process.cwd());
+    const discard = new Set(
+      options.discard
+        .split(',')
+        .map((value) => Number.parseInt(value.trim(), 10))
+        .filter((value) => Number.isInteger(value)),
+    );
+    if (discard.size === 0) throw new Error('--discard requires at least one ordinal');
+    const staged = runtime.store.workflowStore.listRefinementDrafts(workflowId);
+    const keep = staged.map((entry) => entry.ordinal).filter((ordinal) => !discard.has(ordinal));
+    const removed = runtime.store.workflowStore.discardRefinementDraftsOutside(workflowId, keep);
+    printJson({
+      workflowId,
+      discarded: removed,
+      remainingOrdinals: runtime.store.workflowStore
+        .listRefinementDrafts(workflowId)
+        .map((entry) => entry.ordinal),
+    });
+  });
 }

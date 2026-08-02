@@ -1,5 +1,16 @@
 // packages/cli/src/commands/review.ts — unified review via codex: files, prompts, diffs + session continuity
 
+import { execFileSync } from 'node:child_process';
+import {
+  closeSync,
+  existsSync,
+  globSync,
+  openSync,
+  readFileSync,
+  readSync,
+  statSync,
+} from 'node:fs';
+import { resolve } from 'node:path';
 import {
   BINARY_SNIFF_BYTES,
   type BridgeCallResult,
@@ -14,9 +25,6 @@ import {
   openDatabase,
 } from '@codemoot/core';
 import chalk from 'chalk';
-import { execFileSync } from 'node:child_process';
-import { closeSync, globSync, openSync, readFileSync, readSync, statSync, existsSync } from 'node:fs';
-import { resolve } from 'node:path';
 
 import { createProgressCallbacks } from '../progress.js';
 import { getDbPath } from '../utils.js';
@@ -36,7 +44,10 @@ interface ReviewOptions {
   background?: boolean;
 }
 
-export async function reviewCommand(fileOrGlob: string | undefined, options: ReviewOptions): Promise<void> {
+export async function reviewCommand(
+  fileOrGlob: string | undefined,
+  options: ReviewOptions,
+): Promise<void> {
   try {
     const projectDir = process.cwd();
 
@@ -49,7 +60,9 @@ export async function reviewCommand(fileOrGlob: string | undefined, options: Rev
     ].filter(Boolean);
 
     if (modes.length === 0) {
-      console.error(chalk.red('No input specified. Use: <file-or-glob>, --prompt, --stdin, or --diff'));
+      console.error(
+        chalk.red('No input specified. Use: <file-or-glob>, --prompt, --stdin, or --diff'),
+      );
       process.exit(1);
     }
     if (modes.length > 1) {
@@ -90,7 +103,13 @@ export async function reviewCommand(fileOrGlob: string | undefined, options: Rev
           cwd: projectDir,
         },
       });
-      console.log(JSON.stringify({ jobId, status: 'queued', message: 'Review enqueued. Check with: codemoot jobs status ' + jobId }));
+      console.log(
+        JSON.stringify({
+          jobId,
+          status: 'queued',
+          message: 'Review enqueued. Check with: codemoot jobs status ' + jobId,
+        }),
+      );
       db.close();
       return;
     }
@@ -103,9 +122,13 @@ export async function reviewCommand(fileOrGlob: string | undefined, options: Rev
       : sessionMgr.resolveActive('review');
 
     if (!session) {
-      console.error(chalk.red(options.session
-        ? `Session not found: ${options.session}`
-        : 'No active session. Run: codemoot init'));
+      console.error(
+        chalk.red(
+          options.session
+            ? `Session not found: ${options.session}`
+            : 'No active session. Run: codemoot init',
+        ),
+      );
       db.close();
       process.exit(1);
     }
@@ -113,16 +136,21 @@ export async function reviewCommand(fileOrGlob: string | undefined, options: Rev
     // ── Resolve preset (overrides focus/timeout if set) ──
     const preset = options.preset ? getReviewPreset(options.preset) : undefined;
     if (options.preset && !preset) {
-      console.error(chalk.red(`Unknown preset: ${options.preset}. Use: security-audit, performance, quick-scan, pre-commit, api-review`));
+      console.error(
+        chalk.red(
+          `Unknown preset: ${options.preset}. Use: security-audit, performance, quick-scan, pre-commit, api-review`,
+        ),
+      );
       db.close();
       process.exit(1);
     }
 
     // ── Build prompt based on input mode ──
     const focusArea = preset?.focus ?? options.focus ?? 'all';
-    const focusConstraint = focusArea === 'all'
-      ? 'Review for: correctness, bugs, security, performance, code quality'
-      : `Focus specifically on: ${focusArea}`;
+    const focusConstraint =
+      focusArea === 'all'
+        ? 'Review for: correctness, bugs, security, performance, code quality'
+        : `Focus specifically on: ${focusArea}`;
     const presetConstraints = preset?.constraints ?? [];
 
     const currentSession = sessionMgr.get(session.id);
@@ -159,7 +187,6 @@ export async function reviewCommand(fileOrGlob: string | undefined, options: Rev
 
       promptPreview = `Prompt review: ${instruction.slice(0, 100)}`;
       console.error(chalk.cyan(`Reviewing via prompt (session: ${session.id.slice(0, 8)}...)...`));
-
     } else if (mode === 'diff') {
       // ── Diff mode: review git changes ──
       let diff: string;
@@ -170,7 +197,11 @@ export async function reviewCommand(fileOrGlob: string | undefined, options: Rev
           maxBuffer: 1024 * 1024,
         });
       } catch (err) {
-        console.error(chalk.red(`Failed to get diff for ${options.diff}: ${err instanceof Error ? err.message : String(err)}`));
+        console.error(
+          chalk.red(
+            `Failed to get diff for ${options.diff}: ${err instanceof Error ? err.message : String(err)}`,
+          ),
+        );
         db.close();
         process.exit(1);
       }
@@ -189,8 +220,9 @@ export async function reviewCommand(fileOrGlob: string | undefined, options: Rev
       });
 
       promptPreview = `Diff review: ${options.diff}`;
-      console.error(chalk.cyan(`Reviewing diff ${options.diff} (session: ${session.id.slice(0, 8)}...)...`));
-
+      console.error(
+        chalk.cyan(`Reviewing diff ${options.diff} (session: ${session.id.slice(0, 8)}...)...`),
+      );
     } else {
       // ── File mode (original behavior) ──
       // If input is a directory, auto-expand to recursive glob
@@ -202,8 +234,8 @@ export async function reviewCommand(fileOrGlob: string | undefined, options: Rev
       }
       const projectRoot = resolve(projectDir) + (process.platform === 'win32' ? '\\' : '/');
       const paths = globSync(globPattern, { cwd: projectDir })
-        .map(p => resolve(projectDir, p))
-        .filter(p => p.startsWith(projectRoot) || p === resolve(projectDir));
+        .map((p) => resolve(projectDir, p))
+        .filter((p) => p.startsWith(projectRoot) || p === resolve(projectDir));
       if (paths.length === 0) {
         console.error(chalk.red(`No files matched: ${fileOrGlob}`));
         db.close();
@@ -217,7 +249,9 @@ export async function reviewCommand(fileOrGlob: string | undefined, options: Rev
         const stat = statSync(filePath);
         if (!stat.isFile()) continue;
         if (stat.size > MAX_FILE_SIZE) {
-          console.error(chalk.yellow(`Skipping ${filePath} (${(stat.size / 1024).toFixed(0)}KB > 100KB limit)`));
+          console.error(
+            chalk.yellow(`Skipping ${filePath} (${(stat.size / 1024).toFixed(0)}KB > 100KB limit)`),
+          );
           continue;
         }
         if (totalSize + stat.size > MAX_TOTAL_SIZE) {
@@ -235,7 +269,10 @@ export async function reviewCommand(fileOrGlob: string | undefined, options: Rev
         }
 
         const content = readFileSync(filePath, 'utf-8');
-        const relativePath = filePath.replace(projectDir, '').replace(/\\/g, '/').replace(/^\//, '');
+        const relativePath = filePath
+          .replace(projectDir, '')
+          .replace(/\\/g, '/')
+          .replace(/^\//, '');
         files.push({ path: relativePath, content });
         totalSize += stat.size;
       }
@@ -246,7 +283,7 @@ export async function reviewCommand(fileOrGlob: string | undefined, options: Rev
         process.exit(1);
       }
 
-      const fileContents = files.map(f => `--- ${f.path} ---\n${f.content}`).join('\n\n');
+      const fileContents = files.map((f) => `--- ${f.path} ---\n${f.content}`).join('\n\n');
 
       prompt = buildHandoffEnvelope({
         command: 'review',
@@ -255,8 +292,12 @@ export async function reviewCommand(fileOrGlob: string | undefined, options: Rev
         resumed: isResumed,
       });
 
-      promptPreview = `Review ${files.length} file(s): ${files.map(f => f.path).join(', ')}`;
-      console.error(chalk.cyan(`Reviewing ${files.length} file(s) via codex (session: ${session.id.slice(0, 8)}...)...`));
+      promptPreview = `Review ${files.length} file(s): ${files.map((f) => f.path).join(', ')}`;
+      console.error(
+        chalk.cyan(
+          `Reviewing ${files.length} file(s) via codex (session: ${session.id.slice(0, 8)}...)...`,
+        ),
+      );
     }
 
     // ── Execute review via codex with session resume ──
@@ -336,18 +377,28 @@ export async function reviewCommand(fileOrGlob: string | undefined, options: Rev
 
     // Human-readable summary on stderr
     const verdictColor = output.verdict === 'approved' ? chalk.green : chalk.red;
-    console.error(verdictColor(`\nVerdict: ${output.verdict.toUpperCase()} (${output.score ?? '?'}/10)`));
+    console.error(
+      verdictColor(`\nVerdict: ${output.verdict.toUpperCase()} (${output.score ?? '?'}/10)`),
+    );
     if (findings.length > 0) {
       console.error(chalk.yellow(`Findings (${findings.length}):`));
       for (const f of findings) {
-        const sev = f.severity === 'critical' ? chalk.red('CRITICAL') :
-          f.severity === 'warning' ? chalk.yellow('WARNING') : chalk.dim('INFO');
+        const sev =
+          f.severity === 'critical'
+            ? chalk.red('CRITICAL')
+            : f.severity === 'warning'
+              ? chalk.yellow('WARNING')
+              : chalk.dim('INFO');
         console.error(`  ${sev} ${f.file}:${f.line} — ${f.message}`);
       }
     } else {
       console.error(chalk.green('No issues found.'));
     }
-    console.error(chalk.dim(`Duration: ${(output.durationMs / 1000).toFixed(1)}s | Tokens: ${output.usage?.totalTokens ?? '?'}`));
+    console.error(
+      chalk.dim(
+        `Duration: ${(output.durationMs / 1000).toFixed(1)}s | Tokens: ${output.usage?.totalTokens ?? '?'}`,
+      ),
+    );
 
     console.log(JSON.stringify(output, null, 2));
     db.close();

@@ -40,7 +40,11 @@ export function createProgressCallbacks(label = 'codex'): ProgressCallbacks {
   return {
     onSpawn(pid: number, command: string) {
       // Redact args to avoid leaking tokens/credentials in logs — keep only basename
-      const exe = command.replace(/^"([^"]+)".*/, '$1').split(/[\s/\\]+/).pop() ?? command;
+      const exe =
+        command
+          .replace(/^"([^"]+)".*/, '$1')
+          .split(/[\s/\\]+/)
+          .pop() ?? command;
       console.error(chalk.dim(`  [${label}] Started (PID: ${pid}, cmd: ${exe})`));
     },
 
@@ -73,7 +77,11 @@ export function createProgressCallbacks(label = 'codex'): ProgressCallbacks {
         carryOver = '';
       }
       if (droppedEvents > 0) {
-        console.error(chalk.dim(`  [${label}] ${droppedEvents} event(s) dropped (parse errors or buffer overflow)`));
+        console.error(
+          chalk.dim(
+            `  [${label}] ${droppedEvents} event(s) dropped (parse errors or buffer overflow)`,
+          ),
+        );
         droppedEvents = 0;
       }
     },
@@ -88,10 +96,7 @@ export function createProgressCallbacks(label = 'codex'): ProgressCallbacks {
 }
 
 /** Extract a human-readable summary from a codex JSONL event. */
-function formatEvent(
-  event: Record<string, unknown>,
-  print: (msg: string) => void,
-): void {
+function formatEvent(event: Record<string, unknown>, print: (msg: string) => void): void {
   const type = event.type as string;
 
   if (type === 'thread.started') {

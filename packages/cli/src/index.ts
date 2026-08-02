@@ -53,6 +53,7 @@ import {
   reviewWorkflowBatchVerifyCommand,
   reviewWorkflowCancelCommand,
   reviewWorkflowDecideCommand,
+  reviewWorkflowDiscardDraftsCommand,
   reviewWorkflowEventsCommand,
   reviewWorkflowExportCommand,
   reviewWorkflowJobsCancelCommand,
@@ -476,6 +477,15 @@ reviewWorkflow
   )
   .option('--id <workflow-id>', 'Explicit workflow ID')
   .action(reviewWorkflowRunCommand);
+
+reviewWorkflow
+  .command('discard-drafts')
+  .description('Discard staged batch plans by ordinal (staging only; the audit is untouched)')
+  .argument('<workflow-id>', 'Review workflow ID')
+  .requiredOption('--discard <ordinals>', 'Comma-separated ordinals to discard, e.g. 11')
+  .action((workflowId: string, options: { discard: string }) =>
+    reviewWorkflowDiscardDraftsCommand(workflowId, options),
+  );
 
 reviewWorkflow
   .command('preflight')

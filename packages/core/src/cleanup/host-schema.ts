@@ -13,23 +13,25 @@ const symbolPatterns: Record<string, RegExp> = {
   deadcode: /^[$_a-z][\w$]*$/i,
 };
 
-const hostFindingSchema = z.object({
-  scope: scopeSchema,
-  confidence: z.enum(['high', 'medium', 'low']),
-  file: z.string().min(1),
-  line: z.number().int().nonnegative().optional(),
-  symbol: z.string().min(1),
-  description: z.string().min(1),
-  recommendation: z.string().min(1),
-}).refine(
-  (data) => {
-    const pattern = symbolPatterns[data.scope];
-    return pattern ? pattern.test(data.symbol) : true;
-  },
-  (data) => ({
-    message: `Symbol "${data.symbol}" does not match expected pattern for scope "${data.scope}"`,
-  }),
-);
+const hostFindingSchema = z
+  .object({
+    scope: scopeSchema,
+    confidence: z.enum(['high', 'medium', 'low']),
+    file: z.string().min(1),
+    line: z.number().int().nonnegative().optional(),
+    symbol: z.string().min(1),
+    description: z.string().min(1),
+    recommendation: z.string().min(1),
+  })
+  .refine(
+    (data) => {
+      const pattern = symbolPatterns[data.scope];
+      return pattern ? pattern.test(data.symbol) : true;
+    },
+    (data) => ({
+      message: `Symbol "${data.symbol}" does not match expected pattern for scope "${data.scope}"`,
+    }),
+  );
 
 export const hostFindingsSchema = z.array(hostFindingSchema);
 

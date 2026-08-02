@@ -31,7 +31,10 @@ const BUILTIN_IGNORES = [
  * Load and compile all ignore patterns into a single matcher.
  * Precedence: builtins -> .gitignore -> .codemootignore
  */
-export function createIgnoreFilter(projectDir: string, options?: { skipGitignore?: boolean }): Ignore {
+export function createIgnoreFilter(
+  projectDir: string,
+  options?: { skipGitignore?: boolean },
+): Ignore {
   const ig = ignore();
 
   // 1. Builtins

@@ -1,5 +1,6 @@
 // packages/cli/src/commands/cleanup.ts — AI slop scanner with 3-way merge (deterministic + codex + host)
 
+import { readFileSync } from 'node:fs';
 import type {
   BridgeCallResult,
   CleanupFinding,
@@ -25,7 +26,6 @@ import {
   runAllScanners,
 } from '@codemoot/core';
 import chalk from 'chalk';
-import { readFileSync } from 'node:fs';
 
 import { createProgressCallbacks } from '../progress.js';
 import { getDbPath } from '../utils.js';
@@ -53,16 +53,39 @@ export async function cleanupCommand(path: string, options: CleanupOptions): Pro
       const jobStore = new JobStore(bgDb);
       const jobId = jobStore.enqueue({
         type: 'cleanup',
-        payload: { path: projectDir, scope: options.scope, timeout: options.timeout, maxDisputes: options.maxDisputes, hostFindings: options.hostFindings, output: options.output },
+        payload: {
+          path: projectDir,
+          scope: options.scope,
+          timeout: options.timeout,
+          maxDisputes: options.maxDisputes,
+          hostFindings: options.hostFindings,
+          output: options.output,
+        },
       });
-      console.log(JSON.stringify({ jobId, status: 'queued', message: 'Cleanup enqueued. Check with: codemoot jobs status ' + jobId }));
+      console.log(
+        JSON.stringify({
+          jobId,
+          status: 'queued',
+          message: 'Cleanup enqueued. Check with: codemoot jobs status ' + jobId,
+        }),
+      );
       bgDb.close();
       return;
     }
 
-    const scopes = options.scope === 'all'
-      ? ['deps', 'unused-exports', 'hardcoded', 'duplicates', 'deadcode', 'security', 'near-duplicates', 'anti-patterns'] as CleanupScope[]
-      : [options.scope as CleanupScope];
+    const scopes =
+      options.scope === 'all'
+        ? ([
+            'deps',
+            'unused-exports',
+            'hardcoded',
+            'duplicates',
+            'deadcode',
+            'security',
+            'near-duplicates',
+            'anti-patterns',
+          ] as CleanupScope[])
+        : [options.scope as CleanupScope];
 
     const dbPath = getDbPath();
     db = openDatabase(dbPath);
@@ -86,7 +109,7 @@ export async function cleanupCommand(path: string, options: CleanupOptions): Pro
         const parsed = JSON.parse(raw);
         const validated = hostFindingsSchema.parse(parsed);
 
-        hostFindings = validated.map(f => ({
+        hostFindings = validated.map((f) => ({
           key: `${f.scope}:${f.file}:${f.symbol}`,
           scope: f.scope as CleanupScope,
           confidence: f.confidence as CleanupFinding['confidence'],
@@ -102,7 +125,11 @@ export async function cleanupCommand(path: string, options: CleanupOptions): Pro
         }));
         console.error(chalk.dim(`  [host] Loaded ${hostFindings.length} findings`));
       } catch (err) {
-        console.error(chalk.red(`Failed to load host findings: ${err instanceof Error ? err.message : String(err)}`));
+        console.error(
+          chalk.red(
+            `Failed to load host findings: ${err instanceof Error ? err.message : String(err)}`,
+          ),
+        );
         db.close();
         process.exit(1);
       }
@@ -121,7 +148,9 @@ export async function cleanupCommand(path: string, options: CleanupOptions): Pro
       const registry = ModelRegistry.fromConfig(config, projectDir);
       const reviewerAlias = config.roles.reviewer?.model;
       codexAdapter = reviewerAlias === undefined ? null : registry.tryGetAdapter(reviewerAlias);
-    } catch { /* config not found */ }
+    } catch {
+      /* config not found */
+    }
 
     // Resolve unified session
     const sessionMgr = new SessionManager(db);
@@ -137,7 +166,15 @@ export async function cleanupCommand(path: string, options: CleanupOptions): Pro
         console.error(chalk.dim(`  [deterministic] Done: ${findings.length} findings`));
         return findings;
       }),
-      runCodexScan(codexAdapter, projectDir, scopes, options.timeout, sessionMgr, session.id, sessionThreadId),
+      runCodexScan(
+        codexAdapter,
+        projectDir,
+        scopes,
+        options.timeout,
+        sessionMgr,
+        session.id,
+        sessionThreadId,
+      ),
     ]);
 
     // Record scan event
@@ -160,11 +197,24 @@ export async function cleanupCommand(path: string, options: CleanupOptions): Pro
     console.error(chalk.yellow('\nPhase 2: Merging findings (3-way)...'));
 
     const mergedFindings = mergeThreeWay(deterministicFindings, semanticFindings, hostFindings);
-    const stats = computeThreeWayStats(deterministicFindings, semanticFindings, hostFindings, mergedFindings);
+    const stats = computeThreeWayStats(
+      deterministicFindings,
+      semanticFindings,
+      hostFindings,
+      mergedFindings,
+    );
 
-    console.error(chalk.dim(`  Merged: ${mergedFindings.length} total, ${stats.agreed} agreed, ${stats.disputed} disputed`));
+    console.error(
+      chalk.dim(
+        `  Merged: ${mergedFindings.length} total, ${stats.agreed} agreed, ${stats.disputed} disputed`,
+      ),
+    );
     if (hostFindings.length > 0) {
-      console.error(chalk.dim(`  Sources: deterministic=${stats.deterministic}, codex=${stats.semantic}, host=${stats.host}`));
+      console.error(
+        chalk.dim(
+          `  Sources: deterministic=${stats.deterministic}, codex=${stats.semantic}, host=${stats.host}`,
+        ),
+      );
     }
 
     buildStore.updateWithEvent(
@@ -179,9 +229,12 @@ export async function cleanupCommand(path: string, options: CleanupOptions): Pro
     );
 
     // ── Phase 2.5: Adjudicate disputed findings ──
-    const hasAdjudicatable = stats.disputed > 0 || mergedFindings.some(f => f.confidence === 'medium');
+    const hasAdjudicatable =
+      stats.disputed > 0 || mergedFindings.some((f) => f.confidence === 'medium');
     if (codexAdapter && hasAdjudicatable && options.maxDisputes > 0) {
-      console.error(chalk.yellow(`\nPhase 2.5: Adjudicating up to ${options.maxDisputes} disputed findings...`));
+      console.error(
+        chalk.yellow(`\nPhase 2.5: Adjudicating up to ${options.maxDisputes} disputed findings...`),
+      );
       await adjudicateFindings(codexAdapter, mergedFindings, options.maxDisputes, stats);
 
       buildStore.updateWithEvent(
@@ -200,8 +253,9 @@ export async function cleanupCommand(path: string, options: CleanupOptions): Pro
     const durationMs = Date.now() - startTime;
 
     const actionableScopes = new Set<CleanupScope>(['deps', 'unused-exports', 'hardcoded']);
-    const actionableCount = mergedFindings.filter(f =>
-      actionableScopes.has(f.scope) && (f.confidence === 'high' || f.confidence === 'medium'),
+    const actionableCount = mergedFindings.filter(
+      (f) =>
+        actionableScopes.has(f.scope) && (f.confidence === 'high' || f.confidence === 'medium'),
     ).length;
 
     const report: CleanupReport = {
@@ -235,7 +289,9 @@ export async function cleanupCommand(path: string, options: CleanupOptions): Pro
     console.error(chalk.green(`Build ID: ${buildId}`));
     console.error(`  Actionable: ${chalk.red(String(actionableCount))}`);
     console.error(`  Report-only: ${chalk.dim(String(mergedFindings.length - actionableCount))}`);
-    console.error(`  High: ${stats.highConfidence} | Medium: ${stats.mediumConfidence} | Low: ${stats.lowConfidence}`);
+    console.error(
+      `  High: ${stats.highConfidence} | Medium: ${stats.mediumConfidence} | Low: ${stats.lowConfidence}`,
+    );
     if (stats.adjudicated > 0) console.error(`  Adjudicated: ${stats.adjudicated}`);
 
     // ── Human-readable summary (stderr) ──
@@ -248,12 +304,12 @@ export async function cleanupCommand(path: string, options: CleanupOptions): Pro
         byScope.set(f.scope, arr);
       }
       for (const [scope, items] of byScope) {
-        const high = items.filter(f => f.confidence === 'high').length;
-        const med = items.filter(f => f.confidence === 'medium').length;
-        const low = items.filter(f => f.confidence === 'low').length;
+        const high = items.filter((f) => f.confidence === 'high').length;
+        const med = items.filter((f) => f.confidence === 'medium').length;
+        const low = items.filter((f) => f.confidence === 'low').length;
         console.error(chalk.cyan(`\n  ${scope} (${items.length})`));
         // Show up to 5 high/medium findings per scope
-        for (const f of items.filter(i => i.confidence !== 'low').slice(0, 5)) {
+        for (const f of items.filter((i) => i.confidence !== 'low').slice(0, 5)) {
           const conf = f.confidence === 'high' ? chalk.red('HIGH') : chalk.yellow('MED');
           const loc = f.line ? `${f.file}:${f.line}` : f.file;
           console.error(`    ${conf} ${loc} — ${f.description}`);
@@ -288,7 +344,11 @@ export async function cleanupCommand(path: string, options: CleanupOptions): Pro
     }
 
     const reportJson = JSON.stringify(report, null, 2);
-    console.log(reportJson.length > 2000 ? `${reportJson.slice(0, 2000)}\n... (truncated, ${reportJson.length} chars total — use --output to save full report)` : reportJson);
+    console.log(
+      reportJson.length > 2000
+        ? `${reportJson.slice(0, 2000)}\n... (truncated, ${reportJson.length} chars total — use --output to save full report)`
+        : reportJson,
+    );
 
     db.close();
   } catch (error) {
@@ -316,14 +376,17 @@ async function runCodexScan(
 
   console.error(chalk.dim('  [codex] Starting semantic scan...'));
 
-  const scopeDescriptions = scopes.map(s => {
-    if (s === 'deps') return 'unused dependencies (check each package.json dep, including dynamic imports)';
-    if (s === 'unused-exports') return 'unused exports (exported but never imported anywhere)';
-    if (s === 'hardcoded') return 'hardcoded values (magic numbers, URLs, credentials)';
-    if (s === 'duplicates') return 'duplicate logic (similar function bodies across files)';
-    if (s === 'deadcode') return 'dead code (unreachable or unused internal code)';
-    return s;
-  }).join(', ');
+  const scopeDescriptions = scopes
+    .map((s) => {
+      if (s === 'deps')
+        return 'unused dependencies (check each package.json dep, including dynamic imports)';
+      if (s === 'unused-exports') return 'unused exports (exported but never imported anywhere)';
+      if (s === 'hardcoded') return 'hardcoded values (magic numbers, URLs, credentials)';
+      if (s === 'duplicates') return 'duplicate logic (similar function bodies across files)';
+      if (s === 'deadcode') return 'dead code (unreachable or unused internal code)';
+      return s;
+    })
+    .join(', ');
 
   const prompt = buildHandoffEnvelope({
     command: 'cleanup',
@@ -396,7 +459,9 @@ IMPORTANT KEY FORMAT: The key will be built as scope:file:symbol — use the SAM
 
     const findings: CleanupFinding[] = [];
     for (const line of result.text.split('\n')) {
-      const match = line.match(/^FINDING:\s*([^|]+)\|([^|]+)\|([^|]+)\|(\d+)\|([^|]+)\|([^|]+)\|(.+)/);
+      const match = line.match(
+        /^FINDING:\s*([^|]+)\|([^|]+)\|([^|]+)\|(\d+)\|([^|]+)\|([^|]+)\|(.+)/,
+      );
       if (match) {
         const scope = match[1].trim() as CleanupScope;
         if (!scopes.includes(scope)) continue;
@@ -423,7 +488,11 @@ IMPORTANT KEY FORMAT: The key will be built as scope:file:symbol — use the SAM
     console.error(chalk.dim(`  [codex] Done: ${findings.length} findings`));
     return findings;
   } catch (error) {
-    console.error(chalk.yellow(`  [codex] Scan failed: ${error instanceof Error ? error.message : String(error)}`));
+    console.error(
+      chalk.yellow(
+        `  [codex] Scan failed: ${error instanceof Error ? error.message : String(error)}`,
+      ),
+    );
     return [];
   }
 }
@@ -437,16 +506,22 @@ async function adjudicateFindings(
   stats: CleanupReport['stats'],
 ): Promise<void> {
   const toAdjudicate = findings
-    .filter(f => f.disputed || f.confidence === 'medium')
+    .filter((f) => f.disputed || f.confidence === 'medium')
     .slice(0, maxDisputes);
 
   for (const finding of toAdjudicate) {
     try {
-      const allEvidence = [...finding.deterministicEvidence, ...finding.semanticEvidence, ...finding.hostEvidence];
+      const allEvidence = [
+        ...finding.deterministicEvidence,
+        ...finding.semanticEvidence,
+        ...finding.hostEvidence,
+      ];
       const prompt = buildHandoffEnvelope({
         command: 'adjudicate',
         task: `Verify this finding.\n\nFINDING: ${finding.description}\nFILE: ${finding.file}${finding.line ? `:${finding.line}` : ''}\nSCOPE: ${finding.scope}\nSOURCES: ${finding.sources.join(', ')}\nEVIDENCE: ${allEvidence.join('; ')}`,
-        constraints: ['Check for dynamic imports, barrel re-exports, type-only usage, runtime/indirect usage'],
+        constraints: [
+          'Check for dynamic imports, barrel re-exports, type-only usage, runtime/indirect usage',
+        ],
         resumed: false,
       });
 

@@ -575,6 +575,29 @@ export const REVIEW_WORKFLOW_MIGRATIONS = [
     PRIMARY KEY (workflow_id, ordinal)
   )`,
 
+  // The ACCEPTED decomposition, pinned on first success. Staged drafts are keyed by ordinal,
+  // but ordinal->work is decided by the outline — so re-asking for the outline on every
+  // resume let a non-deterministic answer re-partition the plan underneath drafts that were
+  // authored against the previous partition. One resume returned ELEVEN batches for a
+  // ten-batch plan and authored a duplicate of batch 10 as batch 11.
+  `CREATE TABLE IF NOT EXISTS review_workflow_refinement_outlines (
+    workflow_id  TEXT PRIMARY KEY,
+    outline_json TEXT NOT NULL,
+    created_at   TEXT NOT NULL
+  )`,
+
+  // Evidence for a reservation released by an authorised retry. Nothing is destroyed: the
+  // failed receipt is copied here before the command ID is freed.
+  `CREATE TABLE IF NOT EXISTS review_workflow_superseded_commands (
+    superseded_id  INTEGER PRIMARY KEY AUTOINCREMENT,
+    command_id     TEXT NOT NULL,
+    workflow_id    TEXT NOT NULL,
+    batch_id       TEXT NOT NULL,
+    reason         TEXT NOT NULL,
+    receipt_json   TEXT NOT NULL,
+    created_at     TEXT NOT NULL
+  )`,
+
   `CREATE TABLE IF NOT EXISTS review_workflow_runner_log (
     log_id       INTEGER PRIMARY KEY AUTOINCREMENT,
     workflow_id  TEXT NOT NULL,

@@ -8,13 +8,13 @@ import {
   DEFAULT_RULES,
   ModelRegistry,
   type PolicyContext,
+  REVIEW_DIFF_MAX_CHARS,
   SessionManager,
   buildHandoffEnvelope,
   callBridge,
   evaluatePolicy,
   loadConfig,
   openDatabase,
-  REVIEW_DIFF_MAX_CHARS,
 } from '@codemoot/core';
 import chalk from 'chalk';
 
@@ -73,7 +73,8 @@ function parseFixes(text: string): ParsedFix[] {
   const fixes: ParsedFix[] = [];
 
   // Match FIX: lines followed by code blocks
-  const fixPattern = /FIX:\s*(\S+?):(\d+)\s+(.+?)(?:\n```old\n([\s\S]*?)\n```\s*\n```new\n([\s\S]*?)\n```|(?:\n```\n([\s\S]*?)\n```))/g;
+  const fixPattern =
+    /FIX:\s*(\S+?):(\d+)\s+(.+?)(?:\n```old\n([\s\S]*?)\n```\s*\n```new\n([\s\S]*?)\n```|(?:\n```\n([\s\S]*?)\n```))/g;
 
   let match: RegExpExecArray | null;
   match = fixPattern.exec(text);
@@ -159,9 +160,13 @@ export async function fixCommand(fileOrGlob: string, options: FixOptions): Promi
     : sessionMgr.resolveActive('fix');
 
   if (!session) {
-    console.error(chalk.red(options.session
-      ? `Session not found: ${options.session}`
-      : 'No active session. Run: codemoot init'));
+    console.error(
+      chalk.red(
+        options.session
+          ? `Session not found: ${options.session}`
+          : 'No active session. Run: codemoot init',
+      ),
+    );
     db.close();
     process.exit(1);
   }
@@ -372,7 +377,9 @@ export async function fixCommand(fileOrGlob: string, options: FixOptions): Promi
       // Mark as stuck if same fingerprint appeared in previous round
       if (prevFingerprints.has(fingerprint)) {
         stuckFingerprints.add(fingerprint);
-        console.error(chalk.yellow(`    Stuck (recurring): ${fix.file}:${fix.line} — ${fix.description}`));
+        console.error(
+          chalk.yellow(`    Stuck (recurring): ${fix.file}:${fix.line} — ${fix.description}`),
+        );
         failed++;
         continue;
       }
@@ -446,7 +453,7 @@ export async function fixCommand(fileOrGlob: string, options: FixOptions): Promi
     ? 'all_resolved'
     : stuckFingerprints.size > 0
       ? 'all_stuck'
-      : lastRound?.exitReason ?? 'max_iterations';
+      : (lastRound?.exitReason ?? 'max_iterations');
 
   const output = {
     target: fileOrGlob,
@@ -472,7 +479,9 @@ export async function fixCommand(fileOrGlob: string, options: FixOptions): Promi
   if (stuckFingerprints.size > 0) {
     console.error(chalk.yellow(`  Stuck issues: ${stuckFingerprints.size}`));
   }
-  console.error(`  Final: ${lastRound?.reviewVerdict ?? '?'} (${lastRound?.reviewScore ?? '?'}/10)`);
+  console.error(
+    `  Final: ${lastRound?.reviewVerdict ?? '?'} (${lastRound?.reviewScore ?? '?'}/10)`,
+  );
 
   console.log(JSON.stringify(output, null, 2));
   db.close();

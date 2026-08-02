@@ -1,6 +1,14 @@
 // packages/core/src/types/cleanup.ts — Cleanup scanner types
 
-export type CleanupScope = 'deps' | 'unused-exports' | 'hardcoded' | 'duplicates' | 'deadcode' | 'security' | 'near-duplicates' | 'anti-patterns';
+export type CleanupScope =
+  | 'deps'
+  | 'unused-exports'
+  | 'hardcoded'
+  | 'duplicates'
+  | 'deadcode'
+  | 'security'
+  | 'near-duplicates'
+  | 'anti-patterns';
 
 export type CleanupConfidence = 'high' | 'medium' | 'low';
 

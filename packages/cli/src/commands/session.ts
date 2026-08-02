@@ -24,12 +24,18 @@ export async function sessionStartCommand(options: StartOptions): Promise<void> 
       promptPreview: `Session started: ${session?.name ?? id}`,
     });
 
-    console.log(JSON.stringify({
-      sessionId: id,
-      name: session?.name ?? null,
-      status: 'active',
-      message: 'Session created. All GPT commands will now use this session.',
-    }, null, 2));
+    console.log(
+      JSON.stringify(
+        {
+          sessionId: id,
+          name: session?.name ?? null,
+          status: 'active',
+          message: 'Session created. All GPT commands will now use this session.',
+        },
+        null,
+        2,
+      ),
+    );
   });
 }
 
@@ -40,27 +46,38 @@ export async function sessionCurrentCommand(): Promise<void> {
     const mgr = new SessionManager(db);
     const session = mgr.getActive();
     if (!session) {
-      console.log(JSON.stringify({ active: false, message: 'No active session. Run "codemoot session start" to create one.' }));
+      console.log(
+        JSON.stringify({
+          active: false,
+          message: 'No active session. Run "codemoot session start" to create one.',
+        }),
+      );
       return;
     }
 
     const events = mgr.getEvents(session.id, 5);
 
-    console.log(JSON.stringify({
-      sessionId: session.id,
-      name: session.name,
-      codexThreadId: session.codexThreadId,
-      status: session.status,
-      tokenUsage: session.tokenUsage,
-      recentEvents: events.map(e => ({
-        command: e.command,
-        subcommand: e.subcommand,
-        durationMs: e.durationMs,
-        createdAt: new Date(e.createdAt).toISOString(),
-      })),
-      createdAt: new Date(session.createdAt).toISOString(),
-      updatedAt: new Date(session.updatedAt).toISOString(),
-    }, null, 2));
+    console.log(
+      JSON.stringify(
+        {
+          sessionId: session.id,
+          name: session.name,
+          codexThreadId: session.codexThreadId,
+          status: session.status,
+          tokenUsage: session.tokenUsage,
+          recentEvents: events.map((e) => ({
+            command: e.command,
+            subcommand: e.subcommand,
+            durationMs: e.durationMs,
+            createdAt: new Date(e.createdAt).toISOString(),
+          })),
+          createdAt: new Date(session.createdAt).toISOString(),
+          updatedAt: new Date(session.updatedAt).toISOString(),
+        },
+        null,
+        2,
+      ),
+    );
   });
 }
 
@@ -79,7 +96,7 @@ export async function sessionListCommand(options: ListOptions): Promise<void> {
       limit: options.limit ?? 20,
     });
 
-    const output = sessions.map(s => ({
+    const output = sessions.map((s) => ({
       sessionId: s.id,
       name: s.name,
       status: s.status,
@@ -106,25 +123,31 @@ export async function sessionStatusCommand(sessionId: string): Promise<void> {
 
     const events = mgr.getEvents(sessionId, 20);
 
-    console.log(JSON.stringify({
-      sessionId: session.id,
-      name: session.name,
-      codexThreadId: session.codexThreadId,
-      status: session.status,
-      tokenUsage: session.tokenUsage,
-      eventCount: events.length,
-      events: events.map(e => ({
-        command: e.command,
-        subcommand: e.subcommand,
-        promptPreview: e.promptPreview,
-        responsePreview: e.responsePreview,
-        durationMs: e.durationMs,
-        createdAt: new Date(e.createdAt).toISOString(),
-      })),
-      createdAt: new Date(session.createdAt).toISOString(),
-      updatedAt: new Date(session.updatedAt).toISOString(),
-      completedAt: session.completedAt ? new Date(session.completedAt).toISOString() : null,
-    }, null, 2));
+    console.log(
+      JSON.stringify(
+        {
+          sessionId: session.id,
+          name: session.name,
+          codexThreadId: session.codexThreadId,
+          status: session.status,
+          tokenUsage: session.tokenUsage,
+          eventCount: events.length,
+          events: events.map((e) => ({
+            command: e.command,
+            subcommand: e.subcommand,
+            promptPreview: e.promptPreview,
+            responsePreview: e.responsePreview,
+            durationMs: e.durationMs,
+            createdAt: new Date(e.createdAt).toISOString(),
+          })),
+          createdAt: new Date(session.createdAt).toISOString(),
+          updatedAt: new Date(session.updatedAt).toISOString(),
+          completedAt: session.completedAt ? new Date(session.completedAt).toISOString() : null,
+        },
+        null,
+        2,
+      ),
+    );
   });
 }
 

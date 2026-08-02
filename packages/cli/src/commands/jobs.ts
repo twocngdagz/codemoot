@@ -26,7 +26,7 @@ export async function jobsListCommand(options: ListOptions): Promise<void> {
       limit: options.limit ?? 20,
     });
 
-    const output = jobs.map(j => ({
+    const output = jobs.map((j) => ({
       id: j.id,
       type: j.type,
       status: j.status,
@@ -73,7 +73,7 @@ export async function jobsLogsCommand(jobId: string, options: LogsOptions): Prom
       jobId: job.id,
       type: job.type,
       status: job.status,
-      logs: logs.map(l => ({
+      logs: logs.map((l) => ({
         seq: l.seq,
         level: l.level,
         event: l.eventType,
@@ -133,7 +133,11 @@ export async function jobsRetryCommand(jobId: string): Promise<void> {
 
     const retried = store.retry(jobId);
     if (!retried) {
-      console.error(chalk.red(`Cannot retry job ${jobId}: status=${job.status}, retries=${job.retryCount}/${job.maxRetries}`));
+      console.error(
+        chalk.red(
+          `Cannot retry job ${jobId}: status=${job.status}, retries=${job.retryCount}/${job.maxRetries}`,
+        ),
+      );
       db.close();
       process.exit(1);
     }
@@ -176,7 +180,7 @@ export async function jobsStatusCommand(jobId: string): Promise<void> {
       payload: JSON.parse(job.payloadJson),
       result: job.resultJson ? JSON.parse(job.resultJson) : null,
       error: job.errorText,
-      recentLogs: logs.map(l => ({
+      recentLogs: logs.map((l) => ({
         seq: l.seq,
         level: l.level,
         event: l.eventType,

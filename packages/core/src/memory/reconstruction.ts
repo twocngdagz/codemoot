@@ -20,7 +20,7 @@ export function buildReconstructionPrompt(
   currentPrompt: string,
   maxChars = 100_000,
 ): string {
-  const completed = history.filter(m => m.status === 'completed' && m.responseText);
+  const completed = history.filter((m) => m.status === 'completed' && m.responseText);
 
   if (completed.length === 0) {
     return currentPrompt;

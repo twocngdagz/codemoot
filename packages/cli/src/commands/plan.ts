@@ -108,7 +108,9 @@ export async function planReviewCommand(planFile: string, options: ReviewOptions
     const threadId = currentSession?.codexThreadId ?? undefined;
 
     // Build review prompt — send the plan to codex for structured review
-    const phaseContext = options.phase ? `\nThis is Phase ${options.phase} of a multi-phase plan.` : '';
+    const phaseContext = options.phase
+      ? `\nThis is Phase ${options.phase} of a multi-phase plan.`
+      : '';
     const buildContext = options.build ? `\nBuild ID: ${options.build}` : '';
 
     const prompt = buildHandoffEnvelope({
@@ -209,7 +211,12 @@ Output format:
     if (issues.length > 0) {
       console.error(chalk.yellow(`Issues (${issues.length}):`));
       for (const issue of issues) {
-        const sevColor = issue.severity === 'high' ? chalk.red : issue.severity === 'medium' ? chalk.yellow : chalk.dim;
+        const sevColor =
+          issue.severity === 'high'
+            ? chalk.red
+            : issue.severity === 'medium'
+              ? chalk.yellow
+              : chalk.dim;
         console.error(`  ${sevColor(issue.severity.toUpperCase())} ${issue.message}`);
       }
     }
@@ -219,7 +226,11 @@ Output format:
         console.error(`  ${chalk.dim('→')} ${s}`);
       }
     }
-    console.error(chalk.dim(`Duration: ${(result.durationMs / 1000).toFixed(1)}s | Tokens: ${result.usage.totalTokens}`));
+    console.error(
+      chalk.dim(
+        `Duration: ${(result.durationMs / 1000).toFixed(1)}s | Tokens: ${result.usage.totalTokens}`,
+      ),
+    );
 
     // JSON output on stdout (capped)
     const output = {

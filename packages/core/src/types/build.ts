@@ -9,13 +9,7 @@ export type BuildStatus =
   | 'failed'
   | 'paused';
 
-export type BuildPhase =
-  | 'debate'
-  | 'plan_approved'
-  | 'implementing'
-  | 'review'
-  | 'fix'
-  | 'done';
+export type BuildPhase = 'debate' | 'plan_approved' | 'implementing' | 'review' | 'fix' | 'done';
 
 export type BuildEventType =
   | 'debate_started'

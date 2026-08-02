@@ -232,6 +232,95 @@ export class ReviewWorkflowCommandStore {
     })();
   }
 
+  /**
+   * Frees a TERMINALLY FAILED command ID so an explicitly authorised retry can reserve it.
+   *
+   * The canonical request hash covers the requester's actor execution, which is genuinely
+   * new on every run (a different process, honestly attested). A retry of a failed command
+   * therefore NEVER hashes identically, and the idempotency check rejects it as "already
+   * reserved for a different request". That made `fix_again` — the documented way to
+   * continue a blocked batch — structurally unable to retry the refinement it exists to fix.
+   * It went unnoticed because every earlier failure started a brand-new workflow.
+   *
+   * The invariant idempotency protects is "never fabricate a side effect that did not
+   * happen". This cannot violate it: the release is refused unless the command failed
+   * terminally AND its aggregate was never created AND no side effect was recorded — that
+   * is, unless nothing happened. The failed receipt is copied to
+   * `review_workflow_superseded_commands` before the ID is freed, so the attempt stays on
+   * the record.
+   *
+   * Returns false when there is nothing to release.
+   */
+  releaseFailedFinalReservation(commandId: string, reason: string): boolean {
+    return this.db.transaction(() => {
+      const stored = this.get(commandId);
+      if (stored === null) return false;
+      if (stored.receipt.status !== 'FAILED_FINAL') {
+        throw new ReviewWorkflowPersistenceError(
+          'COMMAND_STATE_CONFLICT',
+          `Command ${commandId} is ${stored.receipt.status}, not FAILED_FINAL, and cannot be superseded`,
+        );
+      }
+      // Nothing may have been created under this command, or releasing it would allow a
+      // second aggregate to be built over the first.
+      if (this.getBatchRow(stored.request.batchId) !== null) {
+        throw new ReviewWorkflowPersistenceError(
+          'COMMAND_STATE_CONFLICT',
+          `Command ${commandId} already created batch ${stored.request.batchId}`,
+        );
+      }
+      // A RECORDED side effect is deliberately NOT a reason to refuse. The failed refinement
+      // really did invoke an agent, and that invocation stays in the immutable invocation
+      // audit either way — releasing the reservation neither erases it nor causes it to be
+      // replayed. What must never be duplicated is durable aggregate state, and the batch
+      // check above is what guarantees that.
+      const archive = this.db
+        .prepare(
+          `INSERT INTO review_workflow_superseded_commands
+             (command_id, workflow_id, batch_id, reason, receipt_json, created_at)
+           VALUES (?, ?, ?, ?, ?, ?)`,
+        )
+        .run(
+          commandId,
+          stored.request.workflowId,
+          stored.request.batchId,
+          reason,
+          JSON.stringify(stored),
+          this.timestamp(),
+        );
+      // Side effects, role invocations and events are foreign-keyed to the receipt, and they
+      // are EVIDENCE of calls that really happened — so the receipt is RENAMED rather than
+      // deleted, and its children follow it. Nothing is destroyed; the original command ID
+      // is simply free again. (The immutable `review_workflow_invocation_audit` — prompt,
+      // response, tokens, cost — is not keyed on the command and is untouched throughout.)
+      const archivedCommandId = `${commandId}:superseded:${archive.lastInsertRowid}`;
+      this.db
+        .prepare(
+          `INSERT INTO review_workflow_command_receipts
+             SELECT ?, workflow_id, batch_id, command_type, expected_aggregate_version,
+                    canonical_request_hash, target_commit_sha, requester_actor_execution_id,
+                    authority_exercised, status, side_effect_identity,
+                    resulting_aggregate_version, resulting_event_sequence, result_hash,
+                    result_json, error_code, request_json, created_at, updated_at
+             FROM review_workflow_command_receipts WHERE command_id = ?`,
+        )
+        .run(archivedCommandId, commandId);
+      for (const table of [
+        'review_workflow_command_side_effects',
+        'review_workflow_invocations',
+        'review_workflow_events',
+      ]) {
+        this.db
+          .prepare(`UPDATE ${table} SET command_id = ? WHERE command_id = ?`)
+          .run(archivedCommandId, commandId);
+      }
+      this.db
+        .prepare('DELETE FROM review_workflow_command_receipts WHERE command_id = ?')
+        .run(commandId);
+      return true;
+    })();
+  }
+
   get(commandId: string): StoredReviewWorkflowCommand | null {
     const row = this.db
       .prepare('SELECT * FROM review_workflow_command_receipts WHERE command_id = ?')

@@ -1,7 +1,7 @@
-import { openDatabase } from '@codemoot/core';
-import chalk from 'chalk';
 import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
+import { openDatabase } from '@codemoot/core';
+import chalk from 'chalk';
 
 export function getDbPath(projectDir?: string): string {
   const base = projectDir ?? process.cwd();
@@ -14,7 +14,9 @@ export function getDbPath(projectDir?: string): string {
  * Run a command function with a database connection that is guaranteed to close,
  * even on errors or process.exit calls.
  */
-export async function withDatabase<T>(fn: (db: ReturnType<typeof openDatabase>) => Promise<T>): Promise<T> {
+export async function withDatabase<T>(
+  fn: (db: ReturnType<typeof openDatabase>) => Promise<T>,
+): Promise<T> {
   const db = openDatabase(getDbPath());
   const originalExit = process.exit;
   let requestedExitCode: number | undefined;

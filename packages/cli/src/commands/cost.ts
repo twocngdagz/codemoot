@@ -1,6 +1,6 @@
 // packages/cli/src/commands/cost.ts — Cost and usage dashboard
 
-import { openDatabase, SessionManager } from '@codemoot/core';
+import { SessionManager, openDatabase } from '@codemoot/core';
 import chalk from 'chalk';
 
 import { getDbPath } from '../utils.js';
@@ -44,7 +44,13 @@ export async function costCommand(options: CostOptions): Promise<void> {
         ? sessionMgr.get(options.session)
         : sessionMgr.resolveActive('cost');
       if (!session) {
-        console.error(chalk.red(options.session ? `Session not found: ${options.session}` : 'No active session. Run: codemoot init'));
+        console.error(
+          chalk.red(
+            options.session
+              ? `Session not found: ${options.session}`
+              : 'No active session. Run: codemoot init',
+          ),
+        );
         db.close();
         process.exit(1);
       }

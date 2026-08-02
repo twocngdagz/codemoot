@@ -1,8 +1,8 @@
 // packages/core/src/cleanup/scanners.ts — Deterministic scanners (no LLM)
 
-import { readFileSync, readdirSync, statSync, existsSync } from 'node:fs';
-import { join, relative, sep } from 'node:path';
 import { createHash } from 'node:crypto';
+import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs';
+import { join, relative, sep } from 'node:path';
 import type { Ignore } from 'ignore';
 import type { CleanupConfidence, CleanupFinding, CleanupScope } from '../types/cleanup.js';
 
@@ -16,7 +16,13 @@ function normalizePath(filePath: string): string {
 }
 
 /** Walk files, respecting an optional compiled ignore filter. */
-function walkFiles(dir: string, exts: Set<string>, result: string[] = [], rootDir?: string, ig?: Ignore): string[] {
+function walkFiles(
+  dir: string,
+  exts: Set<string>,
+  result: string[] = [],
+  rootDir?: string,
+  ig?: Ignore,
+): string[] {
   const root = rootDir ?? dir;
   let entries: string[];
   try {
@@ -69,7 +75,9 @@ function findPackageJsons(projectDir: string): { dir: string; pkg: Record<string
   if (existsSync(rootPkg)) {
     try {
       results.push({ dir: projectDir, pkg: JSON.parse(readFileSafe(rootPkg)) });
-    } catch { /* skip */ }
+    } catch {
+      /* skip */
+    }
   }
 
   // packages/*/package.json (one level of workspace nesting)
@@ -84,10 +92,14 @@ function findPackageJsons(projectDir: string): { dir: string; pkg: Record<string
               dir: join(packagesDir, entry),
               pkg: JSON.parse(readFileSafe(pkgJson)),
             });
-          } catch { /* skip */ }
+          } catch {
+            /* skip */
+          }
         }
       }
-    } catch { /* skip */ }
+    } catch {
+      /* skip */
+    }
   }
 
   return results;
@@ -107,7 +119,7 @@ export function scanUnusedDeps(projectDir: string, ig?: Ignore): CleanupFinding[
     const files = walkFiles(dir, ALL_SCAN_EXTS, [], projectDir, ig);
 
     // Collect all file contents for searching
-    const allContent = files.map(f => readFileSafe(f)).join('\n');
+    const allContent = files.map((f) => readFileSafe(f)).join('\n');
 
     for (const depName of Object.keys(deps)) {
       // Check if dep is imported/required anywhere in this package
@@ -130,9 +142,10 @@ export function scanUnusedDeps(projectDir: string, ig?: Ignore): CleanupFinding[
       const binStr = JSON.stringify(pkg.bin ?? {});
       const exportsStr = JSON.stringify(pkg.exports ?? {});
       const scriptsStr = JSON.stringify(pkg.scripts ?? {});
-      const usedInPkgJson = binStr.includes(depName) || exportsStr.includes(depName) || scriptsStr.includes(depName);
+      const usedInPkgJson =
+        binStr.includes(depName) || exportsStr.includes(depName) || scriptsStr.includes(depName);
 
-      const usedInSource = importPatterns.some(p => allContent.includes(p));
+      const usedInSource = importPatterns.some((p) => allContent.includes(p));
 
       if (!usedInSource && !usedInPkgJson) {
         const relFile = normalizePath(relative(projectDir, join(dir, 'package.json')));
@@ -143,7 +156,9 @@ export function scanUnusedDeps(projectDir: string, ig?: Ignore): CleanupFinding[
           file: relFile,
           description: `Dependency "${depName}" is not imported in any source file`,
           recommendation: `Remove "${depName}" from dependencies`,
-          deterministicEvidence: [`No import/require of "${depName}" found in ${files.length} files in ${pkgName}`],
+          deterministicEvidence: [
+            `No import/require of "${depName}" found in ${files.length} files in ${pkgName}`,
+          ],
           semanticEvidence: [],
           hostEvidence: [],
           sources: ['deterministic'],
@@ -165,7 +180,8 @@ export function scanUnusedExports(projectDir: string, ig?: Ignore): CleanupFindi
 
   // Build a map of all exported symbols and their locations
   const exports: { file: string; name: string; line: number }[] = [];
-  const exportRegex = /^export\s+(?:(?:async\s+)?function|class|const|let|var|type|interface|enum)\s+(\w+)/gm;
+  const exportRegex =
+    /^export\s+(?:(?:async\s+)?function|class|const|let|var|type|interface|enum)\s+(\w+)/gm;
   const namedExportRegex = /export\s*\{([^}]+)\}/g;
 
   for (const file of allFiles) {
@@ -188,7 +204,15 @@ export function scanUnusedExports(projectDir: string, ig?: Ignore): CleanupFindi
     namedExportRegex.lastIndex = 0;
     match = namedExportRegex.exec(content);
     while (match) {
-      const names = match[1].split(',').map(n => n.trim().split(/\s+as\s+/)[0].trim()).filter(Boolean);
+      const names = match[1]
+        .split(',')
+        .map((n) =>
+          n
+            .trim()
+            .split(/\s+as\s+/)[0]
+            .trim(),
+        )
+        .filter(Boolean);
       const lineNum = content.slice(0, match.index).split('\n').length;
       for (const name of names) {
         exports.push({ file: relFile, name, line: lineNum });
@@ -198,11 +222,12 @@ export function scanUnusedExports(projectDir: string, ig?: Ignore): CleanupFindi
   }
 
   // Build all source content for import searching
-  const allContent = allFiles.map(f => readFileSafe(f)).join('\n');
+  const allContent = allFiles.map((f) => readFileSafe(f)).join('\n');
 
   for (const exp of exports) {
     // Simple check: does the export name appear in an import statement in any other file?
-    const isUsed = allContent.includes(`{ ${exp.name}`) ||
+    const isUsed =
+      allContent.includes(`{ ${exp.name}`) ||
       allContent.includes(`{${exp.name}`) ||
       allContent.includes(`, ${exp.name}`) ||
       allContent.includes(`${exp.name},`) ||
@@ -237,9 +262,8 @@ const MAGIC_NUMBER_REGEX = /(?<!\w)(\d{4,})(?!\w)/g; // 4+ digit numbers (3-digi
 
 /** Numbers commonly used as config values — not magic numbers. */
 const COMMON_NUMBERS = new Set([
-  1000, 1024, 2048, 4096, 8192, 16384, 32768, 65536,
-  1200, 1500, 2000, 3000, 5000, 8000, 8080, 8443, 9000, 9090,
-  10000, 15000, 30000, 50000, 60000, 100000, 120000, 200000, 300000, 400000, 600000,
+  1000, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 1200, 1500, 2000, 3000, 5000, 8000, 8080, 8443,
+  9000, 9090, 10000, 15000, 30000, 50000, 60000, 100000, 120000, 200000, 300000, 400000, 600000,
 ]);
 const URL_REGEX = /(['"`])(https?:\/\/[^\s'"`]+)\1/g;
 const CREDENTIAL_PATTERNS = [
@@ -254,7 +278,8 @@ export function scanHardcoded(projectDir: string, ig?: Ignore): CleanupFinding[]
     const relFile = normalizePath(relative(projectDir, file));
 
     // Skip test files for magic numbers (fixtures/mocks are expected)
-    const isTest = relFile.includes('test') || relFile.includes('spec') || relFile.includes('__test');
+    const isTest =
+      relFile.includes('test') || relFile.includes('spec') || relFile.includes('__test');
 
     const content = readFileSafe(file);
     const lines = content.split('\n');
@@ -289,8 +314,8 @@ export function scanHardcoded(projectDir: string, ig?: Ignore): CleanupFinding[]
             recommendation: `Extract to named constant`,
             deterministicEvidence: [`Literal number ${m[1]} at line ${lineNum}`],
             semanticEvidence: [],
-          hostEvidence: [],
-          sources: ['deterministic'],
+            hostEvidence: [],
+            sources: ['deterministic'],
             disputed: false,
           });
         }
@@ -311,33 +336,34 @@ export function scanHardcoded(projectDir: string, ig?: Ignore): CleanupFinding[]
             recommendation: `Move to configuration or environment variable`,
             deterministicEvidence: [`URL literal at line ${lineNum}`],
             semanticEvidence: [],
-          hostEvidence: [],
-          sources: ['deterministic'],
+            hostEvidence: [],
+            sources: ['deterministic'],
             disputed: false,
           });
         }
       }
 
       // Credential patterns (skip in tests — mock tokens/secrets are expected)
-      if (!isTest) for (const pattern of CREDENTIAL_PATTERNS) {
-        pattern.lastIndex = 0;
-        if (pattern.test(line)) {
-          findings.push({
-            key: makeKey('hardcoded', relFile, `cred:L${lineNum}`),
-            scope: 'hardcoded',
-            confidence: 'high',
-            file: relFile,
-            line: lineNum,
-            description: `Possible hardcoded credential`,
-            recommendation: `Move to environment variable or secret manager`,
-            deterministicEvidence: [`Credential pattern matched at line ${lineNum}`],
-            semanticEvidence: [],
-          hostEvidence: [],
-          sources: ['deterministic'],
-            disputed: false,
-          });
+      if (!isTest)
+        for (const pattern of CREDENTIAL_PATTERNS) {
+          pattern.lastIndex = 0;
+          if (pattern.test(line)) {
+            findings.push({
+              key: makeKey('hardcoded', relFile, `cred:L${lineNum}`),
+              scope: 'hardcoded',
+              confidence: 'high',
+              file: relFile,
+              line: lineNum,
+              description: `Possible hardcoded credential`,
+              recommendation: `Move to environment variable or secret manager`,
+              deterministicEvidence: [`Credential pattern matched at line ${lineNum}`],
+              semanticEvidence: [],
+              hostEvidence: [],
+              sources: ['deterministic'],
+              disputed: false,
+            });
+          }
         }
-      }
     }
   }
 
@@ -392,7 +418,10 @@ export function scanDuplicates(projectDir: string, ig?: Ignore): CleanupFinding[
   for (const [hash, group] of bodyMap) {
     if (group.length < 2) continue;
 
-    const groupKey = group.map(g => `${g.file}:${g.line}`).sort().join('+');
+    const groupKey = group
+      .map((g) => `${g.file}:${g.line}`)
+      .sort()
+      .join('+');
 
     for (const item of group) {
       findings.push({
@@ -403,7 +432,9 @@ export function scanDuplicates(projectDir: string, ig?: Ignore): CleanupFinding[
         line: item.line,
         description: `Function "${item.name}" has identical body to ${group.length - 1} other function(s)`,
         recommendation: `Consider extracting shared logic to a common utility`,
-        deterministicEvidence: [`Body hash ${hash.slice(0, 8)} shared by: ${group.map(g => `${g.file}:${g.name}`).join(', ')}`],
+        deterministicEvidence: [
+          `Body hash ${hash.slice(0, 8)} shared by: ${group.map((g) => `${g.file}:${g.name}`).join(', ')}`,
+        ],
         semanticEvidence: [],
         hostEvidence: [],
         sources: ['deterministic'],
@@ -458,7 +489,9 @@ export function scanDeadCode(projectDir: string, ig?: Ignore): CleanupFinding[] 
           line: lineNum,
           description: `"${name}" is declared but never referenced in this file`,
           recommendation: `Remove if unused, or export if needed elsewhere`,
-          deterministicEvidence: [`"${name}" appears ${occurrences} time(s) in file (declaration only)`],
+          deterministicEvidence: [
+            `"${name}" appears ${occurrences} time(s) in file (declaration only)`,
+          ],
           semanticEvidence: [],
           hostEvidence: [],
           sources: ['deterministic'],
@@ -475,44 +508,149 @@ export function scanDeadCode(projectDir: string, ig?: Ignore): CleanupFinding[] 
 
 // ── Scanner: Security (OWASP vulnerability detection) ──
 
-const SECURITY_PATTERNS: { regex: RegExp; cwe: string; severity: 'critical' | 'high' | 'medium'; description: string; recommendation: string }[] = [
+const SECURITY_PATTERNS: {
+  regex: RegExp;
+  cwe: string;
+  severity: 'critical' | 'high' | 'medium';
+  description: string;
+  recommendation: string;
+}[] = [
   // CWE-94: Code Injection
-  { regex: /\beval\s*\(/g, cwe: 'CWE-94', severity: 'critical', description: 'eval() usage — code injection risk', recommendation: 'Replace eval() with safe alternatives (JSON.parse, Function constructor with validation, or structured parsing)' },
-  { regex: /\bnew\s+Function\s*\(/g, cwe: 'CWE-94', severity: 'critical', description: 'new Function() — dynamic code execution', recommendation: 'Avoid dynamic code generation; use static dispatch or lookup tables' },
+  {
+    regex: /\beval\s*\(/g,
+    cwe: 'CWE-94',
+    severity: 'critical',
+    description: 'eval() usage — code injection risk',
+    recommendation:
+      'Replace eval() with safe alternatives (JSON.parse, Function constructor with validation, or structured parsing)',
+  },
+  {
+    regex: /\bnew\s+Function\s*\(/g,
+    cwe: 'CWE-94',
+    severity: 'critical',
+    description: 'new Function() — dynamic code execution',
+    recommendation: 'Avoid dynamic code generation; use static dispatch or lookup tables',
+  },
 
   // CWE-78: OS Command Injection
-  { regex: /child_process.*\bexec\s*\(\s*`/g, cwe: 'CWE-78', severity: 'critical', description: 'exec() with template literal — command injection risk', recommendation: 'Use execFile() with argument array instead of exec() with string interpolation' },
-  { regex: /child_process.*\bexec\s*\(\s*[^'"`\s]+\s*\+/g, cwe: 'CWE-78', severity: 'critical', description: 'exec() with string concatenation — command injection risk', recommendation: 'Use execFile() with argument array instead of exec() with concatenation' },
-  { regex: /\bexecSync\s*\(\s*`/g, cwe: 'CWE-78', severity: 'critical', description: 'execSync() with template literal — command injection', recommendation: 'Use execFileSync() with argument array' },
+  {
+    regex: /child_process.*\bexec\s*\(\s*`/g,
+    cwe: 'CWE-78',
+    severity: 'critical',
+    description: 'exec() with template literal — command injection risk',
+    recommendation:
+      'Use execFile() with argument array instead of exec() with string interpolation',
+  },
+  {
+    regex: /child_process.*\bexec\s*\(\s*[^'"`\s]+\s*\+/g,
+    cwe: 'CWE-78',
+    severity: 'critical',
+    description: 'exec() with string concatenation — command injection risk',
+    recommendation: 'Use execFile() with argument array instead of exec() with concatenation',
+  },
+  {
+    regex: /\bexecSync\s*\(\s*`/g,
+    cwe: 'CWE-78',
+    severity: 'critical',
+    description: 'execSync() with template literal — command injection',
+    recommendation: 'Use execFileSync() with argument array',
+  },
 
   // CWE-89: SQL Injection
-  { regex: /\.(?:query|exec|run|prepare)\s*\(\s*`[^`]*\$\{/g, cwe: 'CWE-89', severity: 'critical', description: 'SQL query with template literal interpolation', recommendation: 'Use parameterized queries with ? placeholders' },
-  { regex: /\.(?:query|exec|run)\s*\([^)]*\+/g, cwe: 'CWE-89', severity: 'high', description: 'SQL query with string concatenation', recommendation: 'Use parameterized queries instead of string building' },
+  {
+    regex: /\.(?:query|exec|run|prepare)\s*\(\s*`[^`]*\$\{/g,
+    cwe: 'CWE-89',
+    severity: 'critical',
+    description: 'SQL query with template literal interpolation',
+    recommendation: 'Use parameterized queries with ? placeholders',
+  },
+  {
+    regex: /\.(?:query|exec|run)\s*\([^)]*\+/g,
+    cwe: 'CWE-89',
+    severity: 'high',
+    description: 'SQL query with string concatenation',
+    recommendation: 'Use parameterized queries instead of string building',
+  },
 
   // CWE-22: Path Traversal
-  { regex: /path\.(?:join|resolve)\s*\([^)]*(?:req\.|params\.|query\.|body\.)/g, cwe: 'CWE-22', severity: 'high', description: 'Path construction with user input — traversal risk', recommendation: 'Validate and normalize paths, reject .. segments, use path.normalize() + startsWith() check' },
+  {
+    regex: /path\.(?:join|resolve)\s*\([^)]*(?:req\.|params\.|query\.|body\.)/g,
+    cwe: 'CWE-22',
+    severity: 'high',
+    description: 'Path construction with user input — traversal risk',
+    recommendation:
+      'Validate and normalize paths, reject .. segments, use path.normalize() + startsWith() check',
+  },
 
   // CWE-79: Cross-Site Scripting
-  { regex: /\.innerHTML\s*=/g, cwe: 'CWE-79', severity: 'high', description: 'innerHTML assignment — XSS risk', recommendation: 'Use textContent or a sanitization library (DOMPurify)' },
-  { regex: /dangerouslySetInnerHTML/g, cwe: 'CWE-79', severity: 'medium', description: 'dangerouslySetInnerHTML — potential XSS', recommendation: 'Sanitize HTML before rendering; use DOMPurify or similar' },
+  {
+    regex: /\.innerHTML\s*=/g,
+    cwe: 'CWE-79',
+    severity: 'high',
+    description: 'innerHTML assignment — XSS risk',
+    recommendation: 'Use textContent or a sanitization library (DOMPurify)',
+  },
+  {
+    regex: /dangerouslySetInnerHTML/g,
+    cwe: 'CWE-79',
+    severity: 'medium',
+    description: 'dangerouslySetInnerHTML — potential XSS',
+    recommendation: 'Sanitize HTML before rendering; use DOMPurify or similar',
+  },
 
   // CWE-601: Open Redirect
-  { regex: /res\.redirect\s*\(\s*(?:req\.(?:query|params|body)\.|[^'"`\s])/g, cwe: 'CWE-601', severity: 'high', description: 'Redirect with user-controlled input — open redirect', recommendation: 'Validate redirect target against allowlist of safe URLs' },
+  {
+    regex: /res\.redirect\s*\(\s*(?:req\.(?:query|params|body)\.|[^'"`\s])/g,
+    cwe: 'CWE-601',
+    severity: 'high',
+    description: 'Redirect with user-controlled input — open redirect',
+    recommendation: 'Validate redirect target against allowlist of safe URLs',
+  },
 
   // CWE-798: Hardcoded Credentials (beyond what hardcoded scanner catches)
-  { regex: /(?:jwt|bearer)\s*[:=]\s*['"`][A-Za-z0-9\-_.]+['"`]/gi, cwe: 'CWE-798', severity: 'high', description: 'Hardcoded JWT/Bearer token', recommendation: 'Move tokens to environment variables or secret manager' },
+  {
+    regex: /(?:jwt|bearer)\s*[:=]\s*['"`][A-Za-z0-9\-_.]+['"`]/gi,
+    cwe: 'CWE-798',
+    severity: 'high',
+    description: 'Hardcoded JWT/Bearer token',
+    recommendation: 'Move tokens to environment variables or secret manager',
+  },
 
   // CWE-327: Weak Cryptography
-  { regex: /createHash\s*\(\s*['"`](?:md5|sha1)['"`]\s*\)/g, cwe: 'CWE-327', severity: 'medium', description: 'Weak hash algorithm (MD5/SHA1)', recommendation: 'Use SHA-256 or stronger for security-sensitive hashing' },
+  {
+    regex: /createHash\s*\(\s*['"`](?:md5|sha1)['"`]\s*\)/g,
+    cwe: 'CWE-327',
+    severity: 'medium',
+    description: 'Weak hash algorithm (MD5/SHA1)',
+    recommendation: 'Use SHA-256 or stronger for security-sensitive hashing',
+  },
 
   // CWE-1333: ReDoS
-  { regex: /new\s+RegExp\s*\(\s*[^)]*(?:\.\*|\.\+|\(.*\|.*\))\s*[^)]*\)/g, cwe: 'CWE-1333', severity: 'medium', description: 'Dynamic regex with potential catastrophic backtracking', recommendation: 'Audit regex for ReDoS; consider using re2 or safe-regex library' },
+  {
+    regex: /new\s+RegExp\s*\(\s*[^)]*(?:\.\*|\.\+|\(.*\|.*\))\s*[^)]*\)/g,
+    cwe: 'CWE-1333',
+    severity: 'medium',
+    description: 'Dynamic regex with potential catastrophic backtracking',
+    recommendation: 'Audit regex for ReDoS; consider using re2 or safe-regex library',
+  },
 
   // CWE-200: Information Exposure
-  { regex: /(?:console\.(?:log|error|warn)|res\.(?:json|send))\s*\(\s*(?:err|error|e)\s*\)/g, cwe: 'CWE-200', severity: 'medium', description: 'Full error object exposed — may leak stack traces/internals', recommendation: 'Log errors server-side; return sanitized error messages to clients' },
+  {
+    regex: /(?:console\.(?:log|error|warn)|res\.(?:json|send))\s*\(\s*(?:err|error|e)\s*\)/g,
+    cwe: 'CWE-200',
+    severity: 'medium',
+    description: 'Full error object exposed — may leak stack traces/internals',
+    recommendation: 'Log errors server-side; return sanitized error messages to clients',
+  },
 
   // CWE-352: Missing CSRF (heuristic)
-  { regex: /app\.(?:post|put|patch|delete)\s*\([^)]*,\s*(?:async\s+)?\([^)]*req/g, cwe: 'CWE-352', severity: 'medium', description: 'State-changing route without visible CSRF protection', recommendation: 'Add CSRF token validation middleware (csurf, csrf-csrf)' },
+  {
+    regex: /app\.(?:post|put|patch|delete)\s*\([^)]*,\s*(?:async\s+)?\([^)]*req/g,
+    cwe: 'CWE-352',
+    severity: 'medium',
+    description: 'State-changing route without visible CSRF protection',
+    recommendation: 'Add CSRF token validation middleware (csurf, csrf-csrf)',
+  },
 ];
 
 export function scanSecurity(projectDir: string, ig?: Ignore): CleanupFinding[] {
@@ -521,7 +659,8 @@ export function scanSecurity(projectDir: string, ig?: Ignore): CleanupFinding[] 
 
   for (const file of allFiles) {
     const relFile = normalizePath(relative(projectDir, file));
-    const isTest = relFile.includes('test') || relFile.includes('spec') || relFile.includes('__test');
+    const isTest =
+      relFile.includes('test') || relFile.includes('spec') || relFile.includes('__test');
     // Skip test files — mock code intentionally uses unsafe patterns
     if (isTest) continue;
 
@@ -536,14 +675,20 @@ export function scanSecurity(projectDir: string, ig?: Ignore): CleanupFinding[] 
         const lineContent = lines[lineNum - 1]?.trim() || '';
 
         // Skip commented lines and regex/string literals (scanner definition patterns)
-        if (lineContent.startsWith('//') || lineContent.startsWith('*') ||
-            lineContent.startsWith('{ regex:') || lineContent.startsWith('regex:') ||
-            /^\s*\//.test(lineContent) || /^\s*['"`].*['"`]\s*[,;]?\s*$/.test(lineContent)) {
+        if (
+          lineContent.startsWith('//') ||
+          lineContent.startsWith('*') ||
+          lineContent.startsWith('{ regex:') ||
+          lineContent.startsWith('regex:') ||
+          /^\s*\//.test(lineContent) ||
+          /^\s*['"`].*['"`]\s*[,;]?\s*$/.test(lineContent)
+        ) {
           match = pattern.regex.exec(content);
           continue;
         }
 
-        const confidence: CleanupConfidence = pattern.severity === 'critical' ? 'high' : pattern.severity === 'high' ? 'medium' : 'low';
+        const confidence: CleanupConfidence =
+          pattern.severity === 'critical' ? 'high' : pattern.severity === 'high' ? 'medium' : 'low';
 
         findings.push({
           key: makeKey('security', relFile, `${pattern.cwe}:L${lineNum}`),
@@ -553,7 +698,9 @@ export function scanSecurity(projectDir: string, ig?: Ignore): CleanupFinding[] 
           line: lineNum,
           description: `[${pattern.cwe}] ${pattern.description}`,
           recommendation: pattern.recommendation,
-          deterministicEvidence: [`Pattern matched at line ${lineNum}: ${lineContent.slice(0, 80)}`],
+          deterministicEvidence: [
+            `Pattern matched at line ${lineNum}: ${lineContent.slice(0, 80)}`,
+          ],
           semanticEvidence: [],
           hostEvidence: [],
           sources: ['deterministic'],
@@ -573,12 +720,12 @@ export function scanSecurity(projectDir: string, ig?: Ignore): CleanupFinding[] 
 /** Tokenize a function body: strip whitespace, normalize identifiers to placeholders */
 function tokenize(body: string): string[] {
   return body
-    .replace(/\/\/[^\n]*/g, '')      // strip line comments
+    .replace(/\/\/[^\n]*/g, '') // strip line comments
     .replace(/\/\*[\s\S]*?\*\//g, '') // strip block comments
-    .replace(/\s+/g, ' ')            // collapse whitespace
+    .replace(/\s+/g, ' ') // collapse whitespace
     .trim()
-    .split(/(\W)/)                    // split on non-word chars, keep delimiters
-    .filter(t => t.trim().length > 0);
+    .split(/(\W)/) // split on non-word chars, keep delimiters
+    .filter((t) => t.trim().length > 0);
 }
 
 /** Build n-gram set for Jaccard similarity */
@@ -639,7 +786,14 @@ export function scanNearDuplicates(projectDir: string, ig?: Ignore): CleanupFind
       if (tokens.length > 20) {
         const ngrams = ngramSet(tokens, 5);
         const lineNum = content.slice(0, match.index).split('\n').length;
-        funcs.push({ file: relFile, name: match[1], line: lineNum, tokens, ngrams, bodyLength: body.length });
+        funcs.push({
+          file: relFile,
+          name: match[1],
+          line: lineNum,
+          tokens,
+          ngrams,
+          bodyLength: body.length,
+        });
       }
 
       match = funcRegex.exec(content);
@@ -665,12 +819,12 @@ export function scanNearDuplicates(projectDir: string, ig?: Ignore): CleanupFind
       // Skip exact duplicates (handled by duplicates scanner)
       if (sim >= 0.98) continue;
 
-      if (sim >= 0.70) {
+      if (sim >= 0.7) {
         const pairKey = [a.file, a.name, b.file, b.name].sort().join('+');
         if (reported.has(pairKey)) continue;
         reported.add(pairKey);
 
-        const confidence: CleanupConfidence = sim >= 0.90 ? 'high' : sim >= 0.80 ? 'medium' : 'low';
+        const confidence: CleanupConfidence = sim >= 0.9 ? 'high' : sim >= 0.8 ? 'medium' : 'low';
         const simPct = Math.round(sim * 100);
 
         // Report for the first function
@@ -682,7 +836,9 @@ export function scanNearDuplicates(projectDir: string, ig?: Ignore): CleanupFind
           line: a.line,
           description: `"${a.name}" is ${simPct}% similar to "${b.name}" in ${b.file}:${b.line}`,
           recommendation: `Consider extracting shared logic into a common utility function`,
-          deterministicEvidence: [`Jaccard 5-gram similarity: ${simPct}% between ${a.name} (${a.file}:${a.line}) and ${b.name} (${b.file}:${b.line})`],
+          deterministicEvidence: [
+            `Jaccard 5-gram similarity: ${simPct}% between ${a.name} (${a.file}:${a.line}) and ${b.name} (${b.file}:${b.line})`,
+          ],
           semanticEvidence: [],
           hostEvidence: [],
           sources: ['deterministic'],
@@ -698,34 +854,112 @@ export function scanNearDuplicates(projectDir: string, ig?: Ignore): CleanupFind
 
 // ── Scanner: Anti-Patterns (AI code smells) ──
 
-const ANTI_PATTERNS: { regex: RegExp; name: string; description: string; recommendation: string; confidence: CleanupConfidence; skipTests: boolean }[] = [
+const ANTI_PATTERNS: {
+  regex: RegExp;
+  name: string;
+  description: string;
+  recommendation: string;
+  confidence: CleanupConfidence;
+  skipTests: boolean;
+}[] = [
   // Empty catch blocks
-  { regex: /catch\s*\([^)]*\)\s*\{\s*\}/g, name: 'empty-catch', description: 'Empty catch block swallows errors silently', recommendation: 'Log the error or re-throw; empty catches hide bugs', confidence: 'high', skipTests: false },
-  { regex: /catch\s*\{\s*\}/g, name: 'empty-catch', description: 'Empty catch block (no parameter) swallows errors', recommendation: 'At minimum add a comment explaining why errors are ignored', confidence: 'high', skipTests: false },
+  {
+    regex: /catch\s*\([^)]*\)\s*\{\s*\}/g,
+    name: 'empty-catch',
+    description: 'Empty catch block swallows errors silently',
+    recommendation: 'Log the error or re-throw; empty catches hide bugs',
+    confidence: 'high',
+    skipTests: false,
+  },
+  {
+    regex: /catch\s*\{\s*\}/g,
+    name: 'empty-catch',
+    description: 'Empty catch block (no parameter) swallows errors',
+    recommendation: 'At minimum add a comment explaining why errors are ignored',
+    confidence: 'high',
+    skipTests: false,
+  },
 
   // console.log in production code
-  { regex: /\bconsole\.log\s*\(/g, name: 'console-log', description: 'console.log left in production code', recommendation: 'Remove or replace with proper logger', confidence: 'medium', skipTests: true },
+  {
+    regex: /\bconsole\.log\s*\(/g,
+    name: 'console-log',
+    description: 'console.log left in production code',
+    recommendation: 'Remove or replace with proper logger',
+    confidence: 'medium',
+    skipTests: true,
+  },
 
   // async function without await
-  { regex: /async\s+function\s+(\w+)\s*\([^)]*\)\s*(?::\s*[^{]+)?\{/g, name: 'async-no-await', description: 'async function may not need async keyword', recommendation: 'Remove async if function does not use await', confidence: 'low', skipTests: true },
+  {
+    regex: /async\s+function\s+(\w+)\s*\([^)]*\)\s*(?::\s*[^{]+)?\{/g,
+    name: 'async-no-await',
+    description: 'async function may not need async keyword',
+    recommendation: 'Remove async if function does not use await',
+    confidence: 'low',
+    skipTests: true,
+  },
 
   // Redundant return undefined
-  { regex: /return\s+undefined\s*;/g, name: 'return-undefined', description: 'Redundant "return undefined" — functions return undefined by default', recommendation: 'Use bare "return;" or remove the return statement', confidence: 'medium', skipTests: false },
+  {
+    regex: /return\s+undefined\s*;/g,
+    name: 'return-undefined',
+    description: 'Redundant "return undefined" — functions return undefined by default',
+    recommendation: 'Use bare "return;" or remove the return statement',
+    confidence: 'medium',
+    skipTests: false,
+  },
 
   // Nested ternaries (readability hazard)
-  { regex: /\?[^:?]*\?/g, name: 'nested-ternary', description: 'Nested ternary operator — hard to read', recommendation: 'Refactor to if/else or extract to a helper function', confidence: 'low', skipTests: true },
+  {
+    regex: /\?[^:?]*\?/g,
+    name: 'nested-ternary',
+    description: 'Nested ternary operator — hard to read',
+    recommendation: 'Refactor to if/else or extract to a helper function',
+    confidence: 'low',
+    skipTests: true,
+  },
 
   // Type assertion chains (TypeScript)
-  { regex: /as\s+\w+(?:\s*\[\s*\])?\s+as\s+/g, name: 'double-assertion', description: 'Double type assertion (as X as Y) — type safety bypass', recommendation: 'Fix the underlying type instead of double-casting', confidence: 'high', skipTests: false },
+  {
+    regex: /as\s+\w+(?:\s*\[\s*\])?\s+as\s+/g,
+    name: 'double-assertion',
+    description: 'Double type assertion (as X as Y) — type safety bypass',
+    recommendation: 'Fix the underlying type instead of double-casting',
+    confidence: 'high',
+    skipTests: false,
+  },
 
   // any type usage
-  { regex: /:\s*any\b/g, name: 'any-type', description: '"any" type defeats TypeScript type safety', recommendation: 'Use unknown, proper generics, or specific types', confidence: 'low', skipTests: true },
+  {
+    regex: /:\s*any\b/g,
+    name: 'any-type',
+    description: '"any" type defeats TypeScript type safety',
+    recommendation: 'Use unknown, proper generics, or specific types',
+    confidence: 'low',
+    skipTests: true,
+  },
 
   // Promise constructor anti-pattern
-  { regex: /new\s+Promise\s*\(\s*(?:async\s+)?\(\s*resolve\s*(?:,\s*reject)?\s*\)\s*=>\s*\{[^}]*await\b/g, name: 'promise-constructor-async', description: 'Promise constructor with async executor — error handling is broken', recommendation: 'Remove Promise wrapper; async functions already return promises', confidence: 'high', skipTests: false },
+  {
+    regex:
+      /new\s+Promise\s*\(\s*(?:async\s+)?\(\s*resolve\s*(?:,\s*reject)?\s*\)\s*=>\s*\{[^}]*await\b/g,
+    name: 'promise-constructor-async',
+    description: 'Promise constructor with async executor — error handling is broken',
+    recommendation: 'Remove Promise wrapper; async functions already return promises',
+    confidence: 'high',
+    skipTests: false,
+  },
 
   // setTimeout/setInterval with string argument
-  { regex: /(?:setTimeout|setInterval)\s*\(\s*['"`]/g, name: 'implicit-eval', description: 'setTimeout/setInterval with string argument — implicit eval()', recommendation: 'Pass a function reference instead of a string', confidence: 'high', skipTests: false },
+  {
+    regex: /(?:setTimeout|setInterval)\s*\(\s*['"`]/g,
+    name: 'implicit-eval',
+    description: 'setTimeout/setInterval with string argument — implicit eval()',
+    recommendation: 'Pass a function reference instead of a string',
+    confidence: 'high',
+    skipTests: false,
+  },
 ];
 
 export function scanAntiPatterns(projectDir: string, ig?: Ignore): CleanupFinding[] {
@@ -734,7 +968,8 @@ export function scanAntiPatterns(projectDir: string, ig?: Ignore): CleanupFindin
 
   for (const file of allFiles) {
     const relFile = normalizePath(relative(projectDir, file));
-    const isTest = relFile.includes('test') || relFile.includes('spec') || relFile.includes('__test');
+    const isTest =
+      relFile.includes('test') || relFile.includes('spec') || relFile.includes('__test');
     const content = readFileSafe(file);
     const lines = content.split('\n');
 
@@ -767,7 +1002,9 @@ export function scanAntiPatterns(projectDir: string, ig?: Ignore): CleanupFindin
               line: lineNum,
               description: `${pattern.description}: "${funcName}"`,
               recommendation: pattern.recommendation,
-              deterministicEvidence: [`async function "${funcName}" at line ${lineNum} contains no await expressions`],
+              deterministicEvidence: [
+                `async function "${funcName}" at line ${lineNum} contains no await expressions`,
+              ],
               semanticEvidence: [],
               hostEvidence: [],
               sources: ['deterministic'],
@@ -785,9 +1022,13 @@ export function scanAntiPatterns(projectDir: string, ig?: Ignore): CleanupFindin
         const lineContent = lines[lineNum - 1]?.trim() || '';
 
         // Skip commented lines and regex/string literals (scanner definition patterns)
-        if (lineContent.startsWith('//') || lineContent.startsWith('*') ||
-            lineContent.startsWith('{ regex:') || lineContent.startsWith('regex:') ||
-            /^\s*\//.test(lineContent)) {
+        if (
+          lineContent.startsWith('//') ||
+          lineContent.startsWith('*') ||
+          lineContent.startsWith('{ regex:') ||
+          lineContent.startsWith('regex:') ||
+          /^\s*\//.test(lineContent)
+        ) {
           match = pattern.regex.exec(content);
           continue;
         }
@@ -800,7 +1041,9 @@ export function scanAntiPatterns(projectDir: string, ig?: Ignore): CleanupFindin
           line: lineNum,
           description: pattern.description,
           recommendation: pattern.recommendation,
-          deterministicEvidence: [`Pattern matched at line ${lineNum}: ${lineContent.slice(0, 80)}`],
+          deterministicEvidence: [
+            `Pattern matched at line ${lineNum}: ${lineContent.slice(0, 80)}`,
+          ],
           semanticEvidence: [],
           hostEvidence: [],
           sources: ['deterministic'],
@@ -823,7 +1066,16 @@ export function runAllScanners(
   ig?: Ignore,
 ): CleanupFinding[] {
   const findings: CleanupFinding[] = [];
-  const ALL_SCOPES: CleanupScope[] = ['deps', 'unused-exports', 'hardcoded', 'duplicates', 'deadcode', 'security', 'near-duplicates', 'anti-patterns'];
+  const ALL_SCOPES: CleanupScope[] = [
+    'deps',
+    'unused-exports',
+    'hardcoded',
+    'duplicates',
+    'deadcode',
+    'security',
+    'near-duplicates',
+    'anti-patterns',
+  ];
   const activeScopes = new Set(scopes.includes('all' as CleanupScope) ? ALL_SCOPES : scopes);
 
   if (activeScopes.has('deps')) findings.push(...scanUnusedDeps(projectDir, ig));

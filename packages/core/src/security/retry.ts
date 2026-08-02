@@ -223,4 +223,3 @@ function getHeaders(error: unknown): Record<string, string> | Headers | undefine
   }
   return undefined;
 }
-

@@ -372,7 +372,13 @@ export class ContextBuilder {
 // ── Handoff Envelope ──
 
 /** Command types with pre-defined output contracts. */
-export type HandoffCommand = 'review' | 'debate' | 'build-review' | 'cleanup' | 'adjudicate' | 'custom';
+export type HandoffCommand =
+  | 'review'
+  | 'debate'
+  | 'build-review'
+  | 'cleanup'
+  | 'adjudicate'
+  | 'custom';
 
 export interface HandoffEnvelopeOptions {
   /** The command being executed */
@@ -437,7 +443,9 @@ export function buildHandoffEnvelope(options: HandoffEnvelopeOptions): string {
   const sections: string[] = [];
 
   // ── Preamble ──
-  sections.push('You have full access to this project\'s codebase. Use tools to discover, read, and analyze relevant files as needed.');
+  sections.push(
+    "You have full access to this project's codebase. Use tools to discover, read, and analyze relevant files as needed.",
+  );
 
   // ── Resume primer (capped at 500 chars to prevent bloat) ──
   if (options.resumed) {
@@ -457,7 +465,7 @@ export function buildHandoffEnvelope(options: HandoffEnvelopeOptions): string {
     constraints.push(`Restrict exploration to files matching: ${options.scope}`);
   }
   if (constraints.length > 0) {
-    sections.push(`CONSTRAINTS:\n${constraints.map(c => `- ${c}`).join('\n')}`);
+    sections.push(`CONSTRAINTS:\n${constraints.map((c) => `- ${c}`).join('\n')}`);
   }
 
   // ── Output contract ──

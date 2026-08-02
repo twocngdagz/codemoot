@@ -52,4 +52,3 @@ function isRetryable(error: unknown, config: FallbackConfig): boolean {
 
   return false;
 }
-

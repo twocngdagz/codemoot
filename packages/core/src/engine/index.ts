@@ -18,4 +18,10 @@ export { WorkflowEngine } from './workflow-engine.js';
 export { CancellationToken, CancellationError } from './cancellation.js';
 export { ProposalCritiqueEngine, detectStance } from './debate-engine.js';
 export { evaluatePolicy, DEFAULT_RULES } from './policy.js';
-export type { PolicyRule, PolicyContext, PolicyResult, PolicyMode, PolicyDecision } from './policy.js';
+export type {
+  PolicyRule,
+  PolicyContext,
+  PolicyResult,
+  PolicyMode,
+  PolicyDecision,
+} from './policy.js';

@@ -196,7 +196,9 @@ export class MessageStore {
   /** Get a message by debate_id, round, and role (for idempotency checks). */
   getByRound(debateId: string, round: number, role: string): DebateMessageRow | null {
     const row = this.db
-      .prepare('SELECT * FROM debate_messages WHERE debate_id = ? AND round = ? AND role = ? LIMIT 1')
+      .prepare(
+        'SELECT * FROM debate_messages WHERE debate_id = ? AND round = ? AND role = ? LIMIT 1',
+      )
       .get(debateId, round, role) as Record<string, unknown> | undefined;
     return row ? this.toRow(row) : null;
   }
@@ -206,7 +208,7 @@ export class MessageStore {
     const rows = this.db
       .prepare('SELECT * FROM debate_messages WHERE debate_id = ? ORDER BY round ASC, role ASC')
       .all(debateId) as Record<string, unknown>[];
-    return rows.map(r => this.toRow(r));
+    return rows.map((r) => this.toRow(r));
   }
 
   /** Recover stale running rows older than threshold. Returns count recovered. */

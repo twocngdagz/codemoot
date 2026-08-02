@@ -1,8 +1,8 @@
 // packages/core/src/memory/unified-session.ts — Unified session management
 
 import type Database from 'better-sqlite3';
-import { generateId } from '../utils/id.js';
 import { sanitize } from '../security/dlp.js';
+import { generateId } from '../utils/id.js';
 import { estimateTokens } from './token-budget.js';
 
 export interface UnifiedSession {
@@ -48,16 +48,18 @@ export class SessionManager {
 
   /** Get a session by ID. */
   get(id: string): UnifiedSession | null {
-    const row = this.db
-      .prepare('SELECT * FROM codemoot_sessions WHERE id = ?')
-      .get(id) as Record<string, unknown> | undefined;
+    const row = this.db.prepare('SELECT * FROM codemoot_sessions WHERE id = ?').get(id) as
+      | Record<string, unknown>
+      | undefined;
     return row ? this.toSession(row) : null;
   }
 
   /** Get the current active session (most recently updated). */
   getActive(): UnifiedSession | null {
     const row = this.db
-      .prepare("SELECT * FROM codemoot_sessions WHERE status = 'active' ORDER BY updated_at DESC LIMIT 1")
+      .prepare(
+        "SELECT * FROM codemoot_sessions WHERE status = 'active' ORDER BY updated_at DESC LIMIT 1",
+      )
       .get() as Record<string, unknown> | undefined;
     return row ? this.toSession(row) : null;
   }
@@ -73,9 +75,7 @@ export class SessionManager {
   /** Update the codex thread ID for a session. Pass null to clear. */
   updateThreadId(sessionId: string, threadId: string | null): void {
     this.db
-      .prepare(
-        'UPDATE codemoot_sessions SET codex_thread_id = ?, updated_at = ? WHERE id = ?',
-      )
+      .prepare('UPDATE codemoot_sessions SET codex_thread_id = ?, updated_at = ? WHERE id = ?')
       .run(threadId, Date.now(), sessionId);
   }
 
@@ -94,8 +94,13 @@ export class SessionManager {
    * Add token usage from a model call result. Uses real usage when available,
    * falls back to char/4 estimate only when usage data is missing.
    */
-  addUsageFromResult(sessionId: string, usage: { totalTokens?: number; inputTokens?: number; outputTokens?: number }, promptText?: string, responseText?: string): void {
-    const realTokens = usage.totalTokens || ((usage.inputTokens ?? 0) + (usage.outputTokens ?? 0));
+  addUsageFromResult(
+    sessionId: string,
+    usage: { totalTokens?: number; inputTokens?: number; outputTokens?: number },
+    promptText?: string,
+    responseText?: string,
+  ): void {
+    const realTokens = usage.totalTokens || (usage.inputTokens ?? 0) + (usage.outputTokens ?? 0);
     if (realTokens > 0) {
       this.addTokenUsage(sessionId, realTokens);
     } else if (promptText || responseText) {
@@ -133,7 +138,7 @@ export class SessionManager {
     sql += ' ORDER BY updated_at DESC LIMIT ?';
     params.push(limit);
     const rows = this.db.prepare(sql).all(...params) as Record<string, unknown>[];
-    return rows.map(r => this.toSession(r));
+    return rows.map((r) => this.toSession(r));
   }
 
   // ── Session Events ──
@@ -189,9 +194,11 @@ export class SessionManager {
   getEvents(sessionId: string, rawLimit = 50): SessionEvent[] {
     const limit = Number.isFinite(rawLimit) && rawLimit > 0 ? Math.min(rawLimit, 200) : 50;
     const rows = this.db
-      .prepare('SELECT * FROM session_events WHERE session_id = ? ORDER BY created_at DESC, id DESC LIMIT ?')
+      .prepare(
+        'SELECT * FROM session_events WHERE session_id = ? ORDER BY created_at DESC, id DESC LIMIT ?',
+      )
       .all(sessionId, limit) as Record<string, unknown>[];
-    return rows.map(r => ({
+    return rows.map((r) => ({
       id: r.id as number,
       sessionId: r.session_id as string,
       command: r.command as string,

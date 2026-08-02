@@ -533,7 +533,12 @@ export class Orchestrator extends EventEmitter<OrchestratorEvents> {
   private async executeSession(
     task: string,
     phases: SessionPhase[],
-    options: { maxIterations?: number; stream?: boolean; mode?: ExecutionMode; planAutoApproveThreshold?: number },
+    options: {
+      maxIterations?: number;
+      stream?: boolean;
+      mode?: ExecutionMode;
+      planAutoApproveThreshold?: number;
+    },
   ): Promise<SessionResult> {
     const startTime = Date.now();
     const maxIterations = options.maxIterations ?? this.config.debate.maxRounds ?? 3;

@@ -898,6 +898,62 @@ export class ReviewWorkflowStore {
       });
   }
 
+  /**
+   * Pins the ACCEPTED decomposition on first success, so a resume reuses it instead of
+   * re-asking for it.
+   *
+   * Staged drafts are keyed by ordinal, but ordinal->work is decided by the outline. Asking
+   * for the outline again on every resume let a non-deterministic answer re-partition the
+   * plan underneath drafts authored against the previous partition: one resume returned
+   * eleven batches for a ten-batch plan, reused ten byte-identical drafts, and authored a
+   * near-duplicate of batch 10 as batch 11 — which then declared a dependency on batch 10.
+   * Nothing detected it, because every individual draft was correct.
+   */
+  saveRefinementOutline(input: {
+    readonly workflowId: string;
+    readonly outline: unknown;
+    readonly createdAt: string;
+  }): void {
+    this.db
+      .prepare(
+        `INSERT INTO review_workflow_refinement_outlines (workflow_id, outline_json, created_at)
+         VALUES (?, ?, ?)
+         ON CONFLICT(workflow_id) DO NOTHING`,
+      )
+      .run(input.workflowId, JSON.stringify(input.outline), input.createdAt);
+  }
+
+  /** The pinned outline, or null when this workflow has not accepted one yet. */
+  getRefinementOutline(workflowId: string): unknown | null {
+    const row = this.db
+      .prepare('SELECT outline_json FROM review_workflow_refinement_outlines WHERE workflow_id = ?')
+      .get(workflowId);
+    if (row === undefined) return null;
+    return JSON.parse(z.object({ outline_json: z.string() }).parse(row).outline_json);
+  }
+
+  /**
+   * Drops staged drafts whose ordinal is not part of the pinned decomposition.
+   *
+   * These are the residue of a decomposition that was never accepted — batch 11 of a
+   * ten-batch plan. The drafts table is STAGING, not the audit trail: every invocation that
+   * produced them remains in `review_workflow_invocation_audit` with its full prompt,
+   * response and cost, so nothing about what happened is lost.
+   */
+  discardRefinementDraftsOutside(workflowId: string, keepOrdinals: readonly number[]): number {
+    const kept = new Set(keepOrdinals);
+    const rows = this.db
+      .prepare('SELECT ordinal FROM review_workflow_refinement_drafts WHERE workflow_id = ?')
+      .all(workflowId)
+      .map((row) => z.object({ ordinal: z.number().int() }).parse(row).ordinal);
+    const orphans = rows.filter((ordinal) => !kept.has(ordinal));
+    const statement = this.db.prepare(
+      'DELETE FROM review_workflow_refinement_drafts WHERE workflow_id = ? AND ordinal = ?',
+    );
+    for (const ordinal of orphans) statement.run(workflowId, ordinal);
+    return orphans.length;
+  }
+
   /** Append-only continuity evidence: one row per invocation attempt, including failures. */
   recordSessionContinuity(evidence: SessionContinuityEvidence): void {
     this.db

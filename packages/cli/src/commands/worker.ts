@@ -70,7 +70,9 @@ export async function workerCommand(options: WorkerOptions): Promise<void> {
       // Prevent path traversal — resolved path must be within projectDir
       const sep = process.platform === 'win32' ? '\\' : '/';
       if (cwd !== normalize(projectDir) && !cwd.startsWith(normalize(projectDir) + sep)) {
-        throw new Error(`Path traversal blocked: "${cwd}" is outside project directory "${projectDir}"`);
+        throw new Error(
+          `Path traversal blocked: "${cwd}" is outside project directory "${projectDir}"`,
+        );
       }
       const timeout = ((payload.timeout as number) ?? 600) * 1000;
 
@@ -93,7 +95,7 @@ export async function workerCommand(options: WorkerOptions): Promise<void> {
         } else if (payload.diff) {
           const { execFileSync } = await import('node:child_process');
           // Validate diff args — only allow safe git ref patterns (no flag injection)
-          const diffArgs = (payload.diff as string).split(/\s+/).filter(a => a.length > 0);
+          const diffArgs = (payload.diff as string).split(/\s+/).filter((a) => a.length > 0);
           for (const arg of diffArgs) {
             if (arg.startsWith('-') || !/^[a-zA-Z0-9_.~^:\/\\@{}]+$/.test(arg)) {
               throw new Error(`Invalid diff argument: "${arg}" — only git refs and paths allowed`);

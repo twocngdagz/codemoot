@@ -32,9 +32,9 @@ export class JobStore {
 
   /** Get a job by ID. */
   get(id: string): JobRecord | null {
-    const row = this.db
-      .prepare('SELECT * FROM jobs WHERE id = ?')
-      .get(id) as Record<string, unknown> | undefined;
+    const row = this.db.prepare('SELECT * FROM jobs WHERE id = ?').get(id) as
+      | Record<string, unknown>
+      | undefined;
     return row ? this.toJob(row) : null;
   }
 
@@ -133,13 +133,15 @@ export class JobStore {
       .prepare(`SELECT * FROM jobs ${where} ORDER BY created_at DESC LIMIT ?`)
       .all(...params) as Record<string, unknown>[];
 
-    return rows.map(r => this.toJob(r));
+    return rows.map((r) => this.toJob(r));
   }
 
   /** Check if a dedupe key already has an active (queued/running) job. */
   hasActive(dedupeKey: string): boolean {
     const row = this.db
-      .prepare(`SELECT 1 FROM jobs WHERE dedupe_key = ? AND status IN ('queued', 'running') LIMIT 1`)
+      .prepare(
+        `SELECT 1 FROM jobs WHERE dedupe_key = ? AND status IN ('queued', 'running') LIMIT 1`,
+      )
       .get(dedupeKey);
     return Boolean(row);
   }
@@ -155,7 +157,13 @@ export class JobStore {
   // ── Job Logs ──
 
   /** Append a log entry. */
-  appendLog(jobId: string, level: JobLogRecord['level'], eventType: string, message?: string, payload?: Record<string, unknown>): void {
+  appendLog(
+    jobId: string,
+    level: JobLogRecord['level'],
+    eventType: string,
+    message?: string,
+    payload?: Record<string, unknown>,
+  ): void {
     const maxSeq = this.db
       .prepare('SELECT COALESCE(MAX(seq), 0) AS max_seq FROM job_logs WHERE job_id = ?')
       .get(jobId) as { max_seq: number };
@@ -165,7 +173,15 @@ export class JobStore {
         `INSERT INTO job_logs (job_id, seq, level, event_type, message, payload_json, created_at)
          VALUES (?, ?, ?, ?, ?, ?, ?)`,
       )
-      .run(jobId, maxSeq.max_seq + 1, level, eventType, message ?? null, payload ? JSON.stringify(payload) : null, Date.now());
+      .run(
+        jobId,
+        maxSeq.max_seq + 1,
+        level,
+        eventType,
+        message ?? null,
+        payload ? JSON.stringify(payload) : null,
+        Date.now(),
+      );
   }
 
   /** Get logs for a job. */
@@ -174,7 +190,7 @@ export class JobStore {
       .prepare('SELECT * FROM job_logs WHERE job_id = ? AND seq > ? ORDER BY seq ASC LIMIT ?')
       .all(jobId, fromSeq, limit) as Record<string, unknown>[];
 
-    return rows.map(r => ({
+    return rows.map((r) => ({
       id: r.id as number,
       jobId: r.job_id as string,
       seq: r.seq as number,

@@ -7,7 +7,7 @@ function normalizeKey(key: string): string {
   return key
     .replaceAll('\\', '/')
     .split(':')
-    .map(s => s.replace(/^\.\//, ''))
+    .map((s) => s.replace(/^\.\//, ''))
     .join(':');
 }
 
@@ -123,12 +123,12 @@ export function computeThreeWayStats(
     deterministic: uniqueKeyCount(deterministic),
     semantic: uniqueKeyCount(semantic),
     host: uniqueKeyCount(host),
-    agreed: merged.filter(f => f.sources.length >= 2).length,
-    disputed: merged.filter(f => f.disputed).length,
+    agreed: merged.filter((f) => f.sources.length >= 2).length,
+    disputed: merged.filter((f) => f.disputed).length,
     adjudicated: 0,
-    highConfidence: merged.filter(f => f.confidence === 'high').length,
-    mediumConfidence: merged.filter(f => f.confidence === 'medium').length,
-    lowConfidence: merged.filter(f => f.confidence === 'low').length,
+    highConfidence: merged.filter((f) => f.confidence === 'high').length,
+    mediumConfidence: merged.filter((f) => f.confidence === 'medium').length,
+    lowConfidence: merged.filter((f) => f.confidence === 'low').length,
   };
 }
 
@@ -161,9 +161,9 @@ export function recalculateConfidenceStats(
   findings: CleanupFinding[],
   stats: CleanupReport['stats'],
 ): void {
-  stats.highConfidence = findings.filter(f => f.confidence === 'high').length;
-  stats.mediumConfidence = findings.filter(f => f.confidence === 'medium').length;
-  stats.lowConfidence = findings.filter(f => f.confidence === 'low').length;
-  stats.agreed = findings.filter(f => f.sources.length >= 2).length;
-  stats.disputed = findings.filter(f => f.disputed).length;
+  stats.highConfidence = findings.filter((f) => f.confidence === 'high').length;
+  stats.mediumConfidence = findings.filter((f) => f.confidence === 'medium').length;
+  stats.lowConfidence = findings.filter((f) => f.confidence === 'low').length;
+  stats.agreed = findings.filter((f) => f.sources.length >= 2).length;
+  stats.disputed = findings.filter((f) => f.disputed).length;
 }
