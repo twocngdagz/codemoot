@@ -1,12 +1,12 @@
 import { describe, expect, it } from 'vitest';
-import type { CleanupFinding } from '../../../src/types/cleanup.js';
 import {
-  mergeThreeWay,
-  mergeTwoWay,
   computeThreeWayStats,
   computeTwoWayStats,
+  mergeThreeWay,
+  mergeTwoWay,
   recalculateConfidenceStats,
 } from '../../../src/cleanup/merge.js';
+import type { CleanupFinding } from '../../../src/types/cleanup.js';
 
 function makeFinding(overrides: Partial<CleanupFinding> & { key: string }): CleanupFinding {
   return {
@@ -26,9 +26,27 @@ function makeFinding(overrides: Partial<CleanupFinding> & { key: string }): Clea
 
 describe('mergeThreeWay', () => {
   it('boosts confidence when all 3 sources agree', () => {
-    const det = [makeFinding({ key: 'deps:pkg.json:lodash', deterministicEvidence: ['unused'], sources: ['deterministic'] })];
-    const sem = [makeFinding({ key: 'deps:pkg.json:lodash', semanticEvidence: ['codex: unused'], sources: ['semantic'] })];
-    const host = [makeFinding({ key: 'deps:pkg.json:lodash', hostEvidence: ['host: unused'], sources: ['host'] })];
+    const det = [
+      makeFinding({
+        key: 'deps:pkg.json:lodash',
+        deterministicEvidence: ['unused'],
+        sources: ['deterministic'],
+      }),
+    ];
+    const sem = [
+      makeFinding({
+        key: 'deps:pkg.json:lodash',
+        semanticEvidence: ['codex: unused'],
+        sources: ['semantic'],
+      }),
+    ];
+    const host = [
+      makeFinding({
+        key: 'deps:pkg.json:lodash',
+        hostEvidence: ['host: unused'],
+        sources: ['host'],
+      }),
+    ];
 
     const merged = mergeThreeWay(det, sem, host);
 
@@ -39,8 +57,20 @@ describe('mergeThreeWay', () => {
   });
 
   it('boosts confidence when 2 of 3 agree', () => {
-    const det = [makeFinding({ key: 'deps:pkg.json:lodash', deterministicEvidence: ['unused'], sources: ['deterministic'] })];
-    const sem = [makeFinding({ key: 'deps:pkg.json:lodash', semanticEvidence: ['codex: unused'], sources: ['semantic'] })];
+    const det = [
+      makeFinding({
+        key: 'deps:pkg.json:lodash',
+        deterministicEvidence: ['unused'],
+        sources: ['deterministic'],
+      }),
+    ];
+    const sem = [
+      makeFinding({
+        key: 'deps:pkg.json:lodash',
+        semanticEvidence: ['codex: unused'],
+        sources: ['semantic'],
+      }),
+    ];
     const host: CleanupFinding[] = [];
 
     const merged = mergeThreeWay(det, sem, host);
@@ -53,7 +83,14 @@ describe('mergeThreeWay', () => {
 
   it('marks single-source findings as disputed but preserves original confidence', () => {
     const det: CleanupFinding[] = [];
-    const sem = [makeFinding({ key: 'deps:pkg.json:lodash', confidence: 'high', semanticEvidence: ['codex: unused'], sources: ['semantic'] })];
+    const sem = [
+      makeFinding({
+        key: 'deps:pkg.json:lodash',
+        confidence: 'high',
+        semanticEvidence: ['codex: unused'],
+        sources: ['semantic'],
+      }),
+    ];
     const host: CleanupFinding[] = [];
 
     const merged = mergeThreeWay(det, sem, host);
@@ -65,7 +102,9 @@ describe('mergeThreeWay', () => {
   });
 
   it('merges evidence from all sources', () => {
-    const det = [makeFinding({ key: 'k', deterministicEvidence: ['det-ev'], sources: ['deterministic'] })];
+    const det = [
+      makeFinding({ key: 'k', deterministicEvidence: ['det-ev'], sources: ['deterministic'] }),
+    ];
     const sem = [makeFinding({ key: 'k', semanticEvidence: ['sem-ev'], sources: ['semantic'] })];
     const host = [makeFinding({ key: 'k', hostEvidence: ['host-ev'], sources: ['host'] })];
 
@@ -82,8 +121,20 @@ describe('mergeThreeWay', () => {
   });
 
   it('normalizes keys with backslashes and ./ prefixes', () => {
-    const det = [makeFinding({ key: 'deps:src\\utils.ts:lodash', deterministicEvidence: ['unused'], sources: ['deterministic'] })];
-    const host = [makeFinding({ key: 'deps:./src/utils.ts:lodash', hostEvidence: ['host: unused'], sources: ['host'] })];
+    const det = [
+      makeFinding({
+        key: 'deps:src\\utils.ts:lodash',
+        deterministicEvidence: ['unused'],
+        sources: ['deterministic'],
+      }),
+    ];
+    const host = [
+      makeFinding({
+        key: 'deps:./src/utils.ts:lodash',
+        hostEvidence: ['host: unused'],
+        sources: ['host'],
+      }),
+    ];
 
     const merged = mergeThreeWay(det, [], host);
 
@@ -94,7 +145,14 @@ describe('mergeThreeWay', () => {
   });
 
   it('does not leak cross-source evidence into new entries', () => {
-    const sem = [makeFinding({ key: 'a', semanticEvidence: ['sem-ev'], deterministicEvidence: ['should-not-leak'], sources: ['semantic'] })];
+    const sem = [
+      makeFinding({
+        key: 'a',
+        semanticEvidence: ['sem-ev'],
+        deterministicEvidence: ['should-not-leak'],
+        sources: ['semantic'],
+      }),
+    ];
 
     const merged = mergeThreeWay([], sem, []);
 
@@ -110,7 +168,7 @@ describe('mergeThreeWay', () => {
     const merged = mergeThreeWay(det, sem, host);
 
     expect(merged).toHaveLength(4); // a, b, c, d
-    const keys = merged.map(f => f.key).sort();
+    const keys = merged.map((f) => f.key).sort();
     expect(keys).toEqual(['a', 'b', 'c', 'd']);
   });
 });
@@ -166,7 +224,17 @@ describe('recalculateConfidenceStats', () => {
       makeFinding({ key: 'c', confidence: 'medium' }),
       makeFinding({ key: 'd', confidence: 'low' }),
     ];
-    const stats = { deterministic: 0, semantic: 0, host: 0, agreed: 0, disputed: 0, adjudicated: 0, highConfidence: 0, mediumConfidence: 0, lowConfidence: 0 };
+    const stats = {
+      deterministic: 0,
+      semantic: 0,
+      host: 0,
+      agreed: 0,
+      disputed: 0,
+      adjudicated: 0,
+      highConfidence: 0,
+      mediumConfidence: 0,
+      lowConfidence: 0,
+    };
 
     recalculateConfidenceStats(findings, stats);
 

@@ -1,7 +1,7 @@
-import { describe, expect, it, beforeEach } from 'vitest';
+import type Database from 'better-sqlite3';
+import { beforeEach, describe, expect, it } from 'vitest';
 import { openDatabase } from '../../../src/memory/database.js';
 import { JobStore } from '../../../src/memory/job-store.js';
-import type Database from 'better-sqlite3';
 
 describe('JobStore', () => {
   let db: Database.Database;

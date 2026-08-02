@@ -138,6 +138,15 @@ const countersSchema = z.object({
     )
     .default([]),
   pendingDecision: z.enum(HUMAN_DECISION_ACTIONS).optional(),
+  // Human-authorised token-budget extensions. The frozen limits stay frozen; a grant is an
+  // ADDITIVE, separately recorded allowance, so the contract a workflow started under is
+  // still legible next to what a human later permitted.
+  budgetGrants: z
+    .object({
+      inputTokens: z.number().int().nonnegative(),
+      outputTokens: z.number().int().nonnegative(),
+    })
+    .default({ inputTokens: 0, outputTokens: 0 }),
 });
 
 type Clock = () => Date;
@@ -156,7 +165,12 @@ export class ReviewWorkflowRunnerStore {
     readonly limits?: RunnerConfig;
   }): RunnerState {
     const now = this.timestamp();
-    const counters: RunnerCounters = { batch: null, completedOrdinals: [], completedBatches: [] };
+    const counters: RunnerCounters = {
+      batch: null,
+      completedOrdinals: [],
+      completedBatches: [],
+      budgetGrants: { inputTokens: 0, outputTokens: 0 },
+    };
     this.db
       .prepare(
         `INSERT INTO review_workflow_runner_state (
@@ -286,6 +300,42 @@ export class ReviewWorkflowRunnerStore {
       )
       .run(...values, workflowId);
     return this.require(workflowId);
+  }
+
+  /**
+   * Records a HUMAN-authorised token-budget extension.
+   *
+   * The per-workflow limits are frozen at start precisely so an agent cannot quietly widen
+   * its own allowance, and that must stay true. But the default proved structurally wrong
+   * for real plans — one plan review of a large batch used 1.5M input tokens against a
+   * 750k per-BATCH budget — and a frozen limit plus a configuration hash that covers the
+   * whole file left no way to continue except discarding the work and starting over.
+   *
+   * So the grant is additive and separate: the frozen contract stays readable next to what
+   * a human later permitted, and the actor and rationale land in the immutable runner log.
+   */
+  grantBudget(input: {
+    readonly workflowId: string;
+    readonly inputTokens: number;
+    readonly outputTokens: number;
+    readonly actor: string;
+    readonly rationale: string;
+  }): { readonly inputTokens: number; readonly outputTokens: number } {
+    const state = this.require(input.workflowId);
+    const granted = {
+      inputTokens: state.counters.budgetGrants.inputTokens + input.inputTokens,
+      outputTokens: state.counters.budgetGrants.outputTokens + input.outputTokens,
+    };
+    this.update(input.workflowId, {
+      counters: { ...state.counters, budgetGrants: granted },
+    });
+    this.appendLog({
+      workflowId: input.workflowId,
+      entryType: 'DECISION',
+      message: `Token budget extended by ${input.actor}: +${input.inputTokens} input, +${input.outputTokens} output`,
+      payload: { granted, rationale: input.rationale, actor: input.actor },
+    });
+    return granted;
   }
 
   appendLog(entry: {

@@ -2,12 +2,21 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { Debouncer, type FlushBatch } from '../src/watch/debouncer.js';
 
 describe('Debouncer', () => {
-  beforeEach(() => { vi.useFakeTimers(); });
-  afterEach(() => { vi.useRealTimers(); });
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
 
   it('flushes after quiet period', () => {
     const batches: FlushBatch[] = [];
-    const d = new Debouncer((b) => batches.push(b), { quietMs: 100, maxWaitMs: 5000, cooldownMs: 0, maxBatchSize: 50 });
+    const d = new Debouncer((b) => batches.push(b), {
+      quietMs: 100,
+      maxWaitMs: 5000,
+      cooldownMs: 0,
+      maxBatchSize: 50,
+    });
 
     d.push({ path: 'a.ts', event: 'change', ts: Date.now() });
     expect(batches).toHaveLength(0);
@@ -21,7 +30,12 @@ describe('Debouncer', () => {
 
   it('resets quiet timer on new event', () => {
     const batches: FlushBatch[] = [];
-    const d = new Debouncer((b) => batches.push(b), { quietMs: 100, maxWaitMs: 5000, cooldownMs: 0, maxBatchSize: 50 });
+    const d = new Debouncer((b) => batches.push(b), {
+      quietMs: 100,
+      maxWaitMs: 5000,
+      cooldownMs: 0,
+      maxBatchSize: 50,
+    });
 
     d.push({ path: 'a.ts', event: 'change', ts: Date.now() });
     vi.advanceTimersByTime(80);
@@ -37,7 +51,12 @@ describe('Debouncer', () => {
 
   it('force flushes at maxWait', () => {
     const batches: FlushBatch[] = [];
-    const d = new Debouncer((b) => batches.push(b), { quietMs: 200, maxWaitMs: 500, cooldownMs: 0, maxBatchSize: 50 });
+    const d = new Debouncer((b) => batches.push(b), {
+      quietMs: 200,
+      maxWaitMs: 500,
+      cooldownMs: 0,
+      maxBatchSize: 50,
+    });
 
     // Keep pushing events every 100ms to prevent quiet flush
     for (let i = 0; i < 10; i++) {
@@ -53,7 +72,12 @@ describe('Debouncer', () => {
 
   it('flushes at maxBatchSize', () => {
     const batches: FlushBatch[] = [];
-    const d = new Debouncer((b) => batches.push(b), { quietMs: 1000, maxWaitMs: 5000, cooldownMs: 0, maxBatchSize: 3 });
+    const d = new Debouncer((b) => batches.push(b), {
+      quietMs: 1000,
+      maxWaitMs: 5000,
+      cooldownMs: 0,
+      maxBatchSize: 3,
+    });
 
     d.push({ path: 'a.ts', event: 'change', ts: Date.now() });
     d.push({ path: 'b.ts', event: 'change', ts: Date.now() });
@@ -69,7 +93,12 @@ describe('Debouncer', () => {
   it('respects cooldown period', () => {
     const batches: FlushBatch[] = [];
     const now = Date.now();
-    const d = new Debouncer((b) => batches.push(b), { quietMs: 50, maxWaitMs: 5000, cooldownMs: 200, maxBatchSize: 50 });
+    const d = new Debouncer((b) => batches.push(b), {
+      quietMs: 50,
+      maxWaitMs: 5000,
+      cooldownMs: 200,
+      maxBatchSize: 50,
+    });
 
     d.push({ path: 'a.ts', event: 'change', ts: now });
     vi.advanceTimersByTime(50);
@@ -83,7 +112,12 @@ describe('Debouncer', () => {
 
   it('deduplicates same file in batch', () => {
     const batches: FlushBatch[] = [];
-    const d = new Debouncer((b) => batches.push(b), { quietMs: 100, maxWaitMs: 5000, cooldownMs: 0, maxBatchSize: 50 });
+    const d = new Debouncer((b) => batches.push(b), {
+      quietMs: 100,
+      maxWaitMs: 5000,
+      cooldownMs: 0,
+      maxBatchSize: 50,
+    });
 
     d.push({ path: 'a.ts', event: 'change', ts: Date.now() });
     d.push({ path: 'a.ts', event: 'change', ts: Date.now() });
@@ -97,7 +131,12 @@ describe('Debouncer', () => {
 
   it('cancel clears pending', () => {
     const batches: FlushBatch[] = [];
-    const d = new Debouncer((b) => batches.push(b), { quietMs: 100, maxWaitMs: 5000, cooldownMs: 0, maxBatchSize: 50 });
+    const d = new Debouncer((b) => batches.push(b), {
+      quietMs: 100,
+      maxWaitMs: 5000,
+      cooldownMs: 0,
+      maxBatchSize: 50,
+    });
 
     d.push({ path: 'a.ts', event: 'change', ts: Date.now() });
     expect(d.getPendingCount()).toBe(1);
@@ -112,7 +151,12 @@ describe('Debouncer', () => {
 
   it('flushNow triggers manual flush', () => {
     const batches: FlushBatch[] = [];
-    const d = new Debouncer((b) => batches.push(b), { quietMs: 5000, maxWaitMs: 50000, cooldownMs: 0, maxBatchSize: 50 });
+    const d = new Debouncer((b) => batches.push(b), {
+      quietMs: 5000,
+      maxWaitMs: 50000,
+      cooldownMs: 0,
+      maxBatchSize: 50,
+    });
 
     d.push({ path: 'a.ts', event: 'change', ts: Date.now() });
     d.flushNow();

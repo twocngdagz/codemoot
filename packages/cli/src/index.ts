@@ -56,6 +56,7 @@ import {
   reviewWorkflowDiscardDraftsCommand,
   reviewWorkflowEventsCommand,
   reviewWorkflowExportCommand,
+  reviewWorkflowGrantBudgetCommand,
   reviewWorkflowJobsCancelCommand,
   reviewWorkflowJobsListCommand,
   reviewWorkflowJobsRunCommand,
@@ -477,6 +478,21 @@ reviewWorkflow
   )
   .option('--id <workflow-id>', 'Explicit workflow ID')
   .action(reviewWorkflowRunCommand);
+
+reviewWorkflow
+  .command('grant-budget')
+  .description("Extend a running workflow's token budget (human-authorised, immutably logged)")
+  .argument('<workflow-id>', 'Review workflow ID')
+  .option('--input-tokens <n>', 'Additional input tokens per batch', positiveInteger)
+  .option('--output-tokens <n>', 'Additional output tokens per batch', positiveInteger)
+  .option('--actor <name>', 'Granting human')
+  .requiredOption('--rationale <text>', 'Why the budget is being extended')
+  .action(
+    (
+      workflowId: string,
+      options: { inputTokens?: number; outputTokens?: number; actor?: string; rationale: string },
+    ) => reviewWorkflowGrantBudgetCommand(workflowId, options),
+  );
 
 reviewWorkflow
   .command('discard-drafts')

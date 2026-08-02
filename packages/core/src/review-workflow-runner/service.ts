@@ -1072,13 +1072,15 @@ export class AutonomousWorkflowRunner {
         `Batch ${batch.ordinal} used ${batchTotals.invocations} agent invocations (max ${limits.maxAgentInvocationsPerBatch})`,
       );
     }
-    if (
-      batchTotals.inputTokens >= limits.maxInputTokensPerBatch ||
-      batchTotals.outputTokens >= limits.maxOutputTokensPerBatch
-    ) {
+    // The frozen limit is the contract; a human grant extends it EXPLICITLY and additively,
+    // exactly as FIX_AGAIN extends a review round. Nothing an agent does can raise either.
+    const grants = this.store.require(workflowId).counters.budgetGrants;
+    const inputBudget = limits.maxInputTokensPerBatch + grants.inputTokens;
+    const outputBudget = limits.maxOutputTokensPerBatch + grants.outputTokens;
+    if (batchTotals.inputTokens >= inputBudget || batchTotals.outputTokens >= outputBudget) {
       throw new RunnerStop(
         'TOKEN_BUDGET_REACHED',
-        `Batch ${batch.ordinal} token budget exhausted (input ${batchTotals.inputTokens}, output ${batchTotals.outputTokens})`,
+        `Batch ${batch.ordinal} token budget exhausted (input ${batchTotals.inputTokens}/${inputBudget}, output ${batchTotals.outputTokens}/${outputBudget}). Extend it with: codemoot workflow grant-budget ${workflowId} --input-tokens <n> --rationale "..."`,
       );
     }
   }

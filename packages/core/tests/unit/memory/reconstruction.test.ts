@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { buildReconstructionPrompt } from '../../../src/memory/reconstruction.js';
 import type { DebateMessageRow } from '../../../src/memory/message-store.js';
+import { buildReconstructionPrompt } from '../../../src/memory/reconstruction.js';
 
 function makeMsg(overrides: Partial<DebateMessageRow> & { round: number }): DebateMessageRow {
   return {

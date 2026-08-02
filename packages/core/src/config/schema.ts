@@ -160,8 +160,18 @@ export const reviewGatedAutonomousConfigSchema = z.object({
   maxBatchRuntimeMinutes: z.number().int().min(1).max(10_080).default(240),
   maxWorkflowRuntimeMinutes: z.number().int().min(1).max(20_160).default(1440),
   maxConsecutiveNoProgressActions: z.number().int().min(1).max(10).default(2),
-  maxInputTokensPerBatch: z.number().int().min(1).default(500_000),
-  maxOutputTokensPerBatch: z.number().int().min(1).default(100_000),
+  // Measured, not guessed. On a real ten-batch plan the MEDIAN invocation used ~1.3M input
+  // tokens and not one of fourteen came in under 750k — one plan review alone used 1.5M,
+  // twice the entire per-batch budget the old default allowed. At 16 invocations per batch
+  // the old 500k ceiling could not accommodate a single realistic call, so every
+  // substantial plan hit TOKEN_BUDGET_REACHED at its first plan review, after paying for
+  // refinement in full.
+  //
+  // Note these count CACHE READS at full weight, so they track context volume rather than
+  // spend — that same fourteen-call run cost $36.98 against 17.6M input tokens. The real
+  // cost guard is maxCostUsdPerWorkflow; these bound runaway context growth.
+  maxInputTokensPerBatch: z.number().int().min(1).default(25_000_000),
+  maxOutputTokensPerBatch: z.number().int().min(1).default(2_000_000),
   maxCostUsdPerWorkflow: z.number().positive().finite().default(25),
   heartbeatIntervalSeconds: z.number().int().min(5).max(300).default(30),
   heartbeatExpirySeconds: z.number().int().min(30).max(3600).default(120),

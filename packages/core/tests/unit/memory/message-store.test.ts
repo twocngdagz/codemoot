@@ -1,7 +1,7 @@
-import { describe, expect, it, beforeEach } from 'vitest';
+import type Database from 'better-sqlite3';
+import { beforeEach, describe, expect, it } from 'vitest';
 import { openDatabase } from '../../../src/memory/database.js';
 import { MessageStore, parseDebateVerdict } from '../../../src/memory/message-store.js';
-import type Database from 'better-sqlite3';
 
 describe('MessageStore', () => {
   let db: Database.Database;
@@ -157,8 +157,10 @@ describe('MessageStore', () => {
       store.markRunning(id);
 
       // Force updated_at to be old
-      db.prepare('UPDATE debate_messages SET updated_at = ? WHERE id = ?')
-        .run(Date.now() - 600_000, id);
+      db.prepare('UPDATE debate_messages SET updated_at = ? WHERE id = ?').run(
+        Date.now() - 600_000,
+        id,
+      );
 
       const count = store.recoverStale(300_000); // 5 min threshold
       expect(count).toBe(1);

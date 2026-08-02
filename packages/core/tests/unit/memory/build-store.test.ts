@@ -1,8 +1,8 @@
 // tests/unit/memory/build-store.test.ts
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { BuildStore, openDatabase } from '../../../src/memory/index.js';
 import type Database from 'better-sqlite3';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { BuildStore, openDatabase } from '../../../src/memory/index.js';
 
 describe('BuildStore', () => {
   let db: Database.Database;
@@ -57,8 +57,11 @@ describe('BuildStore', () => {
     it('filters by status', () => {
       store.create({ buildId: 'b1', task: 'task 1' });
       store.create({ buildId: 'b2', task: 'task 2' });
-      store.updateWithEvent('b1', { status: 'completed', completedAt: Date.now() },
-        { eventType: 'phase_transition', actor: 'system', phase: 'done' });
+      store.updateWithEvent(
+        'b1',
+        { status: 'completed', completedAt: Date.now() },
+        { eventType: 'phase_transition', actor: 'system', phase: 'done' },
+      );
       const list = store.list({ status: 'completed' });
       expect(list).toHaveLength(1);
       expect(list[0].buildId).toBe('b1');
@@ -76,9 +79,15 @@ describe('BuildStore', () => {
   describe('updateWithEvent', () => {
     it('atomically updates run and appends event', () => {
       store.create({ buildId: 'b1', task: 'task' });
-      store.updateWithEvent('b1',
+      store.updateWithEvent(
+        'b1',
         { status: 'implementing', currentPhase: 'plan_approved', planVersion: 1 },
-        { eventType: 'plan_approved', actor: 'claude', phase: 'debate', payload: { plan: 'do stuff' } },
+        {
+          eventType: 'plan_approved',
+          actor: 'claude',
+          phase: 'debate',
+          payload: { plan: 'do stuff' },
+        },
       );
 
       const run = store.get('b1');
@@ -97,12 +106,21 @@ describe('BuildStore', () => {
 
     it('increments seq monotonically', () => {
       store.create({ buildId: 'b1', task: 'task' });
-      store.updateWithEvent('b1', {},
-        { eventType: 'debate_started', actor: 'system', phase: 'debate' });
-      store.updateWithEvent('b1', {},
-        { eventType: 'debate_converged', actor: 'system', phase: 'debate' });
-      store.updateWithEvent('b1', {},
-        { eventType: 'plan_approved', actor: 'claude', phase: 'debate' });
+      store.updateWithEvent(
+        'b1',
+        {},
+        { eventType: 'debate_started', actor: 'system', phase: 'debate' },
+      );
+      store.updateWithEvent(
+        'b1',
+        {},
+        { eventType: 'debate_converged', actor: 'system', phase: 'debate' },
+      );
+      store.updateWithEvent(
+        'b1',
+        {},
+        { eventType: 'plan_approved', actor: 'claude', phase: 'debate' },
+      );
 
       const events = store.getEvents('b1');
       expect(events.map((e) => e.seq)).toEqual([1, 2, 3]);
@@ -110,14 +128,18 @@ describe('BuildStore', () => {
 
     it('throws for nonexistent build', () => {
       expect(() =>
-        store.updateWithEvent('nonexistent', {},
-          { eventType: 'error', actor: 'system', phase: 'debate' }),
+        store.updateWithEvent(
+          'nonexistent',
+          {},
+          { eventType: 'error', actor: 'system', phase: 'debate' },
+        ),
       ).toThrow('Build not found');
     });
 
     it('updates phase cursor', () => {
       store.create({ buildId: 'b1', task: 'task' });
-      store.updateWithEvent('b1',
+      store.updateWithEvent(
+        'b1',
         { currentPhase: 'review', currentLoop: 2 },
         { eventType: 'review_requested', actor: 'codex', phase: 'review', loopIndex: 2 },
       );
@@ -132,9 +154,21 @@ describe('BuildStore', () => {
   describe('getEvents', () => {
     it('returns events after a given seq', () => {
       store.create({ buildId: 'b1', task: 'task' });
-      store.updateWithEvent('b1', {}, { eventType: 'debate_started', actor: 'system', phase: 'debate' });
-      store.updateWithEvent('b1', {}, { eventType: 'debate_converged', actor: 'system', phase: 'debate' });
-      store.updateWithEvent('b1', {}, { eventType: 'plan_approved', actor: 'claude', phase: 'debate' });
+      store.updateWithEvent(
+        'b1',
+        {},
+        { eventType: 'debate_started', actor: 'system', phase: 'debate' },
+      );
+      store.updateWithEvent(
+        'b1',
+        {},
+        { eventType: 'debate_converged', actor: 'system', phase: 'debate' },
+      );
+      store.updateWithEvent(
+        'b1',
+        {},
+        { eventType: 'plan_approved', actor: 'claude', phase: 'debate' },
+      );
 
       const after1 = store.getEvents('b1', 1);
       expect(after1).toHaveLength(2);
@@ -147,7 +181,11 @@ describe('BuildStore', () => {
       store.create({ buildId: 'b1', task: 'task' });
       store.updateWithEvent('b1', {}, { eventType: 'bug_found', actor: 'codex', phase: 'review' });
       store.updateWithEvent('b1', {}, { eventType: 'bug_found', actor: 'codex', phase: 'review' });
-      store.updateWithEvent('b1', {}, { eventType: 'fix_completed', actor: 'claude', phase: 'fix' });
+      store.updateWithEvent(
+        'b1',
+        {},
+        { eventType: 'fix_completed', actor: 'claude', phase: 'fix' },
+      );
 
       expect(store.countEventsByType('b1', 'bug_found')).toBe(2);
       expect(store.countEventsByType('b1', 'fix_completed')).toBe(1);
@@ -158,13 +196,25 @@ describe('BuildStore', () => {
   describe('codex session tracking', () => {
     it('stores separate plan and review sessions', () => {
       store.create({ buildId: 'b1', task: 'task' });
-      store.updateWithEvent('b1',
+      store.updateWithEvent(
+        'b1',
         { planCodexSession: 'thread-plan-1' },
-        { eventType: 'debate_started', actor: 'codex', phase: 'debate', codexThreadId: 'thread-plan-1' },
+        {
+          eventType: 'debate_started',
+          actor: 'codex',
+          phase: 'debate',
+          codexThreadId: 'thread-plan-1',
+        },
       );
-      store.updateWithEvent('b1',
+      store.updateWithEvent(
+        'b1',
         { reviewCodexSession: 'thread-review-1' },
-        { eventType: 'review_requested', actor: 'codex', phase: 'review', codexThreadId: 'thread-review-1' },
+        {
+          eventType: 'review_requested',
+          actor: 'codex',
+          phase: 'review',
+          codexThreadId: 'thread-review-1',
+        },
       );
 
       const run = store.get('b1');

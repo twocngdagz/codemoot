@@ -1,17 +1,17 @@
 // tests/unit/cleanup/scanners.test.ts
 
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdirSync, writeFileSync, rmSync } from 'node:fs';
-import { join } from 'node:path';
-import { tmpdir } from 'node:os';
 import { randomUUID } from 'node:crypto';
+import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
+  runAllScanners,
+  scanDeadCode,
+  scanDuplicates,
+  scanHardcoded,
   scanUnusedDeps,
   scanUnusedExports,
-  scanHardcoded,
-  scanDuplicates,
-  scanDeadCode,
-  runAllScanners,
 } from '../../../src/cleanup/index.js';
 
 function createTmpDir(): string {
@@ -29,14 +29,22 @@ function writeFile(dir: string, path: string, content: string): void {
 describe('scanUnusedDeps', () => {
   let dir: string;
 
-  beforeEach(() => { dir = createTmpDir(); });
-  afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
+  beforeEach(() => {
+    dir = createTmpDir();
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
 
   it('finds unused dependency', () => {
-    writeFile(dir, 'package.json', JSON.stringify({
-      name: 'test-pkg',
-      dependencies: { lodash: '^4.0.0', chalk: '^5.0.0' },
-    }));
+    writeFile(
+      dir,
+      'package.json',
+      JSON.stringify({
+        name: 'test-pkg',
+        dependencies: { lodash: '^4.0.0', chalk: '^5.0.0' },
+      }),
+    );
     writeFile(dir, 'src/index.ts', "import chalk from 'chalk';\nconsole.log(chalk.red('hi'));");
 
     const findings = scanUnusedDeps(dir);
@@ -47,10 +55,14 @@ describe('scanUnusedDeps', () => {
   });
 
   it('returns empty for all-used deps', () => {
-    writeFile(dir, 'package.json', JSON.stringify({
-      name: 'test-pkg',
-      dependencies: { chalk: '^5.0.0' },
-    }));
+    writeFile(
+      dir,
+      'package.json',
+      JSON.stringify({
+        name: 'test-pkg',
+        dependencies: { chalk: '^5.0.0' },
+      }),
+    );
     writeFile(dir, 'src/index.ts', "import chalk from 'chalk';");
 
     const findings = scanUnusedDeps(dir);
@@ -59,30 +71,38 @@ describe('scanUnusedDeps', () => {
 
   it('scans monorepo packages', () => {
     writeFile(dir, 'package.json', JSON.stringify({ name: 'root', dependencies: {} }));
-    writeFile(dir, 'packages/foo/package.json', JSON.stringify({
-      name: '@test/foo',
-      dependencies: { zod: '^3.0.0', yaml: '^2.0.0' },
-    }));
+    writeFile(
+      dir,
+      'packages/foo/package.json',
+      JSON.stringify({
+        name: '@test/foo',
+        dependencies: { zod: '^3.0.0', yaml: '^2.0.0' },
+      }),
+    );
     writeFile(dir, 'packages/foo/src/index.ts', "import { z } from 'zod';");
 
     const findings = scanUnusedDeps(dir);
-    expect(findings.some(f => f.description.includes('yaml'))).toBe(true);
-    expect(findings.some(f => f.description.includes('zod'))).toBe(false);
+    expect(findings.some((f) => f.description.includes('yaml'))).toBe(true);
+    expect(findings.some((f) => f.description.includes('zod'))).toBe(false);
   });
 });
 
 describe('scanUnusedExports', () => {
   let dir: string;
 
-  beforeEach(() => { dir = createTmpDir(); });
-  afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
+  beforeEach(() => {
+    dir = createTmpDir();
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
 
   it('finds unused export', () => {
     writeFile(dir, 'src/utils.ts', 'export function used() {}\nexport function unused() {}');
     writeFile(dir, 'src/main.ts', "import { used } from './utils.js';");
 
     const findings = scanUnusedExports(dir);
-    expect(findings.some(f => f.description.includes('unused'))).toBe(true);
+    expect(findings.some((f) => f.description.includes('unused'))).toBe(true);
   });
 
   it('skips index files (barrel exports)', () => {
@@ -91,7 +111,7 @@ describe('scanUnusedExports', () => {
 
     const findings = scanUnusedExports(dir);
     // index.ts should be skipped, foo is re-exported
-    const indexFindings = findings.filter(f => f.file.includes('index'));
+    const indexFindings = findings.filter((f) => f.file.includes('index'));
     expect(indexFindings).toHaveLength(0);
   });
 });
@@ -99,21 +119,25 @@ describe('scanUnusedExports', () => {
 describe('scanHardcoded', () => {
   let dir: string;
 
-  beforeEach(() => { dir = createTmpDir(); });
-  afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
+  beforeEach(() => {
+    dir = createTmpDir();
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
 
   it('finds hardcoded URLs', () => {
     writeFile(dir, 'src/api.ts', 'const endpoint = "https://api.example.com/v1";');
 
     const findings = scanHardcoded(dir);
-    expect(findings.some(f => f.description.includes('URL'))).toBe(true);
+    expect(findings.some((f) => f.description.includes('URL'))).toBe(true);
   });
 
   it('skips test files for magic numbers', () => {
     writeFile(dir, 'tests/math.test.ts', 'expect(result).toBe(12345);');
 
     const findings = scanHardcoded(dir);
-    const magicFindings = findings.filter(f => f.description.includes('Magic number'));
+    const magicFindings = findings.filter((f) => f.description.includes('Magic number'));
     expect(magicFindings).toHaveLength(0);
   });
 
@@ -121,7 +145,7 @@ describe('scanHardcoded', () => {
     writeFile(dir, 'src/config.ts', 'const MAX_RETRIES = 500;');
 
     const findings = scanHardcoded(dir);
-    const magicFindings = findings.filter(f => f.description.includes('500'));
+    const magicFindings = findings.filter((f) => f.description.includes('500'));
     expect(magicFindings).toHaveLength(0);
   });
 });
@@ -129,8 +153,12 @@ describe('scanHardcoded', () => {
 describe('scanDuplicates', () => {
   let dir: string;
 
-  beforeEach(() => { dir = createTmpDir(); });
-  afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
+  beforeEach(() => {
+    dir = createTmpDir();
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
 
   it('finds duplicate function bodies', () => {
     const body = `
@@ -159,42 +187,62 @@ describe('scanDuplicates', () => {
 describe('scanDeadCode', () => {
   let dir: string;
 
-  beforeEach(() => { dir = createTmpDir(); });
-  afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
+  beforeEach(() => {
+    dir = createTmpDir();
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
 
   it('finds unused internal function', () => {
-    writeFile(dir, 'src/utils.ts', `
+    writeFile(
+      dir,
+      'src/utils.ts',
+      `
 export function publicFn() { return helper(); }
 function helper() { return 42; }
 function neverCalled() { return 0; }
-`);
+`,
+    );
 
     const findings = scanDeadCode(dir);
-    expect(findings.some(f => f.description.includes('neverCalled'))).toBe(true);
-    expect(findings.some(f => f.description.includes('helper'))).toBe(false);
+    expect(findings.some((f) => f.description.includes('neverCalled'))).toBe(true);
+    expect(findings.some((f) => f.description.includes('helper'))).toBe(false);
   });
 });
 
 describe('runAllScanners', () => {
   let dir: string;
 
-  beforeEach(() => { dir = createTmpDir(); });
-  afterEach(() => { rmSync(dir, { recursive: true, force: true }); });
+  beforeEach(() => {
+    dir = createTmpDir();
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
 
   it('runs selected scopes only', () => {
-    writeFile(dir, 'package.json', JSON.stringify({ name: 'test', dependencies: { unused: '1.0' } }));
+    writeFile(
+      dir,
+      'package.json',
+      JSON.stringify({ name: 'test', dependencies: { unused: '1.0' } }),
+    );
     writeFile(dir, 'src/index.ts', 'console.log("hi");');
 
     const findings = runAllScanners(dir, ['deps']);
-    expect(findings.every(f => f.scope === 'deps')).toBe(true);
+    expect(findings.every((f) => f.scope === 'deps')).toBe(true);
   });
 
   it('returns deterministic sort order', () => {
-    writeFile(dir, 'package.json', JSON.stringify({ name: 'test', dependencies: { aaa: '1.0', zzz: '1.0' } }));
+    writeFile(
+      dir,
+      'package.json',
+      JSON.stringify({ name: 'test', dependencies: { aaa: '1.0', zzz: '1.0' } }),
+    );
     writeFile(dir, 'src/index.ts', '');
 
     const findings = runAllScanners(dir, ['deps']);
-    const keys = findings.map(f => f.key);
+    const keys = findings.map((f) => f.key);
     const sorted = [...keys].sort();
     expect(keys).toEqual(sorted);
   });

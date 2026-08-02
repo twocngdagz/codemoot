@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest';
-import { getReviewPreset, listPresetNames, REVIEW_PRESETS } from '../../../src/config/review-presets.js';
+import {
+  REVIEW_PRESETS,
+  getReviewPreset,
+  listPresetNames,
+} from '../../../src/config/review-presets.js';
 
 describe('review presets', () => {
   it('has 5 built-in presets', () => {

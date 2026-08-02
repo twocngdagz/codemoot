@@ -1,7 +1,7 @@
-import { describe, expect, it, beforeEach } from 'vitest';
+import type Database from 'better-sqlite3';
+import { beforeEach, describe, expect, it } from 'vitest';
 import { openDatabase } from '../../../src/memory/database.js';
 import { SessionManager } from '../../../src/memory/unified-session.js';
-import type Database from 'better-sqlite3';
 
 describe('SessionManager', () => {
   let db: Database.Database;
@@ -43,7 +43,9 @@ describe('SessionManager', () => {
       const id1 = mgr.create('first');
       const id2 = mgr.create('second');
       // Force id2 to have a later updated_at
-      db.prepare('UPDATE codemoot_sessions SET updated_at = updated_at + 1000 WHERE id = ?').run(id2);
+      db.prepare('UPDATE codemoot_sessions SET updated_at = updated_at + 1000 WHERE id = ?').run(
+        id2,
+      );
       const active = mgr.getActive();
       expect(active?.id).toBe(id2);
     });
@@ -148,7 +150,7 @@ describe('SessionManager', () => {
       mgr.create('c');
       const list = mgr.list();
       expect(list).toHaveLength(3);
-      const names = list.map(s => s.name).sort();
+      const names = list.map((s) => s.name).sort();
       expect(names).toEqual(['a', 'b', 'c']);
     });
 
@@ -184,9 +186,9 @@ describe('SessionManager', () => {
       const events = mgr.getEvents(sessionId);
       expect(events).toHaveLength(2);
       // Both events exist, check by finding them (ordering may be same-ms)
-      const commands = events.map(e => e.command).sort();
+      const commands = events.map((e) => e.command).sort();
       expect(commands).toEqual(['debate', 'review']);
-      const reviewEvent = events.find(e => e.command === 'review');
+      const reviewEvent = events.find((e) => e.command === 'review');
       expect(reviewEvent?.codexThreadId).toBe('thread_xyz');
     });
   });

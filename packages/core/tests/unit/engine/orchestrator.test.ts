@@ -64,14 +64,14 @@ const testConfig: ProjectConfig = {
     'codex-architect': {
       provider: 'openai',
       model: 'gpt-5.3-codex',
-        maxTokens: 4096,
+      maxTokens: 4096,
       temperature: 0.7,
       timeout: 120,
     },
     'codex-reviewer': {
       provider: 'openai',
       model: 'gpt-5.3-codex',
-        maxTokens: 4096,
+      maxTokens: 4096,
       temperature: 0.7,
       timeout: 120,
     },
@@ -719,7 +719,7 @@ describe('Orchestrator', () => {
       mockRegistry.getModelConfig.mockReturnValue({
         provider: 'openai' as const,
         model: 'gpt-5.3-codex',
-            maxTokens: 4096,
+        maxTokens: 4096,
         temperature: 0.7,
         timeout: 30000,
       });

@@ -88,7 +88,12 @@ describe('DebateStore', () => {
       thread: [],
       runningSummary: 'summary here',
       stanceHistory: [],
-      usage: { totalPromptTokens: 100, totalCompletionTokens: 50, totalCalls: 4, startedAt: Date.now() },
+      usage: {
+        totalPromptTokens: 100,
+        totalCompletionTokens: 50,
+        totalCalls: 4,
+        startedAt: Date.now(),
+      },
       status: 'running',
       sessionIds: { codex: 'thread-xyz' },
       resumeStats: { attempted: 2, succeeded: 1, fallbacks: 1 },
@@ -133,9 +138,10 @@ describe('DebateStore', () => {
     store.upsert({ debateId: 'd1', role: 'critic' });
 
     // Manually set last_activity to 2 hours ago
-    db.prepare(
-      'UPDATE debate_turns SET last_activity_at = ? WHERE debate_id = ?',
-    ).run(Date.now() - 2 * 60 * 60 * 1000, 'd1');
+    db.prepare('UPDATE debate_turns SET last_activity_at = ? WHERE debate_id = ?').run(
+      Date.now() - 2 * 60 * 60 * 1000,
+      'd1',
+    );
 
     const count = store.markStale(60 * 60 * 1000); // 1 hour threshold
     expect(count).toBe(1);
@@ -150,9 +156,11 @@ describe('DebateStore', () => {
     store.upsert({ debateId: 'd1', role: 'critic', status: 'stale' });
 
     // Set to 31 days ago
-    db.prepare(
-      'UPDATE debate_turns SET last_activity_at = ?, status = ? WHERE debate_id = ?',
-    ).run(Date.now() - 31 * 24 * 60 * 60 * 1000, 'stale', 'd1');
+    db.prepare('UPDATE debate_turns SET last_activity_at = ?, status = ? WHERE debate_id = ?').run(
+      Date.now() - 31 * 24 * 60 * 60 * 1000,
+      'stale',
+      'd1',
+    );
 
     const count = store.markExpired(30 * 24 * 60 * 60 * 1000); // 30 day threshold
     expect(count).toBe(1);

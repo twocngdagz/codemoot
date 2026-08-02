@@ -1,5 +1,5 @@
-import { describe, expect, it } from 'vitest';
 import { Command, Option } from 'commander';
+import { describe, expect, it } from 'vitest';
 
 function createShipitCommand() {
   const program = new Command();
@@ -17,9 +17,9 @@ function createShipitCommand() {
 describe('shipit command', () => {
   it('registers with profile choices', () => {
     const program = createShipitCommand();
-    const shipit = program.commands.find(c => c.name() === 'shipit');
+    const shipit = program.commands.find((c) => c.name() === 'shipit');
     expect(shipit).toBeDefined();
-    const opts = shipit?.options.map(o => o.long);
+    const opts = shipit?.options.map((o) => o.long);
     expect(opts).toContain('--profile');
     expect(opts).toContain('--dry-run');
     expect(opts).toContain('--json');
@@ -27,8 +27,8 @@ describe('shipit command', () => {
 
   it('defaults to safe profile', () => {
     const program = createShipitCommand();
-    const shipit = program.commands.find(c => c.name() === 'shipit');
-    const profileOpt = shipit?.options.find(o => o.long === '--profile');
+    const shipit = program.commands.find((c) => c.name() === 'shipit');
+    const profileOpt = shipit?.options.find((o) => o.long === '--profile');
     expect(profileOpt?.defaultValue).toBe('safe');
   });
 });

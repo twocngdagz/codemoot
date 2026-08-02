@@ -105,6 +105,12 @@ export interface RunnerCounters {
   completedBatches: RunnerBatchSummary[];
   /** Set by an explicit human decision; consumed once by the resumed run. */
   pendingDecision?: HumanDecisionAction;
+  /**
+   * Human-authorised, additive token-budget extensions. The frozen per-workflow limits are
+   * never edited — a grant sits beside them, so the contract the workflow started under
+   * stays legible next to what a human later permitted.
+   */
+  budgetGrants: { inputTokens: number; outputTokens: number };
 }
 
 /**

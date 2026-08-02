@@ -1,11 +1,11 @@
 import { describe, expect, it } from 'vitest';
+import type { DebateMessageRow } from '../../../src/memory/message-store.js';
 import {
-  estimateTokens,
   calculateDebateTokens,
+  estimateTokens,
   getTokenBudgetStatus,
   preflightTokenCheck,
 } from '../../../src/memory/token-budget.js';
-import type { DebateMessageRow } from '../../../src/memory/message-store.js';
 
 function makeMsg(overrides: Partial<DebateMessageRow> & { round: number }): DebateMessageRow {
   return {

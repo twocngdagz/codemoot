@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { shouldIgnore, loadIgnorePatterns } from '../../../src/config/ignore.js';
+import { loadIgnorePatterns, shouldIgnore } from '../../../src/config/ignore.js';
 
 describe('shouldIgnore', () => {
   const patterns = ['node_modules', '.git', 'dist', '*.db', '.env', '.env.*'];

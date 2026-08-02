@@ -160,10 +160,17 @@ export async function reviewWorkflowStatusCommand(workflowId: string): Promise<v
         stopReason: reconciled.stopReason ?? null,
         stopDetails: reconciled.stopDetails ?? null,
         pendingDecision: reconciled.counters.pendingDecision ?? null,
+        budgetGrants: reconciled.counters.budgetGrants,
         lastCheckpoint: reconciled.lastCheckpoint ?? null,
         nextAction:
+          // A decision is consumed by the resume it authorises, so HUMAN_DECISION_REQUIRED
+          // means "decide" only when none is already pending. Reading the status alone, the
+          // two are indistinguishable without this — which is how a stop that had already
+          // been decided was told to decide again.
           reconciled.status === 'HUMAN_DECISION_REQUIRED'
-            ? `codemoot workflow decide ${workflowId} --action <fix_again|accept_risk|cancel> --rationale "..."`
+            ? reconciled.counters.pendingDecision === undefined
+              ? `codemoot workflow decide ${workflowId} --action <fix_again|accept_risk|cancel> --rationale "..."`
+              : `codemoot workflow run-resume ${workflowId} --background   (a ${reconciled.counters.pendingDecision} decision is pending and unconsumed)`
             : reconciled.status === 'PAUSED_BY_USER' || reconciled.status === 'PAUSE_REQUESTED'
               ? `codemoot workflow resume ${workflowId} --background`
               : reconciled.status === 'RUNNING'
@@ -4551,6 +4558,58 @@ export async function reviewWorkflowDiscardDraftsCommand(
       remainingOrdinals: runtime.store.workflowStore
         .listRefinementDrafts(workflowId)
         .map((entry) => entry.ordinal),
+    });
+  });
+}
+
+/**
+ * Extends a RUNNING workflow's token budget by explicit human authorisation.
+ *
+ * Limits are frozen into runner state at workflow start so an agent cannot quietly widen
+ * its own allowance, and editing `.cowork.yml` cannot help either: the configuration hash
+ * covers the whole file, so any edit invalidates the role assignments and blocks resume.
+ * Both are deliberate. Together they left no way to continue a workflow that hit a budget
+ * which turned out to be structurally too small — the only option was to discard the work
+ * and start over.
+ *
+ * This is the sanctioned escape: additive, human-only, and recorded in the immutable runner
+ * log with actor and rationale. The frozen contract is never edited, so what the workflow
+ * started under stays legible beside what a human later permitted.
+ */
+export async function reviewWorkflowGrantBudgetCommand(
+  workflowId: string,
+  options: {
+    readonly inputTokens?: number;
+    readonly outputTokens?: number;
+    readonly actor?: string;
+    readonly rationale: string;
+  },
+): Promise<void> {
+  await withDatabase(async (db) => {
+    const runtime = createRuntime(db, process.cwd());
+    if (options.inputTokens === undefined && options.outputTokens === undefined) {
+      throw new Error('Grant at least one of --input-tokens or --output-tokens');
+    }
+    const granted = runtime.runnerStore.grantBudget({
+      workflowId,
+      inputTokens: options.inputTokens ?? 0,
+      outputTokens: options.outputTokens ?? 0,
+      actor: options.actor ?? 'human-owner',
+      rationale: options.rationale,
+    });
+    const state = runtime.runnerStore.require(workflowId);
+    const limits = state.limits;
+    printJson({
+      workflowId,
+      granted,
+      effectiveBudget:
+        limits === undefined
+          ? null
+          : {
+              inputTokens: limits.maxInputTokensPerBatch + granted.inputTokens,
+              outputTokens: limits.maxOutputTokensPerBatch + granted.outputTokens,
+            },
+      resume: `codemoot workflow run-resume ${workflowId} --background`,
     });
   });
 }
