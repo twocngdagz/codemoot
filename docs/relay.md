@@ -57,8 +57,18 @@ codemoot relay resume <run-id> --decision proceed    # advance as-is
 
 ## Pause and resume
 
-Stopping is graceful: Ctrl-C finishes the current call, records it, and exits. Resume needs
-no ceremony —
+```bash
+codemoot relay pause <run-id>                # graceful: current call finishes, then stop
+codemoot relay pause <run-id> --after-batch  # stop exactly when the current batch is accepted
+```
+
+`pause` signals the pid recorded in the run's own lease — never a pattern match (a watcher
+once pgrep'd the run id, matched its own command line, and signalled itself). The intent is
+also written durably, so a lost signal still stops the loop at its next call boundary, and
+`--after-batch` is intent only: the loop honours it exactly at the batch's acceptance, a
+boundary no external poll can reliably hit. Ctrl-C on a foreground worker does the same
+graceful stop. Every RESPONSE in the transcript records **which model** produced it, so
+mid-run model or vendor swaps stay visible in the audit. Resume needs no ceremony —
 
 ```bash
 codemoot relay resume <run-id>

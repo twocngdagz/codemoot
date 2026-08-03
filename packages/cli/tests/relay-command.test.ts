@@ -4,7 +4,7 @@
 // the event log alone is enough to resume from any interruption, with no ceremony.
 
 import { execFileSync, spawn } from 'node:child_process';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -13,6 +13,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   countPlanBatches,
   parseVerdict,
+  relayPauseCommand,
   relayResumeCommand,
   relayRunCommand,
 } from '../src/commands/relay.js';
@@ -685,6 +686,117 @@ describe('codemoot relay (real command, two scripted models)', () => {
     expect(eventCount).toBe(0);
   });
 
+  it('relay pause signals the LEASE pid — never a pattern-matched one', async () => {
+    // The trap this replaces: an operator's watcher ran pgrep -f "<run-id>", matched its
+    // OWN command line, signalled itself, and the run advanced through the boundary they
+    // meant to stop at. The pause command resolves the worker from the lease.
+    writeFileSync(implFile, JSON.stringify(['b1.']));
+    writeFileSync(revFile, JSON.stringify(['no verdict here']));
+    await relayRunCommand({ plan: 'plan.md', id: 'relay-pausable' });
+
+    // A stand-in worker that records receiving SIGINT — and announces when its handler is
+    // actually installed, because 'spawn' fires before a single line of its JS has run and
+    // a signal delivered into that gap takes the default action instead of the handler.
+    const marker = join(projectDir, 'sigint-received');
+    const ready = join(projectDir, 'holder-ready');
+    const holder = spawn(
+      process.execPath,
+      [
+        '-e',
+        `const fs = require('node:fs'); process.on('SIGINT', () => { fs.writeFileSync(${JSON.stringify(marker)}, 'yes'); process.exit(0); }); fs.writeFileSync(${JSON.stringify(ready)}, 'up'); setTimeout(() => {}, 30000);`,
+      ],
+      { stdio: 'ignore' },
+    );
+    const readyDeadline = Date.now() + 3_000;
+    while (!existsSync(ready) && Date.now() < readyDeadline) {
+      await new Promise((resolveWait) => setTimeout(resolveWait, 25));
+    }
+    expect(existsSync(ready)).toBe(true);
+    try {
+      const db = openDatabase(getDbPath());
+      db.prepare(
+        'UPDATE relay_runs SET worker_pid = ?, worker_started_at = ? WHERE run_id = ?',
+      ).run(holder.pid, new Date().toISOString(), 'relay-pausable');
+      db.close();
+
+      await relayPauseCommand('relay-pausable', {});
+      const printed = JSON.parse(String(logSpy.mock.calls.at(-1)?.[0])) as {
+        status: string;
+        workerPid: number;
+      };
+      expect(printed.status).toBe('PAUSE_REQUESTED');
+      expect(printed.workerPid).toBe(holder.pid);
+      // The signal reached the LEASE pid.
+      const deadline = Date.now() + 3_000;
+      while (!existsSync(marker) && Date.now() < deadline) {
+        await new Promise((resolveWait) => setTimeout(resolveWait, 50));
+      }
+      expect(existsSync(marker)).toBe(true);
+      // And the durable intent is written as the belt for a lost signal.
+      const check = openDatabase(getDbPath());
+      const intent = check
+        .prepare('SELECT pause_intent FROM relay_runs WHERE run_id = ?')
+        .get('relay-pausable') as { pause_intent: string | null };
+      check.close();
+      expect(intent.pause_intent).toBe('NEXT_BOUNDARY');
+    } finally {
+      holder.kill('SIGKILL');
+    }
+  });
+
+  it('pause with a dead or absent worker reports honestly and clears the stale lease', async () => {
+    writeFileSync(implFile, JSON.stringify(['b1.']));
+    writeFileSync(revFile, JSON.stringify(['no verdict here']));
+    await relayRunCommand({ plan: 'plan.md', id: 'relay-pause-idle' });
+    await relayPauseCommand('relay-pause-idle', {});
+    const printed = JSON.parse(String(logSpy.mock.calls.at(-1)?.[0])) as { status: string };
+    expect(printed.status).toBe('NOT_RUNNING');
+  });
+
+  it('--after-batch stops EXACTLY when the batch is accepted — a deterministic boundary', async () => {
+    // Polling can never land between two events written in the same instant; recorded
+    // intent is honoured by the loop itself, at the advance, deterministically.
+    writeFileSync(implFile, JSON.stringify(['Did batch 1.', 'Did batch 2.']));
+    writeFileSync(
+      revFile,
+      JSON.stringify([`__DELAY:1500:${FINDINGS}VERDICT: PROCEED`, `${FINDINGS}VERDICT: COMPLETE`]),
+    );
+    const running = relayRunCommand({ plan: 'plan.md', id: 'relay-afterbatch' });
+    // While the batch-1 review is held open by the fake's delay, schedule the pause.
+    const deadline = Date.now() + 5_000;
+    let scheduled = false;
+    while (!scheduled && Date.now() < deadline) {
+      const db = openDatabase(getDbPath());
+      const exists = db
+        .prepare(
+          "SELECT COUNT(*) n FROM relay_events WHERE run_id = 'relay-afterbatch' AND role = 'REVIEWER' AND kind = 'PROMPT'",
+        )
+        .get() as { n: number };
+      if (exists.n > 0) {
+        db.prepare(
+          "UPDATE relay_runs SET pause_intent = 'BATCH_END' WHERE run_id = 'relay-afterbatch'",
+        ).run();
+        scheduled = true;
+      }
+      db.close();
+      if (!scheduled) await new Promise((resolveWait) => setTimeout(resolveWait, 50));
+    }
+    expect(scheduled).toBe(true);
+    await running;
+
+    const status = printedStatus();
+    expect(status.status).toBe('STOPPED');
+    expect(status.batch).toBe(2); // batch 1 accepted, batch 2 NOT opened
+    const log = events('relay-afterbatch');
+    expect(log.some((e) => e.content.includes('Operator pause honoured: batch 1 finished'))).toBe(
+      true,
+    );
+    expect(log.filter((e) => e.batch === 2 && e.kind === 'PROMPT')).toHaveLength(0);
+
+    await relayResumeCommand('relay-afterbatch', {});
+    expect(printedStatus().status).toBe('COMPLETE');
+  });
+
   it('records the whole exchange — the transcript is the audit', async () => {
     writeFileSync(implFile, JSON.stringify(['b1.', 'b2.']));
     writeFileSync(
@@ -696,5 +808,16 @@ describe('codemoot relay (real command, two scripted models)', () => {
     // Every call is two entries: the exact prompt sent, the exact reply received.
     expect(log.filter((e) => e.kind === 'PROMPT')).toHaveLength(4);
     expect(log.filter((e) => e.kind === 'RESPONSE')).toHaveLength(4);
+    // And every response names the MODEL that produced it — the audit fact two live
+    // vendor swaps proved the transcript was missing.
+    const db = openDatabase(getDbPath());
+    const models = db
+      .prepare(
+        "SELECT DISTINCT role, model FROM relay_events WHERE run_id = 'relay-audit' AND kind = 'RESPONSE'",
+      )
+      .all() as { role: string; model: string | null }[];
+    db.close();
+    expect(models.find((m) => m.role === 'IMPLEMENTER')?.model).toBe('claude-opus-5');
+    expect(models.find((m) => m.role === 'REVIEWER')?.model).toBe('claude-fable-5');
   });
 });

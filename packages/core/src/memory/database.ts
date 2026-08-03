@@ -7,7 +7,7 @@ import {
   REVIEW_WORKFLOW_RUNNER_STATE_DDL,
 } from './review-workflow-schema.js';
 
-const SCHEMA_VERSION = '20';
+const SCHEMA_VERSION = '21';
 
 const MIGRATIONS = [
   // Sessions
@@ -414,12 +414,25 @@ export function runMigrations(db: Database.Database): void {
       'worker_started_at TEXT',
       'implementer_session_kind TEXT',
       'reviewer_session_kind TEXT',
+      // v21: a durable operator pause intent. SIGINT means "after the current call" and
+      // requires finding the worker pid by hand — an operator's pgrep matched its own
+      // command line, signalled itself, and the run advanced through a boundary they
+      // meant to stop at. Intent recorded in the row is honoured by the loop instead.
+      'pause_intent TEXT',
     ]) {
       try {
         db.exec(`ALTER TABLE relay_runs ADD COLUMN ${column}`);
       } catch {
         // Column already exists
       }
+    }
+    // v21: the transcript records WHICH MODEL produced each response. A live run swapped
+    // implementer (claude-opus-5 → claude-fable-5) and reviewer (claude-fable-5 →
+    // gpt-5.6-sol) mid-run, and nothing in the audit showed either seam.
+    try {
+      db.exec('ALTER TABLE relay_events ADD COLUMN model TEXT');
+    } catch {
+      // Column already exists
     }
 
     // v15: the runner-state status CHECK gained pause states and the paused-repo column.

@@ -254,6 +254,7 @@ function appendEvent(
     kind: RelayEvent['kind'];
     content: string;
     sessionId?: string;
+    model?: string;
     inputTokens?: number;
     outputTokens?: number;
     durationMs?: number;
@@ -261,8 +262,8 @@ function appendEvent(
 ): void {
   db.prepare(
     `INSERT INTO relay_events
-       (run_id, batch, cycle, role, kind, content, session_id, input_tokens, output_tokens, duration_ms, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       (run_id, batch, cycle, role, kind, content, session_id, model, input_tokens, output_tokens, duration_ms, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     run.runId,
     run.batch,
@@ -271,6 +272,7 @@ function appendEvent(
     event.kind,
     event.content,
     event.sessionId ?? null,
+    event.model ?? null,
     event.inputTokens ?? null,
     event.outputTokens ?? null,
     event.durationMs ?? null,
@@ -360,7 +362,7 @@ function claimRelayWorker(db: RelayDb, runId: string): void {
   // serialize in SQLite and the loser sees zero changed rows.
   const claimed = db
     .prepare(
-      `UPDATE relay_runs SET worker_pid = ?, worker_started_at = ?
+      `UPDATE relay_runs SET worker_pid = ?, worker_started_at = ?, pause_intent = NULL
        WHERE run_id = ? AND (worker_pid IS ? OR worker_pid = ?)`,
     )
     .run(process.pid, new Date().toISOString(), runId, holder, process.pid);
@@ -369,6 +371,26 @@ function claimRelayWorker(db: RelayDb, runId: string): void {
       `Run ${runId} was claimed by another process at the same moment; not starting a second worker.`,
     );
   }
+}
+
+type PauseIntent = 'NEXT_BOUNDARY' | 'BATCH_END';
+
+/**
+ * Deliberately read fresh from the row each time, and deliberately NOT part of RelayRun /
+ * updateRun: the intent is written by a CONCURRENT operator command while the worker's
+ * in-memory run object is stale, and updateRun writing that stale copy back would silently
+ * erase the pause the operator just asked for.
+ */
+function readPauseIntent(db: RelayDb, runId: string): PauseIntent | null {
+  const row = db.prepare('SELECT pause_intent FROM relay_runs WHERE run_id = ?').get(runId) as
+    | { pause_intent: string | null }
+    | undefined;
+  const value = row?.pause_intent ?? null;
+  return value === 'NEXT_BOUNDARY' || value === 'BATCH_END' ? value : null;
+}
+
+function writePauseIntent(db: RelayDb, runId: string, intent: PauseIntent | null): void {
+  db.prepare('UPDATE relay_runs SET pause_intent = ? WHERE run_id = ?').run(intent, runId);
 }
 
 /** Releases only OUR OWN claim — a newer holder's lease is never clobbered. */
@@ -481,6 +503,9 @@ async function callRole(
     kind: 'RESPONSE',
     content: call.text,
     ...(newSession == null ? {} : { sessionId: newSession }),
+    // Which model said this — the audit fact a transcript exists to carry. Two vendor
+    // swaps happened on one live run and its own log showed neither seam.
+    model: call.model,
     inputTokens: call.usage.inputTokens,
     outputTokens: call.usage.outputTokens,
     durationMs: Date.now() - startedAt,
@@ -630,6 +655,18 @@ function advanceBatch(context: RelayContext, run: RelayRun): boolean {
     kind: 'NOTE',
     content: `Advanced to batch ${run.batch}/${run.totalBatches}`,
   });
+  // "Stop when this batch finishes" — honoured exactly at the finish, deterministically,
+  // instead of an operator racing a poll against two events written in the same instant.
+  if (readPauseIntent(context.db, run.runId) === 'BATCH_END') {
+    writePauseIntent(context.db, run.runId, null);
+    pause(
+      context,
+      run,
+      'STOPPED',
+      `Operator pause honoured: batch ${run.batch - 1} finished (next up: batch ${run.batch}). Resume with: codemoot relay resume ${run.runId}`,
+    );
+    return false;
+  }
   return true;
 }
 
@@ -640,6 +677,13 @@ async function runLoop(context: RelayContext, run: RelayRun): Promise<void> {
     for (;;) {
       if (context.stopRequested()) {
         pause(context, run, 'STOPPED', 'Stopped by operator between calls.');
+        return;
+      }
+      // Durable operator intent — the signal-free pause. Honoured here, between calls,
+      // which is the only boundary a poll can never reliably land on from outside.
+      if (readPauseIntent(context.db, run.runId) === 'NEXT_BOUNDARY') {
+        writePauseIntent(context.db, run.runId, null);
+        pause(context, run, 'STOPPED', 'Operator pause honoured at the call boundary.');
         return;
       }
       // The implementer prompt for a NEW batch is issued here rather than inside step() so
@@ -984,6 +1028,101 @@ export async function relayResumeCommand(
   });
 }
 
+export async function relayPauseCommand(
+  runId: string,
+  options: { readonly afterBatch?: boolean },
+): Promise<void> {
+  await withDatabase(async (db) => {
+    const run = getRun(db, runId);
+    if (run === null) throw new Error(`Relay run ${runId} does not exist`);
+    const row = db.prepare('SELECT worker_pid FROM relay_runs WHERE run_id = ?').get(runId) as {
+      worker_pid: number | null;
+    };
+    const holder = row.worker_pid;
+    const holderAlive = holder !== null && pidAlive(holder);
+
+    if (!holderAlive) {
+      // A dead holder's lease is stale bookkeeping; clear it so the report is honest.
+      if (holder !== null) {
+        db.prepare(
+          'UPDATE relay_runs SET worker_pid = NULL, worker_started_at = NULL WHERE run_id = ? AND worker_pid = ?',
+        ).run(runId, holder);
+      }
+      console.log(
+        JSON.stringify(
+          {
+            status: 'NOT_RUNNING',
+            runId,
+            note:
+              holder === null
+                ? 'No worker holds this run; there is nothing to pause.'
+                : `Worker ${holder} is already dead; stale lease cleared. Nothing to pause.`,
+            resume: `codemoot relay resume ${runId}`,
+          },
+          null,
+          2,
+        ),
+      );
+      return;
+    }
+
+    if (options.afterBatch === true) {
+      // Intent only — no signal. A signal would stop EARLIER than what was asked for; the
+      // loop honours BATCH_END exactly when the current batch is accepted.
+      writePauseIntent(db, runId, 'BATCH_END');
+      console.log(
+        JSON.stringify(
+          {
+            status: 'PAUSE_SCHEDULED',
+            runId,
+            workerPid: holder,
+            note: `Worker ${holder} will stop when batch ${run.batch} finishes.`,
+          },
+          null,
+          2,
+        ),
+      );
+      return;
+    }
+
+    // Default: graceful stop after the current call. The signal goes to the pid the LEASE
+    // records — never to a pgrep pattern, which is how an operator's watcher once matched
+    // its own command line, signalled itself, and the run sailed through the boundary they
+    // meant to stop at. The intent is written as well, so even a lost signal still stops
+    // the loop at its next boundary.
+    writePauseIntent(db, runId, 'NEXT_BOUNDARY');
+    try {
+      process.kill(holder, 'SIGINT');
+    } catch {
+      console.log(
+        JSON.stringify(
+          {
+            status: 'PAUSE_SCHEDULED',
+            runId,
+            note: `Worker ${holder} died as the pause was sent; the durable intent stops any successor at its next boundary.`,
+          },
+          null,
+          2,
+        ),
+      );
+      return;
+    }
+    console.log(
+      JSON.stringify(
+        {
+          status: 'PAUSE_REQUESTED',
+          runId,
+          workerPid: holder,
+          note: 'The worker finishes its current call, then stops. The intent is durable: even if the signal is lost, the loop stops at its next call boundary.',
+          watch: `codemoot relay status ${runId}`,
+        },
+        null,
+        2,
+      ),
+    );
+  });
+}
+
 export async function relayStatusCommand(runId: string): Promise<void> {
   await withDatabase(async (db) => {
     printRelayStatus(db, runId);
@@ -997,15 +1136,16 @@ export async function relayLogCommand(
   await withDatabase(async (db) => {
     const rows = db
       .prepare(
-        `SELECT event_id, batch, cycle, role, kind, content, input_tokens, output_tokens, duration_ms, created_at
+        `SELECT event_id, batch, cycle, role, kind, content, model, input_tokens, output_tokens, duration_ms, created_at
          FROM relay_events WHERE run_id = ? ORDER BY event_id`,
       )
       .all(runId) as Record<string, unknown>[];
     for (const row of rows) {
       const content = String(row.content);
       const body = options.full === true ? content : content.split('\n')[0]?.slice(0, 160);
+      const model = row.model == null ? '' : ` [${row.model}]`;
       console.log(
-        `#${row.event_id} b${row.batch}c${row.cycle} ${String(row.role).padEnd(11)} ${String(row.kind).padEnd(8)} ${body}`,
+        `#${row.event_id} b${row.batch}c${row.cycle} ${String(row.role).padEnd(11)} ${String(row.kind).padEnd(8)}${model} ${body}`,
       );
     }
   });
@@ -1029,6 +1169,7 @@ function printRelayStatus(db: RelayDb, runId: string): void {
         totalBatches: run.totalBatches,
         cycle: run.cycle,
         maxCycles: run.maxCycles,
+        pauseIntent: readPauseIntent(db, runId),
         calls: totals.calls,
         inputTokens: totals.input,
         outputTokens: totals.output,

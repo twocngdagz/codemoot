@@ -37,6 +37,7 @@ import {
 import { planGenerateCommand, planReviewCommand } from './commands/plan.js';
 import {
   relayLogCommand,
+  relayPauseCommand,
   relayResumeCommand,
   relayRunCommand,
   relayStatusCommand,
@@ -844,6 +845,13 @@ relay
   )
   .option('--background', 'Resume detached; stdout/stderr go to .cowork/relay/<run-id>.log')
   .action(relayResumeCommand);
+
+relay
+  .command('pause')
+  .description('Stop the worker gracefully: after the current call, or after the current batch')
+  .argument('<run-id>', 'Relay run ID')
+  .option('--after-batch', 'Stop when the current batch is accepted, not before')
+  .action(relayPauseCommand);
 
 relay
   .command('status')
