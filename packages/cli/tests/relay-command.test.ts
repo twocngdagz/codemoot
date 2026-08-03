@@ -493,6 +493,76 @@ describe('codemoot relay (real command, two scripted models)', () => {
     expect(row.reviewer_session_kind).toBe('claude');
   });
 
+  it('an EMPTY legacy reply gets the full review prompt again, never the restate re-ask', async () => {
+    // The manufactured-verdict incident: a stalled reviewer was killed, a 0-char RESPONSE
+    // was recorded (pre-6c43d00), and the restate re-ask — "restate your conclusion" — ran
+    // in a fresh session with no memory of the batch. The model complied with the only
+    // thing asked of it: 72 characters, VERDICT: PROCEED, and the run advanced past an
+    // unreviewed batch. There was no conclusion to restate. Legacy rows still exist, so
+    // the path must refuse to restate what never happened.
+    const now = new Date().toISOString();
+    const db = openDatabase(getDbPath());
+    db.prepare(
+      `INSERT INTO relay_runs (run_id, plan_path, project_dir, total_batches, max_cycles, batch, cycle, status, pending, implementer_session, reviewer_session, created_at, updated_at)
+       VALUES ('relay-empty-legacy', ?, ?, 2, 3, 1, 1, 'PAUSED_UNCLEAR_VERDICT', NULL, NULL, 'legacy-session', ?, ?)`,
+    ).run(join(projectDir, 'plan.md'), projectDir, now, now);
+    const insertEvent = db.prepare(
+      `INSERT INTO relay_events (run_id, batch, cycle, role, kind, content, created_at)
+       VALUES ('relay-empty-legacy', 1, 1, ?, ?, ?, ?)`,
+    );
+    insertEvent.run('IMPLEMENTER', 'PROMPT', 'Work on Batch 1', now);
+    insertEvent.run('IMPLEMENTER', 'RESPONSE', 'Did batch 1.', now);
+    insertEvent.run('REVIEWER', 'PROMPT', 'FULL-REVIEW-PROMPT-MARKER verify batch 1', now);
+    insertEvent.run('REVIEWER', 'RESPONSE', '', now);
+    db.close();
+
+    writeFileSync(implFile, JSON.stringify(['Did batch 2.']));
+    writeFileSync(revFile, JSON.stringify(['ok\nVERDICT: PROCEED', 'ok\nVERDICT: COMPLETE']));
+    await relayResumeCommand('relay-empty-legacy', {});
+    expect(printedStatus().status).toBe('COMPLETE');
+
+    const log = events('relay-empty-legacy');
+    const reAsk = log.filter((e) => e.role === 'REVIEWER' && e.kind === 'PROMPT')[1];
+    // The FULL prompt was re-sent — not the restate re-ask an amnesiac would answer blind.
+    expect(reAsk?.content).toContain('FULL-REVIEW-PROMPT-MARKER');
+    expect(reAsk?.content).not.toContain('did not end with a clear VERDICT');
+    expect(
+      log.some(
+        (e) =>
+          e.role === 'RELAY' && e.kind === 'NOTE' && e.content.includes('no conclusion to restate'),
+      ),
+    ).toBe(true);
+  });
+
+  it('a CLEARED session also forbids the restate — memory of the review is gone', async () => {
+    // A substantive-but-verdictless reply is only restatable by the session that wrote it.
+    // After a vendor swap clears the session, "restate your conclusion" lands on a model
+    // that never reviewed anything — the same manufactured-verdict trap by another door.
+    writeFileSync(implFile, JSON.stringify(['Did batch 1.', 'Did batch 2.']));
+    writeFileSync(
+      revFile,
+      JSON.stringify([
+        'thorough findings, forgot the line',
+        'ok\nVERDICT: PROCEED',
+        'ok\nVERDICT: COMPLETE',
+      ]),
+    );
+    await relayRunCommand({ plan: 'plan.md', id: 'relay-noses' });
+    expect(printedStatus().status).toBe('PAUSED_UNCLEAR_VERDICT');
+    const db = openDatabase(getDbPath());
+    db.prepare(
+      "UPDATE relay_runs SET reviewer_session = NULL, reviewer_session_kind = NULL WHERE run_id = 'relay-noses'",
+    ).run();
+    db.close();
+
+    await relayResumeCommand('relay-noses', {});
+    expect(printedStatus().status).toBe('COMPLETE');
+    const log = events('relay-noses');
+    const reAsk = log.filter((e) => e.role === 'REVIEWER' && e.kind === 'PROMPT')[1];
+    expect(reAsk?.content).not.toContain('did not end with a clear VERDICT');
+    expect(reAsk?.content).toContain('The implementer reports the following');
+  });
+
   it('records the whole exchange — the transcript is the audit', async () => {
     writeFileSync(implFile, JSON.stringify(['b1.', 'b2.']));
     writeFileSync(revFile, JSON.stringify(['ok\nVERDICT: PROCEED', 'ok\nVERDICT: COMPLETE']));

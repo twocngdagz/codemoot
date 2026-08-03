@@ -255,6 +255,30 @@ function appendEvent(
   );
 }
 
+/** The most recent event of one role and kind — e.g. the reviewer's last FULL prompt. */
+function lastEventOf(
+  db: RelayDb,
+  runId: string,
+  role: RelayEvent['role'],
+  kind: RelayEvent['kind'],
+): RelayEvent | null {
+  const row = db
+    .prepare(
+      `SELECT event_id, batch, cycle, role, kind, content FROM relay_events
+       WHERE run_id = ? AND role = ? AND kind = ? ORDER BY event_id DESC LIMIT 1`,
+    )
+    .get(runId, role, kind) as Record<string, unknown> | undefined;
+  if (row === undefined) return null;
+  return {
+    eventId: Number(row.event_id),
+    batch: Number(row.batch),
+    cycle: Number(row.cycle),
+    role: String(row.role) as RelayEvent['role'],
+    kind: String(row.kind) as RelayEvent['kind'],
+    content: String(row.content),
+  };
+}
+
 function lastEvent(db: RelayDb, runId: string): RelayEvent | null {
   const row = db
     .prepare(
@@ -766,11 +790,37 @@ export async function relayResumeCommand(
         // stacking a second re-ask on top.
         const last = lastEvent(db, runId);
         if (last !== null && last.kind === 'RESPONSE') {
+          // The restate re-ask presumes a review HAPPENED and only its verdict line was
+          // malformed. That presumption has two prerequisites, and both must hold:
+          //   1. the reply actually said something (a legacy zero-length RESPONSE has
+          //      nothing to restate), and
+          //   2. the reviewer session still exists (a fresh session has no memory of the
+          //      batch — asked only to "restate your conclusion", it will oblige by
+          //      INVENTING one; a live run advanced past an unreviewed batch on a
+          //      72-character manufactured PROCEED exactly this way).
+          // When either fails, the honest re-ask is the ORIGINAL full review prompt.
+          const restatable = last.content.trim().length > 0 && run.reviewerSession !== null;
           // Same stale-field shape as the cycle-cap branch: the re-ask is the run being
           // active again, and the row must say so before the call, not after it returns.
           run.status = 'ACTIVE';
           updateRun(db, run);
-          await callRole(context, run, 'REVIEWER', unclearVerdictPrompt());
+          if (restatable) {
+            await callRole(context, run, 'REVIEWER', unclearVerdictPrompt());
+          } else {
+            const originalPrompt = lastEventOf(db, runId, 'REVIEWER', 'PROMPT');
+            if (originalPrompt === null) {
+              throw new Error(
+                `Run ${runId} is paused on an unclear verdict but has no reviewer prompt to re-send`,
+              );
+            }
+            appendEvent(db, run, {
+              role: 'RELAY',
+              kind: 'NOTE',
+              content:
+                'There is no conclusion to restate (empty reply or fresh reviewer session); re-sending the full review prompt instead of the restate re-ask',
+            });
+            await callRole(context, run, 'REVIEWER', originalPrompt.content);
+          }
         }
       }
 
