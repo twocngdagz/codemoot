@@ -25,7 +25,8 @@
 // the model its previous attempt may have been interrupted — and lets the intelligence
 // reconcile the working tree itself.
 
-import { readFileSync } from 'node:fs';
+import { spawn } from 'node:child_process';
+import { closeSync, mkdirSync, openSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import {
   ModelRegistry,
@@ -730,12 +731,41 @@ function buildContext(db: RelayDb, projectDir: string): RelayContext {
   };
 }
 
+/**
+ * Re-invokes this CLI detached: `codemoot relay <args>` in its own session, stderr and
+ * stdout to a log file under .cowork/relay/. The child inherits the FULL parent
+ * environment — the nohup workaround this replaces silently stripped PATH and USER, which
+ * cost a live run its first attempt — and the log file stays, because the relay's first
+ * real failure was diagnosed in two minutes precisely because nohup kept one.
+ */
+function spawnDetachedRelay(
+  projectDir: string,
+  runId: string,
+  args: readonly string[],
+): { readonly pid: number | null; readonly log: string } {
+  const entry = process.argv[1];
+  if (entry === undefined) throw new Error('Cannot resolve the CLI entry point');
+  const logDir = resolve(projectDir, '.cowork', 'relay');
+  mkdirSync(logDir, { recursive: true });
+  const log = resolve(logDir, `${runId}.log`);
+  const fd = openSync(log, 'a');
+  const child = spawn(process.execPath, [entry, 'relay', ...args], {
+    cwd: projectDir,
+    detached: true,
+    stdio: ['ignore', fd, fd],
+  });
+  child.unref();
+  closeSync(fd);
+  return { pid: child.pid ?? null, log };
+}
+
 export async function relayRunCommand(options: {
   readonly plan: string;
   readonly id?: string;
   readonly maxCycles?: number;
   readonly batches?: number;
   readonly startBatch?: number;
+  readonly background?: boolean;
 }): Promise<void> {
   await withDatabase(async (db) => {
     const projectDir = process.cwd();
@@ -762,6 +792,26 @@ export async function relayRunCommand(options: {
     process.stderr.write(
       `[relay] ${runId}: ${totalBatches} batches per the plan's own headings, cycle cap ${options.maxCycles ?? 3}\n`,
     );
+    if (options.background === true) {
+      // The row is durable; the detached child is just `relay resume` on a pristine run —
+      // the loop derives "open batch 1" from an empty event log, so run-in-background and
+      // resume share one worker path instead of two.
+      const worker = spawnDetachedRelay(projectDir, runId, ['resume', runId]);
+      console.log(
+        JSON.stringify(
+          {
+            status: 'RUNNING',
+            runId,
+            workerPid: worker.pid,
+            log: worker.log,
+            watch: `codemoot relay status ${runId}`,
+          },
+          null,
+          2,
+        ),
+      );
+      return;
+    }
     const context = buildContext(db, projectDir);
     const run = getRun(db, runId);
     if (run === null) throw new Error('run row vanished');
@@ -779,7 +829,10 @@ export async function relayRunCommand(options: {
 
 export async function relayResumeCommand(
   runId: string,
-  options: { readonly decision?: 'continue' | 'accept' | 'proceed' },
+  options: {
+    readonly decision?: 'continue' | 'accept' | 'proceed';
+    readonly background?: boolean;
+  },
 ): Promise<void> {
   await withDatabase(async (db) => {
     const run = getRun(db, runId);
@@ -803,6 +856,29 @@ export async function relayResumeCommand(
       throw new Error(
         `Batch ${run.batch} is paused at the cycle cap. Choose: --decision continue (one more review cycle) | accept (implementer applies the last feedback as final, then the batch advances) | proceed (advance as-is)`,
       );
+    }
+    if (options.background === true) {
+      // Validated above, claimed by the CHILD: the lease belongs to the process that
+      // actually works the run, so the parent must not take it and hand off.
+      const worker = spawnDetachedRelay(run.projectDir, runId, [
+        'resume',
+        runId,
+        ...(options.decision === undefined ? [] : ['--decision', options.decision]),
+      ]);
+      console.log(
+        JSON.stringify(
+          {
+            status: 'RESUMING',
+            runId,
+            workerPid: worker.pid,
+            log: worker.log,
+            watch: `codemoot relay status ${runId}`,
+          },
+          null,
+          2,
+        ),
+      );
+      return;
     }
     try {
       if (run.status === 'PAUSED_CYCLE_CAP') {

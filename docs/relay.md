@@ -8,8 +8,12 @@ phase, no contracts, no schemas, no criterion IDs, no coverage maps, no reservat
 token budgets.
 
 ```bash
-codemoot relay run --plan documentation/plan.md
+codemoot relay run --plan documentation/plan.md --background
 ```
+
+`--background` (on `run` and `resume`) detaches the worker with the full parent environment
+inherited and stdout/stderr in `.cowork/relay/<run-id>.log`; omit it to watch in the
+foreground.
 
 ## The loop
 

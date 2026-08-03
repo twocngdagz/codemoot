@@ -646,6 +646,45 @@ describe('codemoot relay (real command, two scripted models)', () => {
     ).toBe(true);
   });
 
+  it('--background creates the durable row, spawns a detached worker, and returns', async () => {
+    // The nohup workaround this replaces stripped PATH and USER from the child and cost a
+    // live run its first attempt. The detached child inherits the full environment and its
+    // output goes to a log file — the relay's first real failure was diagnosed from
+    // exactly such a log. The child here is a no-op entry (spawning the REAL argv[1] from
+    // inside vitest would launch a second test run), so this proves the parent's half:
+    // row first, spawn detached, print pid + log, return without looping.
+    const realEntry = process.argv[1];
+    process.argv[1] = fileURLToPath(new URL('./fixtures/noop-entry.mjs', import.meta.url));
+    try {
+      writeFileSync(implFile, JSON.stringify(['unused']));
+      writeFileSync(revFile, JSON.stringify(['unused']));
+      await relayRunCommand({ plan: 'plan.md', id: 'relay-bg', background: true });
+    } finally {
+      process.argv[1] = realEntry;
+    }
+    const printed = JSON.parse(String(logSpy.mock.calls.at(-1)?.[0])) as {
+      status: string;
+      workerPid: number | null;
+      log: string;
+    };
+    expect(printed.status).toBe('RUNNING');
+    expect(printed.workerPid).toBeGreaterThan(0);
+    expect(printed.log).toContain('.cowork/relay/relay-bg.log');
+    // The row is durable BEFORE the handoff — the child resumes a pristine run.
+    const db = openDatabase(getDbPath());
+    const row = db
+      .prepare('SELECT status, batch FROM relay_runs WHERE run_id = ?')
+      .get('relay-bg') as { status: string; batch: number };
+    const eventCount = (
+      db.prepare('SELECT COUNT(*) n FROM relay_events WHERE run_id = ?').get('relay-bg') as {
+        n: number;
+      }
+    ).n;
+    db.close();
+    expect(row.status).toBe('ACTIVE');
+    expect(eventCount).toBe(0);
+  });
+
   it('records the whole exchange — the transcript is the audit', async () => {
     writeFileSync(implFile, JSON.stringify(['b1.', 'b2.']));
     writeFileSync(

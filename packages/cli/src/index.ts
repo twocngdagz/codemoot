@@ -829,6 +829,7 @@ relay
     positiveInteger,
   )
   .option('--start-batch <n>', 'Start at this batch', positiveInteger)
+  .option('--background', 'Run detached; stdout/stderr go to .cowork/relay/<run-id>.log')
   .action(relayRunCommand);
 
 relay
@@ -841,6 +842,7 @@ relay
       'Required only at a cycle-cap pause: continue | accept | proceed',
     ).choices(['continue', 'accept', 'proceed']),
   )
+  .option('--background', 'Resume detached; stdout/stderr go to .cowork/relay/<run-id>.log')
   .action(relayResumeCommand);
 
 relay
