@@ -267,6 +267,20 @@ export class CliAdapter implements CliBridge {
       // Parse JSONL output
       const parsed = parseCodexJsonl(stdout);
 
+      // Codex handles SIGTERM as a GRACEFUL shutdown: it exits 0 having emitted
+      // thread.started and nothing else. That is a killed call, not an empty reply — and
+      // treating it as success once put a zero-length RESPONSE into a relay transcript, a
+      // turn that never happened. No agent message means no response happened.
+      if (!parsed.sawAgentMessage) {
+        const error = new ModelError(
+          `Codex CLI closed without an agent message (a killed or terminated process is a failed call, not an empty reply)`,
+          this.provider,
+          this.modelId,
+        );
+        error.partialOutput = { stdout, stderr: '' };
+        throw error;
+      }
+
       let output = parsed.text;
       if (Buffer.byteLength(output) > maxBytes) {
         output = Buffer.from(output).subarray(0, maxBytes).toString('utf-8') + TRUNCATION_MARKER;
@@ -636,10 +650,13 @@ export function parseCodexJsonl(stdout: string): {
   sessionId?: string;
   text: string;
   usage?: TokenUsage;
+  /** False when the stream contained NO agent message — a killed process, not a reply. */
+  sawAgentMessage: boolean;
 } {
   let sessionId: string | undefined;
   const textParts: string[] = [];
   let usage: TokenUsage | undefined;
+  let sawAgentMessage = false;
 
   for (const line of stdout.split('\n')) {
     const trimmed = line.trim();
@@ -652,12 +669,9 @@ export function parseCodexJsonl(stdout: string): {
         sessionId = event.thread_id;
       }
 
-      if (
-        event.type === 'item.completed' &&
-        event.item?.type === 'agent_message' &&
-        event.item.text
-      ) {
-        textParts.push(event.item.text);
+      if (event.type === 'item.completed' && event.item?.type === 'agent_message') {
+        sawAgentMessage = true;
+        if (event.item.text) textParts.push(event.item.text);
       }
 
       if (event.type === 'turn.completed' && event.usage) {
@@ -676,7 +690,7 @@ export function parseCodexJsonl(stdout: string): {
     }
   }
 
-  return { sessionId, text: textParts.join('\n'), usage };
+  return { sessionId, text: textParts.join('\n'), usage, sawAgentMessage };
 }
 
 export { MAX_OUTPUT_BYTES };

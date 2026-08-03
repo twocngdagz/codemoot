@@ -32,7 +32,11 @@ function codexConfig(idleTimeoutSeconds?: number): ModelConfig {
 }
 
 const CALL_OPTIONS = {
-  envAllowlist: ['CODEMOOT_FAKE_SILENT_MS', 'CODEMOOT_FAKE_IGNORE_SIGTERM'],
+  envAllowlist: [
+    'CODEMOOT_FAKE_SILENT_MS',
+    'CODEMOOT_FAKE_IGNORE_SIGTERM',
+    'CODEMOOT_FAKE_NO_MESSAGE',
+  ],
 };
 
 function pidAlive(pid: number): boolean {
@@ -49,7 +53,20 @@ describe('codex idleTimeout resolution', () => {
   afterEach(() => {
     delete process.env.CODEMOOT_FAKE_SILENT_MS;
     delete process.env.CODEMOOT_FAKE_IGNORE_SIGTERM;
+    delete process.env.CODEMOOT_FAKE_NO_MESSAGE;
   });
+
+  it('a clean exit with NO agent message is a FAILED call, not an empty reply', async () => {
+    // Codex handles SIGTERM as graceful shutdown: thread.started, nothing else, exit 0.
+    // parseCodexJsonl used to return that as a successful empty text, and a hand-killed
+    // reviewer became a zero-length RESPONSE in a relay transcript — a recorded turn that
+    // never happened.
+    process.env.CODEMOOT_FAKE_NO_MESSAGE = '1';
+    const adapter = createModelAdapter(codexConfig());
+    await expect(adapter.send('hello', CALL_OPTIONS)).rejects.toThrow(
+      /closed without an agent message/,
+    );
+  }, 15_000);
 
   it('actually KILLS the child it says it killed — even one that ignores SIGTERM', async () => {
     // The 42-minute zombie: codex was spawned without its own process group, so the

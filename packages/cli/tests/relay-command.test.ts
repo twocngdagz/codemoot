@@ -400,6 +400,52 @@ describe('codemoot relay (real command, two scripted models)', () => {
     expect(row.worker_pid).toBeNull();
   });
 
+  it('an empty reply is recorded as a FAILED call, never as a zero-length RESPONSE', async () => {
+    // A hand-killed codex once surfaced as a clean call with empty text, and the transcript
+    // gained a turn that never happened. The prompt must stay unanswered in the log, the
+    // failure must be a RELAY NOTE, and resume must re-send with the reconcile preface.
+    writeFileSync(implFile, JSON.stringify(['Did batch 1.', 'Did batch 2.']));
+    writeFileSync(revFile, JSON.stringify(['', 'ok\nVERDICT: PROCEED', 'ok\nVERDICT: COMPLETE']));
+    await relayRunCommand({ plan: 'plan.md', id: 'relay-empty' });
+    expect(printedStatus().status).toBe('STOPPED');
+
+    const log = events('relay-empty');
+    expect(log.some((e) => e.kind === 'RESPONSE' && e.content.trim().length === 0)).toBe(false);
+    expect(
+      log.some(
+        (e) => e.role === 'RELAY' && e.kind === 'NOTE' && e.content.includes('empty response'),
+      ),
+    ).toBe(true);
+
+    await relayResumeCommand('relay-empty', {});
+    expect(printedStatus().status).toBe('COMPLETE');
+  });
+
+  it('a failed RESUME surfaces — it is never retried silently as a fresh session', async () => {
+    // The codex adapter's non-strict fallback re-runs a failed resume as a fresh exec.
+    // Under the relay that hides a killed call AND forks the role's memory: the model that
+    // answers no longer remembers the conversation the transcript says it is part of. The
+    // relay passes strictResume, so the failure is recorded and the operator resumes it.
+    writeFileSync(implFile, JSON.stringify(['Did batch 1.', 'Did batch 2.']));
+    writeFileSync(
+      revFile,
+      JSON.stringify([
+        'needs work\nVERDICT: FIX',
+        '__CRASH__',
+        'ok\nVERDICT: PROCEED',
+        'ok\nVERDICT: COMPLETE',
+      ]),
+    );
+    // maxCycles 1 → after the FIX forward, the SECOND reviewer call is a resume; it dies.
+    await relayRunCommand({ plan: 'plan.md', id: 'relay-strict', maxCycles: 2 });
+    expect(printedStatus().status).toBe('STOPPED');
+
+    // Exactly TWO reviewer invocations happened: the original and the crashed resume — no
+    // hidden third call re-serving the sequence as a fresh session.
+    const revCalls = readFileSync(`${revFile}.prompts.jsonl`, 'utf8').trim().split('\n');
+    expect(revCalls).toHaveLength(2);
+  });
+
   it('records the whole exchange — the transcript is the audit', async () => {
     writeFileSync(implFile, JSON.stringify(['b1.', 'b2.']));
     writeFileSync(revFile, JSON.stringify(['ok\nVERDICT: PROCEED', 'ok\nVERDICT: COMPLETE']));

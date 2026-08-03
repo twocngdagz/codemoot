@@ -342,12 +342,25 @@ async function callRole(
   const options = {
     ...(context.timeouts[role] === undefined ? {} : { timeout: context.timeouts[role] }),
     env: context.guardEnv,
+    // A failed resume must SURFACE, never silently fall back to a fresh exec: the fallback
+    // both hides a killed call and forks the role's memory — the model that answers no
+    // longer remembers the conversation the transcript says it is part of.
+    strictResume: true,
   };
   const startedAt = Date.now();
   const call =
     sessionId === null
       ? await adapter.send(prompt, options)
       : await adapter.resume(sessionId, prompt, options);
+  // An empty response is NOT a response. A hand-killed codex once surfaced as a clean call
+  // with zero-length text, and the transcript gained a turn that never happened. Refuse it
+  // here — the prompt stays unanswered in the log, the boundary records the failure, and
+  // resume re-sends with the reconcile preface, exactly like any other failed call.
+  if (call.text.trim().length === 0) {
+    throw new Error(
+      `${role} returned an empty response — recording it as a failed call, not a turn`,
+    );
+  }
   const newSession = call.sessionId ?? sessionId;
   if (role === 'IMPLEMENTER') run.implementerSession = newSession ?? null;
   else run.reviewerSession = newSession ?? null;

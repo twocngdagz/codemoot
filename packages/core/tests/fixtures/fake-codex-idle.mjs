@@ -26,6 +26,10 @@ setTimeout(
     process.stdout.write(
       `${JSON.stringify({ type: 'thread.started', thread_id: 'thread-fake-1' })}\n`,
     );
+    // Codex's graceful-SIGTERM shape: thread announced, NO agent message, clean exit 0.
+    if (process.env.CODEMOOT_FAKE_NO_MESSAGE === '1') {
+      process.exit(0);
+    }
     process.stdout.write(
       `${JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'done' } })}\n`,
     );
