@@ -259,6 +259,64 @@ function lastEvent(db: RelayDb, runId: string): RelayEvent | null {
 }
 
 // ---------------------------------------------------------------------------
+// The worker lease — one process per run, enforced, not assumed
+// ---------------------------------------------------------------------------
+
+function pidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'EPERM';
+  }
+}
+
+/**
+ * Claims the run for THIS process, refusing while another live process holds it.
+ *
+ * Two workers once drove one run: a killed reviewer call left its relay process alive (an
+ * unkillable child's pipes held the event loop), and a `resume` started a second — same
+ * batch, same cycle, two reviewers appending to one event log. That is a data-integrity
+ * hazard, not untidiness. The relay is same-machine by construction, so the lease is the
+ * simplest thing that is actually true: the holder's pid, checked for liveness. No
+ * heartbeats, no expiry arithmetic — a dead pid releases by BEING dead.
+ */
+function claimRelayWorker(db: RelayDb, runId: string): void {
+  const row = db
+    .prepare('SELECT worker_pid, worker_started_at FROM relay_runs WHERE run_id = ?')
+    .get(runId) as { worker_pid: number | null; worker_started_at: string | null } | undefined;
+  if (row === undefined) throw new Error(`Relay run ${runId} does not exist`);
+  const holder = row.worker_pid;
+  if (holder !== null && holder !== process.pid && pidAlive(holder)) {
+    throw new Error(
+      `Run ${runId} is held by live relay process ${holder} (since ${row.worker_started_at ?? 'unknown'}). ` +
+        'Two workers on one run would interleave two conversations into one event log. ' +
+        `If that process is genuinely stuck, kill it (kill ${holder}) and resume again.`,
+    );
+  }
+  // Optimistic claim: WHERE pins the exact value we read, so two simultaneous resumes
+  // serialize in SQLite and the loser sees zero changed rows.
+  const claimed = db
+    .prepare(
+      `UPDATE relay_runs SET worker_pid = ?, worker_started_at = ?
+       WHERE run_id = ? AND (worker_pid IS ? OR worker_pid = ?)`,
+    )
+    .run(process.pid, new Date().toISOString(), runId, holder, process.pid);
+  if (claimed.changes !== 1) {
+    throw new Error(
+      `Run ${runId} was claimed by another process at the same moment; not starting a second worker.`,
+    );
+  }
+}
+
+/** Releases only OUR OWN claim — a newer holder's lease is never clobbered. */
+function releaseRelayWorker(db: RelayDb, runId: string): void {
+  db.prepare(
+    'UPDATE relay_runs SET worker_pid = NULL, worker_started_at = NULL WHERE run_id = ? AND worker_pid = ?',
+  ).run(runId, process.pid);
+}
+
+// ---------------------------------------------------------------------------
 // The loop
 // ---------------------------------------------------------------------------
 
@@ -538,9 +596,11 @@ export async function relayRunCommand(options: {
     const context = buildContext(db, projectDir);
     const run = getRun(db, runId);
     if (run === null) throw new Error('run row vanished');
+    claimRelayWorker(db, runId);
     try {
       await runLoop(context, run);
     } finally {
+      releaseRelayWorker(db, runId);
       context.dispose();
       uninstallGitGuard(projectDir);
     }
@@ -559,6 +619,7 @@ export async function relayResumeCommand(
       printRelayStatus(db, runId);
       return;
     }
+    claimRelayWorker(db, runId);
     const context = buildContext(db, run.projectDir);
 
     // Every call below runs inside ONE error boundary. runLoop guards its own calls — that
@@ -625,6 +686,7 @@ export async function relayResumeCommand(
         `Call failed: ${error instanceof Error ? error.message : String(error)}. Resume with: codemoot relay resume ${runId}`,
       );
     } finally {
+      releaseRelayWorker(db, runId);
       context.dispose();
       uninstallGitGuard(run.projectDir);
     }

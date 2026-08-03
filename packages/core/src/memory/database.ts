@@ -7,7 +7,7 @@ import {
   REVIEW_WORKFLOW_RUNNER_STATE_DDL,
 } from './review-workflow-schema.js';
 
-const SCHEMA_VERSION = '18';
+const SCHEMA_VERSION = '19';
 
 const MIGRATIONS = [
   // Sessions
@@ -395,6 +395,18 @@ export function runMigrations(db: Database.Database): void {
     for (const col of ['prompt_full', 'response_full']) {
       try {
         db.exec(`ALTER TABLE session_events ADD COLUMN ${col} TEXT`);
+      } catch {
+        // Column already exists
+      }
+    }
+
+    // v19: the relay takes a same-machine worker lease. Two workers once drove one run —
+    // a killed reviewer call left its process alive holding the run, and a resume started a
+    // second — so a run now records the pid that holds it, and a second worker is refused
+    // while that pid is alive. Additive columns; existing rows read as unheld.
+    for (const column of ['worker_pid INTEGER', 'worker_started_at TEXT']) {
+      try {
+        db.exec(`ALTER TABLE relay_runs ADD COLUMN ${column}`);
       } catch {
         // Column already exists
       }

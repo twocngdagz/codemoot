@@ -3,7 +3,7 @@
 // reviewer's VERDICT line — plus the property that gives the design its recovery story:
 // the event log alone is enough to resume from any interruption, with no ceremony.
 
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -303,6 +303,64 @@ describe('codemoot relay (real command, two scripted models)', () => {
         (e) => e.content.includes('did not end with a clear VERDICT') && e.kind === 'PROMPT',
       ),
     ).toHaveLength(2);
+  });
+
+  it('refuses a second worker while a live process holds the run', async () => {
+    // Two workers once drove one run: a killed reviewer call left its relay process alive,
+    // and a resume started another — two reviewers interleaving one event log. The lease is
+    // a pid, checked for liveness; nothing else is true enough on one machine.
+    writeFileSync(implFile, JSON.stringify(['b1.', 'b2.']));
+    writeFileSync(revFile, JSON.stringify(['no verdict here']));
+    await relayRunCommand({ plan: 'plan.md', id: 'relay-lease' });
+    expect(printedStatus().status).toBe('PAUSED_UNCLEAR_VERDICT');
+
+    // A stand-in for the stale-but-alive worker.
+    const holder = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 30000)'], {
+      stdio: 'ignore',
+    });
+    try {
+      const db = openDatabase(getDbPath());
+      db.prepare(
+        'UPDATE relay_runs SET worker_pid = ?, worker_started_at = ? WHERE run_id = ?',
+      ).run(holder.pid, new Date().toISOString(), 'relay-lease');
+      db.close();
+      await expect(relayResumeCommand('relay-lease', {})).rejects.toThrow(
+        new RegExp(`held by live relay process ${holder.pid}`),
+      );
+    } finally {
+      holder.kill('SIGKILL');
+    }
+  });
+
+  it('a DEAD holder releases by being dead — resume takes over without ceremony', async () => {
+    writeFileSync(implFile, JSON.stringify(['b1.', 'b2.']));
+    writeFileSync(
+      revFile,
+      JSON.stringify(['no verdict', 'ok\nVERDICT: PROCEED', 'ok\nVERDICT: COMPLETE']),
+    );
+    await relayRunCommand({ plan: 'plan.md', id: 'relay-lease-dead' });
+    expect(printedStatus().status).toBe('PAUSED_UNCLEAR_VERDICT');
+
+    const dead = spawn(process.execPath, ['-e', ''], { stdio: 'ignore' });
+    await new Promise((resolve) => dead.once('exit', resolve));
+    const db = openDatabase(getDbPath());
+    db.prepare('UPDATE relay_runs SET worker_pid = ?, worker_started_at = ? WHERE run_id = ?').run(
+      dead.pid,
+      new Date().toISOString(),
+      'relay-lease-dead',
+    );
+    db.close();
+
+    await relayResumeCommand('relay-lease-dead', {});
+    expect(printedStatus().status).toBe('COMPLETE');
+
+    // And the finished worker released its own claim.
+    const after = openDatabase(getDbPath());
+    const row = after
+      .prepare('SELECT worker_pid FROM relay_runs WHERE run_id = ?')
+      .get('relay-lease-dead') as { worker_pid: number | null };
+    after.close();
+    expect(row.worker_pid).toBeNull();
   });
 
   it('records the whole exchange — the transcript is the audit', async () => {

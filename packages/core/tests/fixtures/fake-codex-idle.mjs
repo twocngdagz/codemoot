@@ -14,6 +14,13 @@ if (argumentsList.includes('--version')) {
 
 const silentMs = Number.parseInt(process.env.CODEMOOT_FAKE_SILENT_MS ?? '0', 10);
 
+// Worst-case child: ignores polite termination, so only a delivered SIGKILL to its process
+// group ends it — exactly the codex-wrapper behaviour that survived a kill by 42 minutes.
+if (process.env.CODEMOOT_FAKE_IGNORE_SIGTERM === '1') {
+  process.on('SIGTERM', () => {});
+  process.on('SIGINT', () => {});
+}
+
 setTimeout(
   () => {
     process.stdout.write(

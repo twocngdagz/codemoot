@@ -31,13 +31,48 @@ function codexConfig(idleTimeoutSeconds?: number): ModelConfig {
   } as ModelConfig;
 }
 
-const CALL_OPTIONS = { envAllowlist: ['CODEMOOT_FAKE_SILENT_MS'] };
+const CALL_OPTIONS = {
+  envAllowlist: ['CODEMOOT_FAKE_SILENT_MS', 'CODEMOOT_FAKE_IGNORE_SIGTERM'],
+};
+
+function pidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 describe('codex idleTimeout resolution', () => {
   beforeEach(() => chmodSync(FAKE, 0o755));
   afterEach(() => {
     delete process.env.CODEMOOT_FAKE_SILENT_MS;
+    delete process.env.CODEMOOT_FAKE_IGNORE_SIGTERM;
   });
+
+  it('actually KILLS the child it says it killed — even one that ignores SIGTERM', async () => {
+    // The 42-minute zombie: codex was spawned without its own process group, so the
+    // group-signal in killProcessTree threw ESRCH into a silent catch and nothing died.
+    // The unkilled child's pipes then held the relay's event loop open, and a resume
+    // started a SECOND worker on the same run. Detachment gives the child a real group;
+    // this pins that an idle-kill leaves a DEAD child, not a reported-dead one — through
+    // the SIGKILL escalation, because this child ignores SIGTERM outright.
+    process.env.CODEMOOT_FAKE_SILENT_MS = '60000';
+    process.env.CODEMOOT_FAKE_IGNORE_SIGTERM = '1';
+    const adapter = createModelAdapter(codexConfig(1));
+    let childPid = 0;
+    await expect(
+      adapter.send('hello', { ...CALL_OPTIONS, onSpawn: (pid) => (childPid = pid) }),
+    ).rejects.toThrow(/no output for 1000ms/);
+    expect(childPid).toBeGreaterThan(0);
+    // SIGTERM at ~1s is ignored; SIGKILL escalates at +5s. Poll a little past that.
+    const deadline = Date.now() + 8_000;
+    while (pidAlive(childPid) && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 200));
+    }
+    expect(pidAlive(childPid), `child ${childPid} must be dead after the kill`).toBe(false);
+  }, 15_000);
 
   it('honours the CONFIGURED idle timeout instead of the hardcoded default', async () => {
     // 1s configured silence budget against a 5s-silent process: killed at ~1s, and the

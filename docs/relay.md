@@ -53,7 +53,9 @@ codemoot relay resume <run-id>
 ```
 
 — because the event log *is* the state. The relay looks at the last recorded exchange and
-does the one thing it implies. If the log ends with a prompt that has no reply (a crash
+does the one thing it implies. One worker per run is enforced, not assumed: each run records
+the pid that holds it, and a second `run`/`resume` is refused while that process is alive —
+the refusal names the pid so a genuinely stuck holder can be killed and resumed past. If the log ends with a prompt that has no reply (a crash
 mid-call), the same prompt is re-sent with one sentence telling the model its previous
 attempt may have been interrupted and the working tree may hold partial work — the
 intelligence reconciles it, not a recovery state machine.

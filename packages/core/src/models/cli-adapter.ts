@@ -425,6 +425,13 @@ export class CliAdapter implements CliBridge {
         env,
         stdio: ['pipe', 'pipe', 'pipe'],
         windowsHide: true,
+        // Its OWN process group, exactly like the claude adapter. killProcessTree signals
+        // the group (`kill(-pid)`); without detachment the child has no group of its own,
+        // the signal throws ESRCH into a silent catch, and NOTHING is killed. A live codex
+        // reviewer survived its idle-timeout kill by 42 minutes this way — and its open
+        // pipes kept the relay process alive with it, which is how one run ended up with
+        // two workers.
+        detached: process.platform !== 'win32',
         shell: process.platform === 'win32',
       });
 
@@ -457,6 +464,15 @@ export class CliAdapter implements CliBridge {
         cleanup();
         // Preserve whatever the CLI emitted before failing (see ModelError.partialOutput).
         err.partialOutput = { stdout, stderr };
+        // Drop the pipes NOW. A child that ignores its signals must not keep the parent's
+        // event loop — and therefore the whole relay process — alive on open stdio.
+        for (const stream of [child.stdout, child.stderr, child.stdin]) {
+          try {
+            stream?.destroy();
+          } catch {
+            /* stream may already be closed */
+          }
+        }
         reject(err);
       };
 
@@ -589,13 +605,14 @@ export function killProcessTree(pid: number | undefined): void {
       spawn('taskkill', ['/pid', String(pid), '/T', '/F'], { stdio: 'ignore' });
     } else {
       process.kill(-pid, 'SIGTERM');
+      // unref: a five-second escalation timer must never be what keeps the process alive.
       setTimeout(() => {
         try {
           process.kill(-pid, 'SIGKILL');
         } catch {
           // Process may already be dead
         }
-      }, 5000);
+      }, 5000).unref?.();
     }
   } catch {
     // Process may already be dead
