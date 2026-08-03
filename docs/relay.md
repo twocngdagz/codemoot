@@ -29,6 +29,14 @@ The `VERDICT:` line is the single piece of structure in the whole system — the
 know which wire to put a reply on — and when it is missing or ambiguous the relay pauses and
 asks you rather than guessing.
 
+One shape rule guards the one irreversible act: **`PROCEED` and `COMPLETE` must arrive
+attached to findings.** A reply that is a verdict line and (almost) nothing else is treated
+like a missing verdict — the relay pauses, and resume re-sends the full review prompt. The
+relay still never grades review quality; it refuses to advance a batch on a routing token
+with no review behind it (a live run once advanced an unreviewed batch on 72 characters).
+`FIX` is exempt: it advances nothing and a terse FIX errs in the safe direction. An accepted
+review far shorter than that reviewer's own norm also gets a warning line in the log.
+
 ## Liveness, not deadlines
 
 A model that is producing output is left alone however long it takes. Health is the

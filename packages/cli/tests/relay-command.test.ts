@@ -20,6 +20,14 @@ import { getDbPath } from '../src/utils.js';
 
 const FAKE = fileURLToPath(new URL('./fixtures/fake-claude-relay.mjs', import.meta.url));
 
+// Every ADVANCING verdict in these fixtures carries a findings body above the floor —
+// a verdict without findings is now refused, because a live run once advanced an
+// unreviewed batch on a 72-character manufactured PROCEED.
+const FINDINGS =
+  'Verified the claims against the repository: the changed files match the summary, the ' +
+  'stated commands were re-run and pass, and no regressions were found in the touched ' +
+  'areas. Diff inspected hunk by hunk against the batch scope in the plan.\n';
+
 const PLAN = `# Sample plan
 
 ### Batch 1
@@ -143,8 +151,8 @@ describe('codemoot relay (real command, two scripted models)', () => {
       revFile,
       JSON.stringify([
         'Missing trailing newline.\nVERDICT: FIX',
-        'Verified sample.txt.\nVERDICT: PROCEED',
-        'README verified. Everything in the plan is done.\nVERDICT: COMPLETE',
+        `${FINDINGS}Verified sample.txt.\nVERDICT: PROCEED`,
+        `${FINDINGS}README verified. Everything in the plan is done.\nVERDICT: COMPLETE`,
       ]),
     );
     await relayRunCommand({ plan: 'plan.md', id: 'relay-e2e' });
@@ -187,7 +195,7 @@ describe('codemoot relay (real command, two scripted models)', () => {
       JSON.stringify([
         'No.\nVERDICT: FIX',
         'Still no.\nVERDICT: FIX',
-        'Batch 2 fine.\nVERDICT: COMPLETE',
+        `${FINDINGS}Batch 2 fine.\nVERDICT: COMPLETE`,
       ]),
     );
     await relayRunCommand({ plan: 'plan.md', id: 'relay-cap', maxCycles: 2 });
@@ -211,7 +219,11 @@ describe('codemoot relay (real command, two scripted models)', () => {
     writeFileSync(implFile, JSON.stringify(['Did batch 1.', 'Did batch 2.']));
     writeFileSync(
       revFile,
-      JSON.stringify(['Looks good I suppose.', 'VERDICT: PROCEED', 'Fine.\nVERDICT: COMPLETE']),
+      JSON.stringify([
+        `${FINDINGS}Looks good I suppose.`,
+        `${FINDINGS}VERDICT: PROCEED`,
+        `${FINDINGS}Fine.\nVERDICT: COMPLETE`,
+      ]),
     );
     await relayRunCommand({ plan: 'plan.md', id: 'relay-unclear' });
     expect(printedStatus().status).toBe('PAUSED_UNCLEAR_VERDICT');
@@ -231,7 +243,10 @@ describe('codemoot relay (real command, two scripted models)', () => {
 
   it('resumes an interrupted call by re-sending the prompt with the reconcile preface', async () => {
     writeFileSync(implFile, JSON.stringify(['Recovered and finished batch 1.', 'Batch 2 done.']));
-    writeFileSync(revFile, JSON.stringify(['ok\nVERDICT: PROCEED', 'ok\nVERDICT: COMPLETE']));
+    writeFileSync(
+      revFile,
+      JSON.stringify([`${FINDINGS}VERDICT: PROCEED`, `${FINDINGS}VERDICT: COMPLETE`]),
+    );
     // Seed a run whose log ends with an unanswered implementer prompt — a crash mid-call.
     const db = openDatabase(getDbPath());
     const now = new Date().toISOString();
@@ -264,10 +279,10 @@ describe('codemoot relay (real command, two scripted models)', () => {
     writeFileSync(
       revFile,
       JSON.stringify([
-        'Looks fine, probably.',
+        `${FINDINGS}Looks fine, probably.`,
         '__CRASH__',
-        'Verified.\nVERDICT: PROCEED',
-        'Verified.\nVERDICT: COMPLETE',
+        `${FINDINGS}VERDICT: PROCEED`,
+        `${FINDINGS}VERDICT: COMPLETE`,
       ]),
     );
     await relayRunCommand({ plan: 'plan.md', id: 'relay-boundary' });
@@ -313,7 +328,7 @@ describe('codemoot relay (real command, two scripted models)', () => {
     // documented surface alerted "paused" twice on a healthy run. The event and the row
     // must never disagree about whether the run is paused.
     writeFileSync(implFile, JSON.stringify(['Attempt.', '__DELAY:1500:Applied final feedback.']));
-    writeFileSync(revFile, JSON.stringify(['No.\nVERDICT: FIX', 'fine\nVERDICT: COMPLETE']));
+    writeFileSync(revFile, JSON.stringify(['No.\nVERDICT: FIX', `${FINDINGS}VERDICT: COMPLETE`]));
     await relayRunCommand({ plan: 'plan.md', id: 'relay-status-flip', maxCycles: 1 });
     expect(printedStatus().status).toBe('PAUSED_CYCLE_CAP');
 
@@ -373,7 +388,7 @@ describe('codemoot relay (real command, two scripted models)', () => {
     writeFileSync(implFile, JSON.stringify(['b1.', 'b2.']));
     writeFileSync(
       revFile,
-      JSON.stringify(['no verdict', 'ok\nVERDICT: PROCEED', 'ok\nVERDICT: COMPLETE']),
+      JSON.stringify(['no verdict', `${FINDINGS}VERDICT: PROCEED`, `${FINDINGS}VERDICT: COMPLETE`]),
     );
     await relayRunCommand({ plan: 'plan.md', id: 'relay-lease-dead' });
     expect(printedStatus().status).toBe('PAUSED_UNCLEAR_VERDICT');
@@ -405,7 +420,10 @@ describe('codemoot relay (real command, two scripted models)', () => {
     // gained a turn that never happened. The prompt must stay unanswered in the log, the
     // failure must be a RELAY NOTE, and resume must re-send with the reconcile preface.
     writeFileSync(implFile, JSON.stringify(['Did batch 1.', 'Did batch 2.']));
-    writeFileSync(revFile, JSON.stringify(['', 'ok\nVERDICT: PROCEED', 'ok\nVERDICT: COMPLETE']));
+    writeFileSync(
+      revFile,
+      JSON.stringify(['', `${FINDINGS}VERDICT: PROCEED`, `${FINDINGS}VERDICT: COMPLETE`]),
+    );
     await relayRunCommand({ plan: 'plan.md', id: 'relay-empty' });
     expect(printedStatus().status).toBe('STOPPED');
 
@@ -432,8 +450,8 @@ describe('codemoot relay (real command, two scripted models)', () => {
       JSON.stringify([
         'needs work\nVERDICT: FIX',
         '__CRASH__',
-        'ok\nVERDICT: PROCEED',
-        'ok\nVERDICT: COMPLETE',
+        `${FINDINGS}VERDICT: PROCEED`,
+        `${FINDINGS}VERDICT: COMPLETE`,
       ]),
     );
     // maxCycles 1 → after the FIX forward, the SECOND reviewer call is a resume; it dies.
@@ -454,7 +472,7 @@ describe('codemoot relay (real command, two scripted models)', () => {
     writeFileSync(implFile, JSON.stringify(['Did batch 1.', 'Did batch 2.']));
     writeFileSync(
       revFile,
-      JSON.stringify(['no verdict', 'ok\nVERDICT: PROCEED', 'ok\nVERDICT: COMPLETE']),
+      JSON.stringify(['no verdict', `${FINDINGS}VERDICT: PROCEED`, `${FINDINGS}VERDICT: COMPLETE`]),
     );
     await relayRunCommand({ plan: 'plan.md', id: 'relay-kindswap' });
     expect(printedStatus().status).toBe('PAUSED_UNCLEAR_VERDICT');
@@ -517,7 +535,10 @@ describe('codemoot relay (real command, two scripted models)', () => {
     db.close();
 
     writeFileSync(implFile, JSON.stringify(['Did batch 2.']));
-    writeFileSync(revFile, JSON.stringify(['ok\nVERDICT: PROCEED', 'ok\nVERDICT: COMPLETE']));
+    writeFileSync(
+      revFile,
+      JSON.stringify([`${FINDINGS}VERDICT: PROCEED`, `${FINDINGS}VERDICT: COMPLETE`]),
+    );
     await relayResumeCommand('relay-empty-legacy', {});
     expect(printedStatus().status).toBe('COMPLETE');
 
@@ -543,8 +564,8 @@ describe('codemoot relay (real command, two scripted models)', () => {
       revFile,
       JSON.stringify([
         'thorough findings, forgot the line',
-        'ok\nVERDICT: PROCEED',
-        'ok\nVERDICT: COMPLETE',
+        `${FINDINGS}VERDICT: PROCEED`,
+        `${FINDINGS}VERDICT: COMPLETE`,
       ]),
     );
     await relayRunCommand({ plan: 'plan.md', id: 'relay-noses' });
@@ -563,9 +584,74 @@ describe('codemoot relay (real command, two scripted models)', () => {
     expect(reAsk?.content).toContain('The implementer reports the following');
   });
 
+  it('refuses to ADVANCE on a verdict without findings — the 72-character trap', async () => {
+    // Advancing is the one irreversible thing the relay does, and it once did it on
+    // "The proposed work is ready to move forward as planned. VERDICT: PROCEED" from a
+    // session that read nothing. A verdict with no findings attached is treated like a
+    // missing verdict: pause, and resume re-sends the FULL review prompt — a thin reply is
+    // not restatable by construction.
+    writeFileSync(implFile, JSON.stringify(['Did batch 1.', 'Did batch 2.']));
+    writeFileSync(
+      revFile,
+      JSON.stringify([
+        'The proposed work is ready to move forward as planned.\nVERDICT: PROCEED',
+        `${FINDINGS}VERDICT: PROCEED`,
+        `${FINDINGS}VERDICT: COMPLETE`,
+      ]),
+    );
+    await relayRunCommand({ plan: 'plan.md', id: 'relay-thin' });
+    expect(printedStatus().status).toBe('PAUSED_UNCLEAR_VERDICT');
+    const paused = events('relay-thin');
+    expect(
+      paused.some(
+        (e) =>
+          e.role === 'RELAY' &&
+          e.kind === 'NOTE' &&
+          e.content.includes('a verdict without a review cannot advance a batch'),
+      ),
+    ).toBe(true);
+    // Batch did NOT advance on the thin verdict.
+    const db = openDatabase(getDbPath());
+    const row = db.prepare('SELECT batch FROM relay_runs WHERE run_id = ?').get('relay-thin') as {
+      batch: number;
+    };
+    db.close();
+    expect(row.batch).toBe(1);
+
+    await relayResumeCommand('relay-thin', {});
+    expect(printedStatus().status).toBe('COMPLETE');
+    const log = events('relay-thin');
+    // Resume re-sent the FULL review prompt, not the restate re-ask.
+    const reAsk = log.filter((e) => e.role === 'REVIEWER' && e.kind === 'PROMPT')[1];
+    expect(reAsk?.content).toContain('The implementer reports the following');
+    expect(reAsk?.content).not.toContain('did not end with a clear VERDICT');
+  });
+
+  it('a terse FIX still routes — the floor guards only the irreversible direction', async () => {
+    writeFileSync(implFile, JSON.stringify(['Attempt.', 'Fixed.', 'Did batch 2.']));
+    writeFileSync(
+      revFile,
+      JSON.stringify([
+        'No.\nVERDICT: FIX',
+        `${FINDINGS}VERDICT: PROCEED`,
+        `${FINDINGS}VERDICT: COMPLETE`,
+      ]),
+    );
+    await relayRunCommand({ plan: 'plan.md', id: 'relay-terse-fix' });
+    expect(printedStatus().status).toBe('COMPLETE');
+    const log = events('relay-terse-fix');
+    // The two-character-findings FIX was forwarded verbatim, no pause.
+    expect(
+      log.some((e) => e.role === 'IMPLEMENTER' && e.kind === 'PROMPT' && e.content.includes('No.')),
+    ).toBe(true);
+  });
+
   it('records the whole exchange — the transcript is the audit', async () => {
     writeFileSync(implFile, JSON.stringify(['b1.', 'b2.']));
-    writeFileSync(revFile, JSON.stringify(['ok\nVERDICT: PROCEED', 'ok\nVERDICT: COMPLETE']));
+    writeFileSync(
+      revFile,
+      JSON.stringify([`${FINDINGS}VERDICT: PROCEED`, `${FINDINGS}VERDICT: COMPLETE`]),
+    );
     await relayRunCommand({ plan: 'plan.md', id: 'relay-audit' });
     const log = events('relay-audit');
     // Every call is two entries: the exact prompt sent, the exact reply received.

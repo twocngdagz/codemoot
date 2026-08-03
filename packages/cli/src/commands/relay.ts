@@ -94,6 +94,26 @@ export function parseVerdict(reply: string): Verdict | null {
 }
 
 /**
+ * An ADVANCING verdict must arrive attached to findings. Reply text minus its VERDICT
+ * lines is what the review actually said; below this floor there is no review, only a
+ * routing token. 200 characters is far beneath any genuine review (measured: 4,300-6,200
+ * chars with file:line evidence) while excluding the failure that motivated it — a
+ * 72-character "ready to move forward, VERDICT: PROCEED" from a session that read nothing,
+ * which silently advanced an unreviewed batch. FIX is deliberately exempt: it advances
+ * nothing, costs one reversible cycle, and a terse FIX errs in the safe direction.
+ */
+export const REVIEW_FINDINGS_FLOOR = 200;
+
+/** The reply with its VERDICT lines removed — what the reviewer actually SAID. */
+export function findingsOf(reply: string): string {
+  return reply
+    .split(/\r?\n/)
+    .filter((line) => !/^\s*VERDICT:\s*(FIX|PROCEED|COMPLETE)\b/i.test(line.trim()))
+    .join('\n')
+    .trim();
+}
+
+/**
  * The plan's own headings are the decomposition. Counting them is the closest the relay
  * ever comes to reading the plan — and it reads a NUMBER, not the work.
  */
@@ -142,6 +162,8 @@ ${implementerSummary}
 Read Batch ${run.batch} in the plan. Verify the implementer's claims against the repository — the diff, the files, and whatever verification you judge necessary; you may run commands. Reply with your findings, written for the implementer.
 
 ${SINGLE_TURN_NOTICE}
+
+A verdict without findings will not be accepted: PROCEED and COMPLETE must be accompanied by what you verified and how.
 
 End your reply with exactly ONE line, and nothing after it:
 VERDICT: FIX        (problems that must be addressed)
@@ -527,11 +549,48 @@ async function step(context: RelayContext, run: RelayRun): Promise<boolean> {
       );
       return false;
     }
-    if (verdict === 'COMPLETE') {
-      pause(context, run, 'COMPLETE', 'The reviewer declared the plan complete.');
-      return false;
-    }
-    if (verdict === 'PROCEED') {
+    if (verdict === 'COMPLETE' || verdict === 'PROCEED') {
+      // Advancing is the one IRREVERSIBLE thing the relay does. It once did it on 72
+      // characters. The relay still never grades review quality — but a verdict with no
+      // findings attached is not a review the routing token can honestly come from, so it
+      // is treated exactly like a missing verdict: pause, and resume re-sends the FULL
+      // review prompt (the thin reply is not restatable by construction).
+      const findings = findingsOf(last.content);
+      if (findings.length < REVIEW_FINDINGS_FLOOR) {
+        pause(
+          context,
+          run,
+          'PAUSED_UNCLEAR_VERDICT',
+          `The reviewer answered VERDICT: ${verdict} with only ${findings.length} characters of findings — a verdict without a review cannot advance a batch. Resume re-sends the full review prompt: codemoot relay resume ${run.runId}`,
+        );
+        return false;
+      }
+      // Log-only early warning: an accepted review far below this reviewer's own norm is
+      // worth a line in the transcript even though it passed the floor.
+      const priorLengths = context.db
+        .prepare(
+          `SELECT LENGTH(content) AS n FROM relay_events
+           WHERE run_id = ? AND role = 'REVIEWER' AND kind = 'RESPONSE' AND LENGTH(content) >= ?
+           ORDER BY event_id`,
+        )
+        .all(run.runId, REVIEW_FINDINGS_FLOOR)
+        .map((row) => Number((row as { n: number }).n))
+        .slice(0, -1);
+      if (priorLengths.length >= 2) {
+        const sorted = [...priorLengths].sort((left, right) => left - right);
+        const median = sorted[Math.floor(sorted.length / 2)] ?? 0;
+        if (median > 1_000 && last.content.length < median / 4) {
+          appendEvent(context.db, run, {
+            role: 'RELAY',
+            kind: 'NOTE',
+            content: `Accepted review is far shorter than this reviewer's norm (${last.content.length} chars vs median ${median}) — worth a human look in the transcript`,
+          });
+        }
+      }
+      if (verdict === 'COMPLETE') {
+        pause(context, run, 'COMPLETE', 'The reviewer declared the plan complete.');
+        return false;
+      }
       return advanceBatch(context, run);
     }
     // FIX — the only place a counter matters.
@@ -799,7 +858,9 @@ export async function relayResumeCommand(
           //      INVENTING one; a live run advanced past an unreviewed batch on a
           //      72-character manufactured PROCEED exactly this way).
           // When either fails, the honest re-ask is the ORIGINAL full review prompt.
-          const restatable = last.content.trim().length > 0 && run.reviewerSession !== null;
+          const restatable =
+            findingsOf(last.content).length >= REVIEW_FINDINGS_FLOOR &&
+            run.reviewerSession !== null;
           // Same stale-field shape as the cycle-cap branch: the re-ask is the run being
           // active again, and the row must say so before the call, not after it returns.
           run.status = 'ACTIVE';
