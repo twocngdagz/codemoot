@@ -305,6 +305,43 @@ describe('codemoot relay (real command, two scripted models)', () => {
     ).toHaveLength(2);
   });
 
+  it('a consumed decision flips the summary row to ACTIVE in the same transaction', async () => {
+    // After `resume --decision accept` the run is genuinely active — decision recorded,
+    // prompt recorded, model working — but the status column used to stay PAUSED_CYCLE_CAP
+    // for the whole next call, because updateRun re-wrote the stale field alongside the
+    // counters it was advancing. `relay status` reads that column: a watcher polling the
+    // documented surface alerted "paused" twice on a healthy run. The event and the row
+    // must never disagree about whether the run is paused.
+    writeFileSync(implFile, JSON.stringify(['Attempt.', '__DELAY:1500:Applied final feedback.']));
+    writeFileSync(revFile, JSON.stringify(['No.\nVERDICT: FIX', 'fine\nVERDICT: COMPLETE']));
+    await relayRunCommand({ plan: 'plan.md', id: 'relay-status-flip', maxCycles: 1 });
+    expect(printedStatus().status).toBe('PAUSED_CYCLE_CAP');
+
+    // Fire the resume WITHOUT awaiting, then probe the row while the implementer call is
+    // held open by the fake's delay.
+    const resume = relayResumeCommand('relay-status-flip', { decision: 'accept' });
+    const deadline = Date.now() + 5_000;
+    let observed: { status: string } | undefined;
+    while (Date.now() < deadline) {
+      const db = openDatabase(getDbPath());
+      const decisionRecorded = db
+        .prepare("SELECT COUNT(*) AS n FROM relay_events WHERE run_id = ? AND kind = 'DECISION'")
+        .get('relay-status-flip') as { n: number };
+      if (decisionRecorded.n > 0) {
+        observed = db
+          .prepare('SELECT status FROM relay_runs WHERE run_id = ?')
+          .get('relay-status-flip') as { status: string };
+        db.close();
+        break;
+      }
+      db.close();
+      await new Promise((resolveWait) => setTimeout(resolveWait, 50));
+    }
+    // The moment the DECISION event exists, the row already says ACTIVE — same transaction.
+    expect(observed?.status).toBe('ACTIVE');
+    await resume;
+  });
+
   it('refuses a second worker while a live process holds the run', async () => {
     // Two workers once drove one run: a killed reviewer call left its relay process alive,
     // and a resume started another — two reviewers interleaving one event log. The lease is

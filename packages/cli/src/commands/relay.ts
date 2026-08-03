@@ -640,16 +640,29 @@ export async function relayResumeCommand(
         const review = lastEvent(db, runId);
         // Narrowed above: PAUSED_CYCLE_CAP without a decision already threw.
         const decision = options.decision as 'continue' | 'accept' | 'proceed';
-        appendEvent(db, run, { role: 'OPERATOR', kind: 'DECISION', content: decision });
-        if (decision === 'continue') {
-          run.maxCycles += 1; // one more cycle, explicitly granted — the count stays honest
-          run.cycle += 1;
+        // The decision CONSUMES the pause, and the summary row must say so in the same
+        // transaction that records it. It used to stay PAUSED_CYCLE_CAP for the entire
+        // next model call, because updateRun faithfully re-wrote every field of the run
+        // object — including the stale status it was loaded with. cycle and maxCycles
+        // advanced in the same write, which is what made the row look half-updated: one
+        // stale FIELD, not a missing write. `relay status` reports from this column, so a
+        // watcher polling the documented surface alerted "paused, waiting for you" twice
+        // on a healthy mid-call run.
+        db.transaction(() => {
+          appendEvent(db, run, { role: 'OPERATOR', kind: 'DECISION', content: decision });
+          run.status = 'ACTIVE';
+          if (decision === 'continue') {
+            run.maxCycles += 1; // one more cycle, explicitly granted — the count stays honest
+            run.cycle += 1;
+          } else if (decision === 'accept') {
+            run.pending = 'ADVANCE_AFTER_RESPONSE';
+          }
           updateRun(db, run);
+        })();
+        if (decision === 'continue') {
           if (review === null) throw new Error('no review to continue from');
           await callRole(context, run, 'IMPLEMENTER', fixPrompt(run, review.content));
         } else if (decision === 'accept') {
-          run.pending = 'ADVANCE_AFTER_RESPONSE';
-          updateRun(db, run);
           if (review === null) throw new Error('no review to accept');
           await callRole(context, run, 'IMPLEMENTER', acceptPrompt(run, review.content));
         } else {
@@ -667,6 +680,10 @@ export async function relayResumeCommand(
         // stacking a second re-ask on top.
         const last = lastEvent(db, runId);
         if (last !== null && last.kind === 'RESPONSE') {
+          // Same stale-field shape as the cycle-cap branch: the re-ask is the run being
+          // active again, and the row must say so before the call, not after it returns.
+          run.status = 'ACTIVE';
+          updateRun(db, run);
           await callRole(context, run, 'REVIEWER', unclearVerdictPrompt());
         }
       }

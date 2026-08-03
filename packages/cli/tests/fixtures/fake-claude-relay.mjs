@@ -44,7 +44,15 @@ appendFileSync(
 );
 
 const sequence = JSON.parse(readFileSync(responseFile, 'utf8'));
-const responseText = String(sequence[Math.min(index, sequence.length - 1)]);
+let responseText = String(sequence[Math.min(index, sequence.length - 1)]);
+// '__DELAY:<ms>:<text>' holds the reply for <ms> before emitting <text> — wide enough a
+// window for tests to observe what the relay's summary row claims WHILE a call is in
+// flight, which is exactly where a stale status hid.
+const delayMatch = /^__DELAY:(\d+):([\s\S]*)$/.exec(responseText);
+if (delayMatch !== null) {
+  await new Promise((resolveDelay) => setTimeout(resolveDelay, Number.parseInt(delayMatch[1], 10)));
+  responseText = delayMatch[2];
+}
 // '__CRASH__' simulates an adapter-level failure AFTER the model ran: the process dies
 // without a result message, which the adapter surfaces as a thrown ModelError — the class
 // of exception that once escaped the relay's boundary and killed the whole runner.
