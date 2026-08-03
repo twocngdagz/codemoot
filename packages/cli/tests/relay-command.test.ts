@@ -446,6 +446,53 @@ describe('codemoot relay (real command, two scripted models)', () => {
     expect(revCalls).toHaveLength(2);
   });
 
+  it('a mid-run adapter swap starts a FRESH session instead of resuming a foreign id', async () => {
+    // An operator swapped the reviewer from claude to codex mid-run; the relay handed the
+    // stored claude session id to `codex exec resume`, the resume failed, and the fallback
+    // stalled at task_started for 79 minutes. A session id without its creator's kind is
+    // not enough to resume safely — when the kind changed, don't attempt it at all.
+    writeFileSync(implFile, JSON.stringify(['Did batch 1.', 'Did batch 2.']));
+    writeFileSync(
+      revFile,
+      JSON.stringify(['no verdict', 'ok\nVERDICT: PROCEED', 'ok\nVERDICT: COMPLETE']),
+    );
+    await relayRunCommand({ plan: 'plan.md', id: 'relay-kindswap' });
+    expect(printedStatus().status).toBe('PAUSED_UNCLEAR_VERDICT');
+
+    // Simulate the pre-swap state: the stored reviewer session was created by another kind.
+    const db = openDatabase(getDbPath());
+    db.prepare("UPDATE relay_runs SET reviewer_session_kind = 'codex' WHERE run_id = ?").run(
+      'relay-kindswap',
+    );
+    db.close();
+
+    await relayResumeCommand('relay-kindswap', {});
+    expect(printedStatus().status).toBe('COMPLETE');
+
+    const log = events('relay-kindswap');
+    expect(
+      log.some(
+        (e) =>
+          e.role === 'RELAY' &&
+          e.kind === 'NOTE' &&
+          e.content.includes('adapter kind changed (codex → claude)'),
+      ),
+    ).toBe(true);
+    // The re-ask ran WITHOUT a resume — a fresh session, not a foreign-id attempt.
+    const revCalls = readFileSync(`${revFile}.prompts.jsonl`, 'utf8')
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line));
+    expect(revCalls.at(1)?.resumedSessionId).toBeNull();
+    // And the fresh session is recorded with ITS creator's kind, so the ledger heals.
+    const after = openDatabase(getDbPath());
+    const row = after
+      .prepare('SELECT reviewer_session_kind FROM relay_runs WHERE run_id = ?')
+      .get('relay-kindswap') as { reviewer_session_kind: string | null };
+    after.close();
+    expect(row.reviewer_session_kind).toBe('claude');
+  });
+
   it('records the whole exchange — the transcript is the audit', async () => {
     writeFileSync(implFile, JSON.stringify(['b1.', 'b2.']));
     writeFileSync(revFile, JSON.stringify(['ok\nVERDICT: PROCEED', 'ok\nVERDICT: COMPLETE']));

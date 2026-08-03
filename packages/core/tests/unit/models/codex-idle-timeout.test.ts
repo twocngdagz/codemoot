@@ -56,6 +56,21 @@ describe('codex idleTimeout resolution', () => {
     delete process.env.CODEMOOT_FAKE_NO_MESSAGE;
   });
 
+  it('a refused resume is FLAGGED as such — the stored session is bad, not the call', async () => {
+    // Without the flag, a caller that stores session identity cannot tell "this session
+    // will never resume" (clear it, start fresh) from "this call died" (keep it, retry) —
+    // and a relay looped on a foreign claude session id under codex because of exactly
+    // that ambiguity.
+    const adapter = createModelAdapter(codexConfig());
+    try {
+      await adapter.resume('thread-foreign', 'hello', { ...CALL_OPTIONS, strictResume: true });
+      expect.unreachable('resume of a foreign thread must fail');
+    } catch (error) {
+      expect(String(error)).toMatch(/could not resume thread thread-foreign/);
+      expect((error as { resumeFailed?: boolean }).resumeFailed).toBe(true);
+    }
+  }, 15_000);
+
   it('a clean exit with NO agent message is a FAILED call, not an empty reply', async () => {
     // Codex handles SIGTERM as graceful shutdown: thread.started, nothing else, exit 0.
     // parseCodexJsonl used to return that as a successful empty text, and a hand-killed

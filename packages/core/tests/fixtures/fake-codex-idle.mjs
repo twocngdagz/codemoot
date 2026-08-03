@@ -12,6 +12,13 @@ if (argumentsList.includes('--version')) {
   process.exit(0);
 }
 
+// A resume attempt against this fake always fails, the way codex refuses a thread id it
+// has never seen — e.g. a claude session id handed over after a mid-run vendor swap.
+if (argumentsList.includes('resume')) {
+  process.stderr.write('fake-codex-idle: no such thread\n');
+  process.exit(1);
+}
+
 const silentMs = Number.parseInt(process.env.CODEMOOT_FAKE_SILENT_MS ?? '0', 10);
 
 // Worst-case child: ignores polite termination, so only a delivered SIGKILL to its process

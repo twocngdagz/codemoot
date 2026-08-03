@@ -18,6 +18,14 @@ export class ModelError extends Error {
    */
   partialOutput?: { readonly stdout: string; readonly stderr: string };
 
+  /**
+   * True when the failure is specifically a SESSION RESUME being refused, as opposed to the
+   * call itself dying. Callers that store session identity need the distinction: a failed
+   * resume means the STORED SESSION is bad (clear it and start fresh next time), while a
+   * failed call means the attempt is bad (keep the session, retry the call).
+   */
+  resumeFailed?: boolean;
+
   constructor(
     message: string,
     public readonly provider?: string,

@@ -27,7 +27,13 @@
 
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { ModelRegistry, generateId, loadConfig, type openDatabase } from '@codemoot/core';
+import {
+  ModelRegistry,
+  generateId,
+  loadConfig,
+  type openDatabase,
+  resolveModelAdapterKind,
+} from '@codemoot/core';
 import { withDatabase } from '../utils.js';
 import { installGitGuard, uninstallGitGuard } from './review-workflow.js';
 
@@ -47,6 +53,8 @@ interface RelayRun {
   pending: string | null;
   implementerSession: string | null;
   reviewerSession: string | null;
+  implementerSessionKind: string | null;
+  reviewerSessionKind: string | null;
 }
 
 interface RelayEvent {
@@ -186,13 +194,18 @@ function getRun(db: RelayDb, runId: string): RelayRun | null {
     pending: row.pending === null ? null : String(row.pending),
     implementerSession: row.implementer_session === null ? null : String(row.implementer_session),
     reviewerSession: row.reviewer_session === null ? null : String(row.reviewer_session),
+    implementerSessionKind:
+      row.implementer_session_kind == null ? null : String(row.implementer_session_kind),
+    reviewerSessionKind:
+      row.reviewer_session_kind == null ? null : String(row.reviewer_session_kind),
   };
 }
 
 function updateRun(db: RelayDb, run: RelayRun): void {
   db.prepare(
     `UPDATE relay_runs SET total_batches = ?, max_cycles = ?, batch = ?, cycle = ?, status = ?,
-       pending = ?, implementer_session = ?, reviewer_session = ?, updated_at = ?
+       pending = ?, implementer_session = ?, reviewer_session = ?,
+       implementer_session_kind = ?, reviewer_session_kind = ?, updated_at = ?
      WHERE run_id = ?`,
   ).run(
     run.totalBatches,
@@ -203,6 +216,8 @@ function updateRun(db: RelayDb, run: RelayRun): void {
     run.pending,
     run.implementerSession,
     run.reviewerSession,
+    run.implementerSessionKind,
+    run.reviewerSessionKind,
     new Date().toISOString(),
     run.runId,
   );
@@ -324,10 +339,22 @@ interface RelayContext {
   db: RelayDb;
   registry: ModelRegistry;
   roleAliases: { IMPLEMENTER: string; REVIEWER: string };
+  roleKinds: { IMPLEMENTER: string; REVIEWER: string };
   timeouts: { IMPLEMENTER: number | undefined; REVIEWER: number | undefined };
   guardEnv: Readonly<Record<string, string>>;
   stopRequested: () => boolean;
   dispose: () => void;
+}
+
+function clearRoleSession(context: RelayContext, run: RelayRun, role: RelayRole): void {
+  if (role === 'IMPLEMENTER') {
+    run.implementerSession = null;
+    run.implementerSessionKind = null;
+  } else {
+    run.reviewerSession = null;
+    run.reviewerSessionKind = null;
+  }
+  updateRun(context.db, run);
 }
 
 async function callRole(
@@ -336,9 +363,25 @@ async function callRole(
   role: RelayRole,
   prompt: string,
 ): Promise<string> {
-  appendEvent(context.db, run, { role, kind: 'PROMPT', content: prompt });
   const adapter = context.registry.getAdapter(context.roleAliases[role]);
-  const sessionId = role === 'IMPLEMENTER' ? run.implementerSession : run.reviewerSession;
+  const currentKind = context.roleKinds[role];
+  let sessionId = role === 'IMPLEMENTER' ? run.implementerSession : run.reviewerSession;
+  const sessionKind = role === 'IMPLEMENTER' ? run.implementerSessionKind : run.reviewerSessionKind;
+  // A session id without its creator's adapter kind is not enough to resume safely. An
+  // operator swapped the reviewer from claude to codex mid-run and the relay handed the
+  // claude session id to `codex exec resume` — the resume failed and the pre-strict
+  // fallback stalled at task_started, twice, for 79 and 13 minutes of nothing. When the
+  // kind has changed, don't attempt the resume at all: start fresh, and say so.
+  if (sessionId !== null && sessionKind !== null && sessionKind !== currentKind) {
+    appendEvent(context.db, run, {
+      role: 'RELAY',
+      kind: 'NOTE',
+      content: `${role} adapter kind changed (${sessionKind} → ${currentKind}); starting a fresh ${role.toLowerCase()} session`,
+    });
+    clearRoleSession(context, run, role);
+    sessionId = null;
+  }
+  appendEvent(context.db, run, { role, kind: 'PROMPT', content: prompt });
   const options = {
     ...(context.timeouts[role] === undefined ? {} : { timeout: context.timeouts[role] }),
     env: context.guardEnv,
@@ -348,10 +391,27 @@ async function callRole(
     strictResume: true,
   };
   const startedAt = Date.now();
-  const call =
-    sessionId === null
-      ? await adapter.send(prompt, options)
-      : await adapter.resume(sessionId, prompt, options);
+  let call: Awaited<ReturnType<typeof adapter.send>>;
+  try {
+    call =
+      sessionId === null
+        ? await adapter.send(prompt, options)
+        : await adapter.resume(sessionId, prompt, options);
+  } catch (error) {
+    // A REFUSED RESUME means the stored session is bad — legacy rows predate the kind
+    // columns, so a foreign id can still reach here. Clear it so the NEXT attempt starts
+    // fresh instead of failing on the same id forever, then surface the failure honestly:
+    // the boundary records it and the operator resumes deliberately.
+    if ((error as { resumeFailed?: boolean }).resumeFailed === true && sessionId !== null) {
+      clearRoleSession(context, run, role);
+      appendEvent(context.db, run, {
+        role: 'RELAY',
+        kind: 'NOTE',
+        content: `${role} session ${sessionId} could not be resumed; cleared — the next attempt starts a fresh session`,
+      });
+    }
+    throw error;
+  }
   // An empty response is NOT a response. A hand-killed codex once surfaced as a clean call
   // with zero-length text, and the transcript gained a turn that never happened. Refuse it
   // here — the prompt stays unanswered in the log, the boundary records the failure, and
@@ -362,8 +422,13 @@ async function callRole(
     );
   }
   const newSession = call.sessionId ?? sessionId;
-  if (role === 'IMPLEMENTER') run.implementerSession = newSession ?? null;
-  else run.reviewerSession = newSession ?? null;
+  if (role === 'IMPLEMENTER') {
+    run.implementerSession = newSession ?? null;
+    run.implementerSessionKind = newSession == null ? null : currentKind;
+  } else {
+    run.reviewerSession = newSession ?? null;
+    run.reviewerSessionKind = newSession == null ? null : currentKind;
+  }
   appendEvent(context.db, run, {
     role,
     kind: 'RESPONSE',
@@ -561,6 +626,14 @@ function buildContext(db: RelayDb, projectDir: string): RelayContext {
     db,
     registry: ModelRegistry.fromConfig(config, projectDir),
     roleAliases: { IMPLEMENTER: implementerAlias, REVIEWER: reviewerAlias },
+    roleKinds: {
+      IMPLEMENTER: resolveModelAdapterKind(
+        config.models[implementerAlias] ?? { provider: 'anthropic', model: '' },
+      ),
+      REVIEWER: resolveModelAdapterKind(
+        config.models[reviewerAlias] ?? { provider: 'anthropic', model: '' },
+      ),
+    },
     timeouts: { IMPLEMENTER: timeoutOf(implementerAlias), REVIEWER: timeoutOf(reviewerAlias) },
     guardEnv: {
       PATH: guardedPath,

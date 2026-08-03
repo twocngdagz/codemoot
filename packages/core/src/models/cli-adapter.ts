@@ -307,14 +307,19 @@ export class CliAdapter implements CliBridge {
         return await doCall(options.sessionId);
       } catch (error) {
         if (options.strictResume === true) {
-          // Mandatory continuity: never fall back to a fresh exec — surface the failure.
-          throw new ModelError(
+          // Mandatory continuity: never fall back to a fresh exec — surface the failure,
+          // FLAGGED as a resume failure so the caller knows the STORED SESSION is what is
+          // bad. A relay once looped retrying a foreign session id because it could not
+          // tell "this session will never resume" from "this call happened to die".
+          const resumeError = new ModelError(
             `Codex CLI could not resume thread ${options.sessionId}: ${
               error instanceof Error ? error.message : String(error)
             }`,
             this.provider,
             this.modelId,
           );
+          resumeError.resumeFailed = true;
+          throw resumeError;
         }
         // Resume failed — fall back to fresh exec
         console.error(

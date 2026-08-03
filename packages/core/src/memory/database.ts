@@ -7,7 +7,7 @@ import {
   REVIEW_WORKFLOW_RUNNER_STATE_DDL,
 } from './review-workflow-schema.js';
 
-const SCHEMA_VERSION = '19';
+const SCHEMA_VERSION = '20';
 
 const MIGRATIONS = [
   // Sessions
@@ -404,7 +404,17 @@ export function runMigrations(db: Database.Database): void {
     // a killed reviewer call left its process alive holding the run, and a resume started a
     // second — so a run now records the pid that holds it, and a second worker is refused
     // while that pid is alive. Additive columns; existing rows read as unheld.
-    for (const column of ['worker_pid INTEGER', 'worker_started_at TEXT']) {
+    // v20: each stored role session remembers WHICH ADAPTER KIND created it. An operator
+    // swapped the reviewer from claude to codex mid-run, and the relay tried
+    // `codex exec resume <claude-session-id>` — the resume failed and the fallback stalled
+    // at task_started, twice, 79 and 13 minutes of nothing. A session id without its
+    // creator's kind is not enough information to resume safely.
+    for (const column of [
+      'worker_pid INTEGER',
+      'worker_started_at TEXT',
+      'implementer_session_kind TEXT',
+      'reviewer_session_kind TEXT',
+    ]) {
       try {
         db.exec(`ALTER TABLE relay_runs ADD COLUMN ${column}`);
       } catch {
