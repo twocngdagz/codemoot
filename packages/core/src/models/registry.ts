@@ -142,6 +142,13 @@ function createCliAdapter(config: ModelConfig, projectDir?: string): CliAdapter 
     model: config.model,
     cliName: 'codex',
     projectDir,
+    // Seconds in config, milliseconds in the adapter — the same resolution the claude
+    // factory performs below. Without this, `cliAdapter.idleTimeout` validated and had no
+    // effect on codex: the runner fell through to its hardcoded default and killed a
+    // configured-900s reviewer at 120s of normal reasoning silence.
+    ...('idleTimeout' in adapterConfig && typeof adapterConfig.idleTimeout === 'number'
+      ? { idleTimeout: adapterConfig.idleTimeout * 1000 }
+      : {}),
   });
 }
 

@@ -110,6 +110,13 @@ const CODEX_CAPABILITIES: BridgeCapabilities = {
   supportsCwd: true,
 };
 
+// Codex has no `--include-partial-messages` equivalent: during a long reasoning turn it
+// emits NOTHING, so silence is structural rather than a hang symptom. A live reviewer call
+// was killed at 2 minutes of quiet, 8 minutes into a perfectly normal medium-effort review
+// of a 22-file batch. Claude keeps a tight 2-minute default because partial messages keep
+// its stream alive; codex needs room to think in silence.
+const DEFAULT_CODEX_IDLE_TIMEOUT_MS = 600_000;
+
 export class CliAdapter implements CliBridge {
   private command: string;
   private baseArgs: string[];
@@ -118,6 +125,7 @@ export class CliAdapter implements CliBridge {
   private cliName: string;
   private projectDir: string | undefined;
   private readonly runtimeEvidence?: CliRuntimeEvidence;
+  private readonly defaultIdleTimeout: number;
   readonly capabilities: BridgeCapabilities;
 
   get name(): string {
@@ -135,6 +143,8 @@ export class CliAdapter implements CliBridge {
     cliName: string;
     projectDir?: string;
     runtimeEvidence?: CliRuntimeEvidence;
+    /** Milliseconds of allowed silence, from `cliAdapter.idleTimeout` (seconds) in config. */
+    idleTimeout?: number;
   }) {
     this.command = config.command;
     this.baseArgs = config.args;
@@ -143,6 +153,7 @@ export class CliAdapter implements CliBridge {
     this.cliName = config.cliName;
     this.projectDir = config.projectDir;
     this.runtimeEvidence = config.runtimeEvidence;
+    this.defaultIdleTimeout = config.idleTimeout ?? DEFAULT_CODEX_IDLE_TIMEOUT_MS;
     this.capabilities = {
       ...CODEX_CAPABILITIES,
       maxContextTokens: MODEL_CONTEXT_WINDOWS[config.model] ?? DEFAULT_CONTEXT_WINDOW,
@@ -188,7 +199,7 @@ export class CliAdapter implements CliBridge {
 
     try {
       await this.runProcess(this.command, args, env, timeout, prompt, {
-        idleTimeout: options?.idleTimeout,
+        idleTimeout: options?.idleTimeout ?? this.defaultIdleTimeout,
         onProgress: options?.onProgress,
         onSpawn: options?.onSpawn,
         onStderr: options?.onStderr,
@@ -246,7 +257,7 @@ export class CliAdapter implements CliBridge {
 
       const start = Date.now();
       const stdout = await this.runProcess(this.command, args, env, timeout, prompt, {
-        idleTimeout: options?.idleTimeout,
+        idleTimeout: options?.idleTimeout ?? this.defaultIdleTimeout,
         onProgress: options?.onProgress,
         onSpawn: options?.onSpawn,
         onStderr: options?.onStderr,
@@ -473,7 +484,7 @@ export class CliAdapter implements CliBridge {
       }, timeout);
 
       // Idle timeout — resets on every stdout/stderr chunk. Detects stalled processes.
-      const idleMs = options?.idleTimeout ?? 120_000;
+      const idleMs = options?.idleTimeout ?? DEFAULT_CODEX_IDLE_TIMEOUT_MS;
       let idleTimer = setTimeout(() => {
         killProcessTree(child.pid);
         fail(
