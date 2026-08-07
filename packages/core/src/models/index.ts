@@ -7,6 +7,21 @@ export {
   resolveModelAdapterKind,
 } from './registry.js';
 export type { ModelAdapter, ModelAdapterHealth } from './registry.js';
+export {
+  CursorCliAdapter,
+  CURSOR_TRUST_FLAGS,
+  buildCursorEnvironment,
+  defaultCursorCommand,
+  hasCursorTrustFlag,
+} from './cursor-cli-adapter.js';
+export type { CursorCallOptions, CursorCallResult } from './cursor-cli-adapter.js';
+export {
+  CursorCliProtocolError,
+  CursorContentRefusalError,
+  findContentRefusal,
+  parseCursorCliStream,
+} from './cursor-cli-protocol.js';
+export type { ParsedCursorCliOutput } from './cursor-cli-protocol.js';
 export { callModel, streamModel } from './caller.js';
 export type { TextDeltaEmitter } from './caller.js';
 export { withFallback } from './fallback.js';

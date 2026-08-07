@@ -79,10 +79,20 @@ export class ReviewWorkflowIdentityError extends Error {
   }
 }
 
+const ADAPTER_KIND_TO_DOMAIN: Readonly<Record<CliAdapterKind, AgentAdapterKind>> = {
+  claude: 'CLAUDE',
+  codex: 'CODEX',
+  cursor: 'CURSOR',
+};
+
 export function resolveConfiguredAdapterKind(model: ModelConfig): AgentAdapterKind {
+  // A total map, not a binary: the previous `claude ? 'CLAUDE' : 'CODEX'` would have
+  // silently labelled every Cursor assignment CODEX — and adapter kind is what
+  // requireDifferentAdapterKinds compares to prove reviewer independence.
   const configuredKind: CliAdapterKind =
-    model.cliAdapter?.kind ?? (model.provider === 'anthropic' ? 'claude' : 'codex');
-  return configuredKind === 'claude' ? 'CLAUDE' : 'CODEX';
+    model.cliAdapter?.kind ??
+    (model.provider === 'anthropic' ? 'claude' : model.provider === 'cursor' ? 'cursor' : 'codex');
+  return ADAPTER_KIND_TO_DOMAIN[configuredKind];
 }
 
 /**

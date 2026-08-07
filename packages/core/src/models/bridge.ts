@@ -3,7 +3,7 @@
 import type { ModelCallResult } from '../types/models.js';
 import type { ProgressCallbacks } from './cli-adapter.js';
 
-export type BridgeAdapterKind = 'CLAUDE' | 'CODEX';
+export type BridgeAdapterKind = 'CLAUDE' | 'CODEX' | 'CURSOR';
 
 /** Capabilities that a bridge implementation advertises. */
 export interface BridgeCapabilities {

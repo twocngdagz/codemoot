@@ -1,6 +1,7 @@
 // packages/core/src/config/schema.ts
 
 import { z } from 'zod';
+import { CURSOR_TRUST_FLAGS } from '../models/cursor-cli-adapter.js';
 import { resolveConfiguredAdapterKind } from '../review-workflow-identity/service.js';
 import {
   CONTEXT_ACTIVE,
@@ -12,8 +13,8 @@ import {
 import { ConfigError } from '../utils/errors.js';
 import { COMPATIBILITY_REVIEW_GATED_CONFIG } from './review-gated.js';
 
-export const modelProviderSchema = z.enum(['openai', 'anthropic']);
-export const cliAdapterKindSchema = z.enum(['codex', 'claude']);
+export const modelProviderSchema = z.enum(['openai', 'anthropic', 'cursor']);
+export const cliAdapterKindSchema = z.enum(['codex', 'claude', 'cursor']);
 
 export const cliAdapterConfigSchema = z.object({
   kind: cliAdapterKindSchema.optional(),
@@ -55,6 +56,27 @@ export const modelConfigSchema = z
         message: 'Codex CLI adapters require provider "openai"',
       });
     }
+    if (value.cliAdapter?.kind === 'cursor' && value.provider !== 'cursor') {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['cliAdapter', 'kind'],
+        message: 'Cursor CLI adapters require provider "cursor"',
+      });
+    }
+    // Rejected at CONFIG time, not discovered at runtime: verified live, a headless
+    // cursor-agent run without --force/--yolo/--trust writes a workspace-trust prompt to
+    // stderr, emits ZERO stdout, and waits forever. Under a relay that is not a fast
+    // failure — it is an idle-timeout kill after the entire silence budget.
+    if (
+      value.cliAdapter?.kind === 'cursor' &&
+      !CURSOR_TRUST_FLAGS.some((flag) => value.cliAdapter?.args.includes(flag))
+    ) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['cliAdapter', 'args'],
+        message: `Cursor CLI adapters require one of ${CURSOR_TRUST_FLAGS.join(', ')} in args for headless use; without it the CLI produces no output and waits on a workspace-trust prompt`,
+      });
+    }
   })
   .transform((value) => ({
     ...value,
@@ -63,7 +85,13 @@ export const modelConfigSchema = z
       : {
           cliAdapter: {
             ...value.cliAdapter,
-            kind: value.cliAdapter.kind ?? (value.provider === 'anthropic' ? 'claude' : 'codex'),
+            kind:
+              value.cliAdapter.kind ??
+              (value.provider === 'anthropic'
+                ? 'claude'
+                : value.provider === 'cursor'
+                  ? 'cursor'
+                  : 'codex'),
           },
         }),
   }));

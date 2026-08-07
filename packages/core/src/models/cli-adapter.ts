@@ -273,7 +273,7 @@ export class CliAdapter implements CliBridge {
       // turn that never happened. No agent message means no response happened.
       if (!parsed.sawAgentMessage) {
         const error = new ModelError(
-          `Codex CLI closed without an agent message (a killed or terminated process is a failed call, not an empty reply)`,
+          'Codex CLI closed without an agent message (a killed or terminated process is a failed call, not an empty reply)',
           this.provider,
           this.modelId,
         );

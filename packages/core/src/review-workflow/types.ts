@@ -98,7 +98,7 @@ export type Authority = (typeof AUTHORITIES)[number];
 export const ASSIGNED_ROLES = ['IMPLEMENTER', 'REVIEWER'] as const;
 export type AssignedRole = (typeof ASSIGNED_ROLES)[number];
 
-export const AGENT_ADAPTER_KINDS = ['CLAUDE', 'CODEX'] as const;
+export const AGENT_ADAPTER_KINDS = ['CLAUDE', 'CODEX', 'CURSOR'] as const;
 export type AgentAdapterKind = (typeof AGENT_ADAPTER_KINDS)[number];
 
 export const COMMIT_PERMISSIONS = ['DENIED', 'AUTHORIZED'] as const;

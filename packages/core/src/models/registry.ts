@@ -6,6 +6,7 @@ import type { CliBridge } from './bridge.js';
 import { ClaudeCliAdapter } from './claude-cli-adapter.js';
 import { CliAdapter } from './cli-adapter.js';
 import { type CliProbeResult, probeCliCommand } from './cli-runtime-evidence.js';
+import { CursorCliAdapter } from './cursor-cli-adapter.js';
 
 /** All registered models implement the common CLI bridge contract. */
 export type ModelAdapter = CliBridge;
@@ -153,7 +154,22 @@ function createCliAdapter(config: ModelConfig, projectDir?: string): CliAdapter 
 }
 
 function createModelAdapter(config: ModelConfig, projectDir?: string): ModelAdapter {
-  if (resolveModelAdapterKind(config) === 'claude') {
+  const kind = resolveModelAdapterKind(config);
+  if (kind === 'cursor') {
+    const adapterConfig = config.cliAdapter;
+    return new CursorCliAdapter({
+      command: adapterConfig?.command ?? defaultCursorCommand(),
+      args: adapterConfig?.args ?? [],
+      model: config.model,
+      projectDir,
+      timeout: (adapterConfig?.timeout ?? config.timeout) * 1000,
+      ...(adapterConfig?.idleTimeout === undefined
+        ? {}
+        : { idleTimeout: adapterConfig.idleTimeout * 1000 }),
+      envAllowlist: adapterConfig?.envAllowlist,
+    });
+  }
+  if (kind === 'claude') {
     const adapterConfig = config.cliAdapter;
     return new ClaudeCliAdapter({
       command: adapterConfig?.command ?? defaultClaudeCommand(),
@@ -171,7 +187,10 @@ function createModelAdapter(config: ModelConfig, projectDir?: string): ModelAdap
 }
 
 export function resolveModelAdapterKind(config: ModelConfig): CliAdapterKind {
-  return config.cliAdapter?.kind ?? (config.provider === 'anthropic' ? 'claude' : 'codex');
+  if (config.cliAdapter?.kind !== undefined) return config.cliAdapter.kind;
+  if (config.provider === 'anthropic') return 'claude';
+  if (config.provider === 'cursor') return 'cursor';
+  return 'codex';
 }
 
 /** Default codex CLI adapter config. */
@@ -191,6 +210,10 @@ function getDefaultCliConfig(projectDir?: string): {
 
 function defaultCodexCommand(): string {
   return process.platform === 'win32' ? 'codex.cmd' : 'codex';
+}
+
+function defaultCursorCommand(): string {
+  return process.platform === 'win32' ? 'cursor-agent.cmd' : 'cursor-agent';
 }
 
 function defaultClaudeCommand(): string {

@@ -45,7 +45,7 @@ export const CONFIG_TOOL_DEFINITIONS = [
   {
     name: 'codemoot_docs',
     description:
-      'Read the canonical CodeMoot documentation. ALWAYS read topic "configuration" before creating or editing a .cowork.yml, "autonomous-runner" before driving codemoot workflow commands, and "handoff-contracts" before authoring or debugging any agent JSON response (a wrong envelope field costs a full invocation).',
+      'Read the canonical CodeMoot documentation. ALWAYS read topic "configuration" before creating or editing a .cowork.yml, "autonomous-runner" before driving codemoot workflow commands, and "handoff-contracts" before authoring or debugging any agent JSON response (a wrong envelope field costs a full invocation). Adapter kinds are claude, codex and cursor — for cursor, read "configuration" first: it is a router (one CLI, many vendors), its effort level is part of the model id, and a headless run without --force silently produces nothing.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -63,7 +63,7 @@ export const CONFIG_TOOL_DEFINITIONS = [
   {
     name: 'codemoot_config_get',
     description:
-      "Read a project's .cowork.yml (raw YAML plus a validation verdict and a role/model summary). projectDir may point at any repository.",
+      "Read a project's .cowork.yml (raw YAML plus a validation verdict and a role/model summary). projectDir may point at any repository. Reported adapter kinds are claude, codex or cursor.",
     inputSchema: {
       type: 'object' as const,
       properties: {

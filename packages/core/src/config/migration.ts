@@ -90,7 +90,12 @@ function migrateModels(models: Record<string, unknown>): Record<string, unknown>
       if (!isRecord(cliAdapter) || typeof cliAdapter.kind === 'string') {
         return [alias, modelValue];
       }
-      const inferredKind = modelValue.provider === 'anthropic' ? 'claude' : 'codex';
+      const inferredKind =
+        modelValue.provider === 'anthropic'
+          ? 'claude'
+          : modelValue.provider === 'cursor'
+            ? 'cursor'
+            : 'codex';
       return [alias, { ...modelValue, cliAdapter: { ...cliAdapter, kind: inferredKind } }];
     }),
   );

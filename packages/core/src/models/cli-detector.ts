@@ -18,7 +18,10 @@ export interface CliDetectionResult {
 const CACHE_TTL = 5 * 60 * 1000;
 const cache = new Map<string, CliDetectionResult>();
 
-export async function detectCli(name: 'codex'): Promise<CliDetectionResult> {
+/** CLIs this doctor-style probe can look for. `cursor-agent` is the Cursor executable. */
+export type DetectableCli = 'codex' | 'claude' | 'cursor-agent';
+
+export async function detectCli(name: DetectableCli): Promise<CliDetectionResult> {
   const cached = cache.get(name);
   if (cached && Date.now() - cached.detectedAt < CACHE_TTL) {
     return cached;
@@ -38,7 +41,7 @@ export function getCacheForTesting(): Map<string, CliDetectionResult> {
   return cache;
 }
 
-async function probeCliTool(name: 'codex'): Promise<CliDetectionResult> {
+async function probeCliTool(name: DetectableCli): Promise<CliDetectionResult> {
   const now = Date.now();
 
   // Step 1: Find executable

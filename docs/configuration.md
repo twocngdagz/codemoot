@@ -35,7 +35,7 @@ A map of **aliases** (any name) to model configurations. Roles reference these a
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
-| `kind` | `claude` \| `codex` | inferred from provider | `claude` requires `provider: anthropic`; `codex` requires `provider: openai` |
+| `kind` | `claude` \| `codex` \| `cursor` | inferred from provider | `claude` requires `provider: anthropic`; `codex` requires `provider: openai`; `cursor` requires `provider: cursor` |
 | `command` | string | — required | Executable, e.g. `claude` or `codex` |
 | `args` | string[] | — required | Base CLI args, **passed through to the CLI**. Codex convention: `[exec]`. This is where per-CLI options go, e.g. Codex reasoning effort: `[exec, -c, model_reasoning_effort=high]` (values: `high`/`medium`/`low`) |
 | `timeout` | positive seconds | — required | Per-invocation subprocess timeout (absolute wall clock). **This is the ceiling the autonomous runner uses** when no explicit `--timeout` is passed. Measured: one plan refinement of a 66 KB plan took 20-30 min at `--effort max` and was still writing at 30 min — set 7200 (2 h) for large plans |
@@ -83,6 +83,44 @@ output for 120000ms…)`). Raise `idleTimeout`, and/or add `--include-partial-me
   (`claude-opus-5` > `claude-sonnet-5` > `claude-sonnet-4-5`); `MAX_THINKING_TOKENS` via
   `envAllowlist` remains available for explicit thinking budgets.
 - **Codex:** append `-c model_reasoning_effort=high|medium|low` to `args`.
+
+### Cursor (`kind: cursor`)
+
+`cursor-agent` is a **router**: one CLI serving Anthropic, OpenAI, xAI and Moonshot models,
+on its own subscription. That makes it a third route rather than a duplicate — it reaches
+models neither other adapter can (Grok, Kimi, Composer, the GPT/Sol family), and it keeps
+working when another provider's budget is exhausted.
+
+```yaml
+reviewer:
+  provider: cursor              # 'cursor' is the ROUTER, not the underlying vendor
+  model: gpt-5.6-sol-medium     # effort is PART of the id; there is no effort flag
+  cliAdapter:
+    kind: cursor
+    command: cursor-agent
+    args: [-p, --force, --output-format, stream-json]
+    timeout: 604800
+    idleTimeout: 604800         # GPT/Sol models work in total silence — see below
+```
+
+- **`--force` (or `--yolo`/`--trust`) is mandatory and validated at config load.** Without
+  it a headless run writes a workspace-trust prompt to stderr, emits **zero stdout**, and
+  waits forever — which under a runner is not a fast failure but an idle-timeout kill after
+  the entire silence budget. Config validation rejects it up front.
+- **`--output-format stream-json`, never `text`.** `text` buffers to the very end, so an
+  in-progress run shows zero bytes and reads as hung.
+- **Silence is not death here.** Claude with `--include-partial-messages` speaks every ~5s;
+  GPT/Sol models work silently and speak when finished — measured at 52 seconds and at 15
+  minutes, both healthy. Set `idleTimeout` to the workflow ceiling for GPT-family models.
+  The adapter's own default is 10 minutes rather than Claude's 2.
+- **Effort is part of the model id** (`gpt-5.6-sol-{none,low,medium,high,xhigh,max}`, each
+  with a `-fast` variant). The id is passed through verbatim; no effort flag is synthesised.
+  `cursor-agent --list-models` shows what your account can reach.
+- **Content refusals are their own failure.** Any GPT-family run is subject to OpenAI's
+  cybersecurity filter, which kills the run mid-flight and returns no verdict — triggered in
+  practice by test fixtures containing fake tokens, and by asking whether a security guard
+  could be defeated. CodeMoot surfaces this as a distinct refusal error, not a crash, so you
+  re-frame or switch model instead of hunting a bug.
 
 ## `roles` — role assignments (required)
 

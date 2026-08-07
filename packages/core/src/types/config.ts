@@ -1,8 +1,11 @@
 // packages/core/src/types/config.ts
 
-export type ModelProvider = 'openai' | 'anthropic';
+// 'cursor' is a ROUTER, not a vendor: one CLI serving Anthropic, OpenAI, xAI and Moonshot
+// models. Naming it as a provider keeps the kind⇄provider constraint one-to-one instead of
+// inferring a vendor from the model id — a mapping that would rot with Cursor's catalogue.
+export type ModelProvider = 'openai' | 'anthropic' | 'cursor';
 
-export type CliAdapterKind = 'codex' | 'claude';
+export type CliAdapterKind = 'codex' | 'claude' | 'cursor';
 
 export interface CliAdapterConfig {
   kind?: CliAdapterKind;

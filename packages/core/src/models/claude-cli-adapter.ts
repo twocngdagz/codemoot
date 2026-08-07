@@ -220,7 +220,8 @@ export class ClaudeCliAdapter implements CliBridge {
     const executable = await collectCliRuntimeEvidence(this.command, this.projectDir, env);
     const args = this.buildArgs(resumeSessionId);
     const maxOutputBytes = options?.maxOutputBytes ?? MAX_OUTPUT_BYTES;
-    const processResult = await runClaudeProcess({
+    const processResult = await runStreamingCliProcess({
+      label: 'Claude CLI',
       command: executable.executablePath,
       args,
       cwd: this.projectDir,
@@ -337,7 +338,16 @@ export function buildClaudeEnvironment(
   };
 }
 
-async function runClaudeProcess(input: {
+/**
+ * The streaming-CLI process runner, shared by every stream-json adapter.
+ *
+ * Exported and label-parameterised rather than copied: the timer discipline, process-group
+ * kill, partial-output preservation and stdout-vs-stderr diagnosis in here were each earned
+ * by a live failure, and a second copy would mean the next such fix lands in only one of
+ * them. `label` names the CLI in error messages; everything else is behaviour-identical to
+ * what the Claude path has always used.
+ */
+export async function runStreamingCliProcess(input: {
   command: string;
   args: readonly string[];
   cwd: string;
@@ -348,14 +358,15 @@ async function runClaudeProcess(input: {
   timeout: number;
   idleTimeout: number;
   maxCaptureBytes: number;
+  /** Human name of the CLI, used in error messages (e.g. "Claude CLI", "Cursor CLI"). */
+  label?: string;
+  /** Prompt on stdin (Claude) or already passed as an argument (Cursor). */
+  promptViaStdin?: boolean;
   options?: ClaudeCallOptions;
 }): Promise<ProcessResult> {
+  const label = input.label ?? 'Claude CLI';
   if (input.options?.signal?.aborted) {
-    throw new ModelError(
-      'Claude CLI invocation cancelled before spawn',
-      input.provider,
-      input.model,
-    );
+    throw new ModelError(`${label} invocation cancelled before spawn`, input.provider, input.model);
   }
 
   return new Promise((resolveResult, rejectResult) => {
@@ -403,7 +414,7 @@ async function runClaudeProcess(input: {
         killProcessTree(child.pid);
         fail(
           new ModelError(
-            `Claude CLI idle timeout (no output for ${input.idleTimeout}ms, ${elapsedDescription()})`,
+            `${label} idle timeout (no output for ${input.idleTimeout}ms, ${elapsedDescription()})`,
             input.provider,
             input.model,
           ),
@@ -412,14 +423,14 @@ async function runClaudeProcess(input: {
     };
     const onAbort = (): void => {
       killProcessTree(child.pid);
-      fail(new ModelError('Claude CLI invocation cancelled', input.provider, input.model));
+      fail(new ModelError(`${label} invocation cancelled`, input.provider, input.model));
     };
 
     const absoluteTimer = setTimeout(() => {
       killProcessTree(child.pid);
       fail(
         new ModelError(
-          `Claude CLI absolute timeout (limit ${input.timeout}ms, ${elapsedDescription()})`,
+          `${label} absolute timeout (limit ${input.timeout}ms, ${elapsedDescription()})`,
           input.provider,
           input.model,
         ),
@@ -440,7 +451,7 @@ async function runClaudeProcess(input: {
         killProcessTree(child.pid);
         fail(
           new ModelError(
-            'Claude CLI spawned without a valid process ID',
+            `${label} spawned without a valid process ID`,
             input.provider,
             input.model,
           ),
@@ -453,11 +464,7 @@ async function runClaudeProcess(input: {
     });
     child.on('error', (error) => {
       fail(
-        new ModelError(
-          `Claude CLI subprocess failed: ${error.message}`,
-          input.provider,
-          input.model,
-        ),
+        new ModelError(`${label} subprocess failed: ${error.message}`, input.provider, input.model),
       );
     });
     child.stdout.on('data', (data: Buffer) => {
@@ -467,7 +474,7 @@ async function runClaudeProcess(input: {
         killProcessTree(child.pid);
         fail(
           new ModelError(
-            `Claude CLI output exceeded ${input.maxCaptureBytes} captured bytes`,
+            `${label} output exceeded ${input.maxCaptureBytes} captured bytes`,
             input.provider,
             input.model,
           ),
@@ -494,7 +501,7 @@ async function runClaudeProcess(input: {
       if (code !== 0) {
         rejectResult(
           new ModelError(
-            `Claude CLI subprocess exited with code ${code}: ${describeProcessFailure(stderr, stdout)}`,
+            `${label} subprocess exited with code ${code}: ${describeProcessFailure(stderr, stdout)}`,
             input.provider,
             input.model,
           ),
@@ -504,7 +511,7 @@ async function runClaudeProcess(input: {
       if (processId === undefined) {
         rejectResult(
           new ModelError(
-            'Claude CLI closed without process identity evidence',
+            `${label} closed without process identity evidence`,
             input.provider,
             input.model,
           ),
@@ -522,16 +529,17 @@ async function runClaudeProcess(input: {
     });
 
     child.stdin.on('error', (error) => {
-      fail(
-        new ModelError(`Claude CLI stdin failed: ${error.message}`, input.provider, input.model),
-      );
+      fail(new ModelError(`${label} stdin failed: ${error.message}`, input.provider, input.model));
     });
     input.options?.signal?.addEventListener('abort', onAbort, { once: true });
     if (input.options?.signal?.aborted) {
       onAbort();
       return;
     }
-    child.stdin.end(input.prompt);
+    // Cursor takes its prompt as a positional ARGUMENT, not on stdin; closing the stream
+    // empty is what lets a non-stdin CLI proceed instead of waiting on input forever.
+    if (input.promptViaStdin === false) child.stdin.end();
+    else child.stdin.end(input.prompt);
   });
 }
 

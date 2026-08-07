@@ -44,8 +44,16 @@ codemoot shipit --profile safe
 - At least one supported agent CLI:
   - [Claude Code CLI](https://claude.com/claude-code) for Anthropic models.
   - [Codex CLI](https://github.com/openai/codex) for OpenAI models (`npm install -g @openai/codex`).
+  - [Cursor CLI](https://cursor.com/cli) (`cursor-agent`) — a **router**: one CLI serving
+    Anthropic, OpenAI, xAI and Moonshot models on its own subscription, so it reaches
+    models the other two cannot (Grok, Kimi, Composer, the GPT/Sol family) and keeps
+    working when another provider's budget is exhausted. See
+    [docs/configuration.md](docs/configuration.md#cursor-kind-cursor).
 - Authentication or a subscription for every configured CLI.
 - A clean Git repository for autonomous review-gated workflows.
+
+Three adapter kinds are supported — `claude`, `codex` and `cursor` — and reviewer
+independence is strongest when the reviewer is a different vendor from the implementer.
 
 The default `review-gated` preset uses Claude Code as implementer and Codex CLI as reviewer.
 Projects may configure two separate Claude models instead, provided role sessions remain
