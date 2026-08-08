@@ -830,6 +830,11 @@ relay
     positiveInteger,
   )
   .option('--start-batch <n>', 'Start at this batch', positiveInteger)
+  .option(
+    '--review-from <batch>',
+    'From this batch on, open at the REVIEWER: the work is already implemented and committed; review it as it stands (FIX loops run unchanged)',
+    positiveInteger,
+  )
   .option('--background', 'Run detached; stdout/stderr go to .cowork/relay/<run-id>.log')
   .action(relayRunCommand);
 

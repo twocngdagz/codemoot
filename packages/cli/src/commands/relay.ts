@@ -50,6 +50,8 @@ interface RelayRun {
   maxCycles: number;
   batch: number;
   cycle: number;
+  /** Batches >= this number start at the REVIEWER — the work already exists on the branch. */
+  reviewFrom: number | null;
   status: 'ACTIVE' | 'PAUSED_CYCLE_CAP' | 'PAUSED_UNCLEAR_VERDICT' | 'STOPPED' | 'COMPLETE';
   pending: string | null;
   implementerSession: string | null;
@@ -153,6 +155,15 @@ When the batch is complete, stop and reply with a summary for the reviewer: what
 ${SINGLE_TURN_NOTICE}`;
 }
 
+// One contract for BOTH reviewer prompts — a fork here would let the review-only path
+// drift from the verdict rules the rest of the loop is built on.
+const VERDICT_CONTRACT = `A verdict without findings will not be accepted: PROCEED and COMPLETE must be accompanied by what you verified and how.
+
+End your reply with exactly ONE line, and nothing after it:
+VERDICT: FIX        (problems that must be addressed)
+VERDICT: PROCEED    (the batch is acceptable; move to the next)
+VERDICT: COMPLETE   (this was the final batch and the plan is done)`;
+
 function reviewerPrompt(run: RelayRun, implementerSummary: string): string {
   return `You are the REVIEWER in a two-model loop. The execution plan is the file at ${run.planPath} — read it from disk yourself.
 
@@ -164,12 +175,26 @@ Read Batch ${run.batch} in the plan. Verify the implementer's claims against the
 
 ${SINGLE_TURN_NOTICE}
 
-A verdict without findings will not be accepted: PROCEED and COMPLETE must be accompanied by what you verified and how.
+${VERDICT_CONTRACT}`;
+}
 
-End your reply with exactly ONE line, and nothing after it:
-VERDICT: FIX        (problems that must be addressed)
-VERDICT: PROCEED    (the batch is acceptable; move to the next)
-VERDICT: COMPLETE   (this was the final batch and the plan is done)`;
+/**
+ * The opening prompt for a batch that ALREADY EXISTS on the branch (--review-from). There
+ * is no implementer summary for such a batch and none is fabricated — the reviewer is told
+ * the truth and pointed at the repository itself. The verdict contract is identical, so
+ * everything downstream (FIX → fixPrompt → re-review, the findings floor, the cycle cap)
+ * behaves exactly as it does for an implemented-in-run batch.
+ */
+function reviewOnlyReviewerPrompt(run: RelayRun): string {
+  return `You are the REVIEWER in a two-model loop. The execution plan is the file at ${run.planPath} — read it from disk yourself.
+
+Batch ${run.batch} of ${run.totalBatches} was implemented outside this run and is already committed. There is no implementer summary to check claims against — review the repository's CURRENT state against the plan.
+
+Read Batch ${run.batch} in the plan. Verify the repository satisfies it — the diff, the files, and whatever verification you judge necessary; you may run commands. Reply with your findings, written for the implementer who will address them.
+
+${SINGLE_TURN_NOTICE}
+
+${VERDICT_CONTRACT}`;
 }
 
 function fixPrompt(run: RelayRun, review: string, preface = ''): string {
@@ -213,6 +238,8 @@ function getRun(db: RelayDb, runId: string): RelayRun | null {
     maxCycles: Number(row.max_cycles),
     batch: Number(row.batch),
     cycle: Number(row.cycle),
+    // == null, not === null: rows created before v22 read the column as undefined.
+    reviewFrom: row.review_from == null ? null : Number(row.review_from),
     status: String(row.status) as RelayRun['status'],
     pending: row.pending === null ? null : String(row.pending),
     implementerSession: row.implementer_session === null ? null : String(row.implementer_session),
@@ -514,6 +541,32 @@ async function callRole(
   return call.text;
 }
 
+/**
+ * Opens a batch. The loop's default opening move assumes the batch is unbuilt — pointed at
+ * work that is already implemented and committed (some batches of a live 10-batch plan were
+ * built by hand, outside any run), "Implement it fully per the plan" re-implements code
+ * that already exists, duplicating or conflicting with it on the branch. A batch inside the
+ * --review-from range therefore begins at the REVIEWER, against the repository as it
+ * stands; only the opening move differs, and a FIX from that review enters the ordinary
+ * fixPrompt → re-review loop.
+ */
+async function openBatch(context: RelayContext, run: RelayRun, afterAccept: boolean): Promise<void> {
+  if (run.reviewFrom !== null && run.batch >= run.reviewFrom) {
+    process.stderr.write(
+      `[relay] batch ${run.batch}/${run.totalBatches} → reviewer (review-only: already implemented)\n`,
+    );
+    await callRole(context, run, 'REVIEWER', reviewOnlyReviewerPrompt(run));
+    return;
+  }
+  process.stderr.write(`[relay] batch ${run.batch}/${run.totalBatches} → implementer\n`);
+  await callRole(
+    context,
+    run,
+    'IMPLEMENTER',
+    implementerBatchPrompt(run, afterAccept ? `Batch ${run.batch - 1} was accepted.\n\n` : ''),
+  );
+}
+
 function pause(
   context: RelayContext,
   run: RelayRun,
@@ -535,8 +588,7 @@ async function step(context: RelayContext, run: RelayRun): Promise<boolean> {
 
   // Nothing yet: open the first batch.
   if (last === null) {
-    process.stderr.write(`[relay] batch ${run.batch}/${run.totalBatches} → implementer\n`);
-    await callRole(context, run, 'IMPLEMENTER', implementerBatchPrompt(run));
+    await openBatch(context, run, false);
     return true;
   }
 
@@ -686,17 +738,12 @@ async function runLoop(context: RelayContext, run: RelayRun): Promise<void> {
         pause(context, run, 'STOPPED', 'Operator pause honoured at the call boundary.');
         return;
       }
-      // The implementer prompt for a NEW batch is issued here rather than inside step() so
-      // an advance and its first prompt are two separate log entries around one call.
+      // The opening prompt for a NEW batch is issued here rather than inside step() so an
+      // advance and its first prompt are two separate log entries around one call. This is
+      // also the seam where a review-only batch branches to the reviewer instead.
       const last = lastEvent(context.db, run.runId);
       if (last !== null && last.batch < run.batch) {
-        process.stderr.write(`[relay] batch ${run.batch}/${run.totalBatches} → implementer\n`);
-        await callRole(
-          context,
-          run,
-          'IMPLEMENTER',
-          implementerBatchPrompt(run, `Batch ${run.batch - 1} was accepted.\n\n`),
-        );
+        await openBatch(context, run, true);
         continue;
       }
       const keepGoing = await step(context, run);
@@ -809,6 +856,7 @@ export async function relayRunCommand(options: {
   readonly maxCycles?: number;
   readonly batches?: number;
   readonly startBatch?: number;
+  readonly reviewFrom?: number;
   readonly background?: boolean;
 }): Promise<void> {
   await withDatabase(async (db) => {
@@ -820,9 +868,9 @@ export async function relayRunCommand(options: {
     const now = new Date().toISOString();
     db.prepare(
       `INSERT INTO relay_runs
-         (run_id, plan_path, project_dir, total_batches, max_cycles, batch, cycle, status,
-          pending, implementer_session, reviewer_session, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, 1, 'ACTIVE', NULL, NULL, NULL, ?, ?)`,
+         (run_id, plan_path, project_dir, total_batches, max_cycles, batch, cycle, review_from,
+          status, pending, implementer_session, reviewer_session, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, 1, ?, 'ACTIVE', NULL, NULL, NULL, ?, ?)`,
     ).run(
       runId,
       planPath,
@@ -830,11 +878,13 @@ export async function relayRunCommand(options: {
       totalBatches,
       options.maxCycles ?? 3,
       options.startBatch ?? 1,
+      options.reviewFrom ?? null,
       now,
       now,
     );
     process.stderr.write(
-      `[relay] ${runId}: ${totalBatches} batches per the plan's own headings, cycle cap ${options.maxCycles ?? 3}\n`,
+      `[relay] ${runId}: ${totalBatches} batches per the plan's own headings, cycle cap ${options.maxCycles ?? 3}` +
+        `${options.reviewFrom === undefined ? '' : `, review-only from batch ${options.reviewFrom}`}\n`,
     );
     if (options.background === true) {
       // The row is durable; the detached child is just `relay resume` on a pristine run —
@@ -1169,6 +1219,7 @@ function printRelayStatus(db: RelayDb, runId: string): void {
         totalBatches: run.totalBatches,
         cycle: run.cycle,
         maxCycles: run.maxCycles,
+        ...(run.reviewFrom === null ? {} : { reviewFrom: run.reviewFrom }),
         pauseIntent: readPauseIntent(db, runId),
         calls: totals.calls,
         inputTokens: totals.input,

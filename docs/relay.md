@@ -41,6 +41,25 @@ with no review behind it (a live run once advanced an unreviewed batch on 72 cha
 `FIX` is exempt: it advances nothing and a terse FIX errs in the safe direction. An accepted
 review far shorter than that reviewer's own norm also gets a warning line in the log.
 
+## Reviewing work that already exists
+
+The loop above assumes every batch is unbuilt. Pointed at a batch that was implemented and
+committed **outside the run** — by hand, or by a previous run — the opening "implement it
+fully" would re-implement code that already exists on the branch. `--review-from <batch>`
+makes every batch from that number on open at the **reviewer** instead:
+
+```bash
+codemoot relay run --plan documentation/plan.md --start-batch 9 --review-from 9
+```
+
+The reviewer is told the batch was implemented outside the run — no implementer summary is
+fabricated — and reviews the repository's current state against the plan's own Batch N
+section. Only the opening move differs: a `FIX` forwards the findings to the implementer
+and the fix→re-review loop runs exactly as always; `PROCEED`/`COMPLETE` advance as always;
+the findings floor and the cycle cap apply unchanged. The range is recorded in the run, so
+a resume needs no re-flagging. It composes with `--start-batch`: the example starts at
+batch 9 and reviews 9 and 10 without ever touching 1–8.
+
 ## Liveness, not deadlines
 
 A model that is producing output is left alone however long it takes. Health is the

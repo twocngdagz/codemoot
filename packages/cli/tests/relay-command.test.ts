@@ -167,6 +167,10 @@ describe('codemoot relay (real command, two scripted models)', () => {
     const reviewerPrompts = JSON.parse(readFileSync(implFile.replace('impl', 'rev'), 'utf8'));
     void reviewerPrompts;
     const log = events('relay-e2e');
+    // A plain start opens with the IMPLEMENTER — the review-only branch must never leak
+    // into the default path.
+    expect(log[0]?.role).toBe('IMPLEMENTER');
+    expect(log[0]?.kind).toBe('PROMPT');
     const firstReviewerPrompt = log.find((e) => e.role === 'REVIEWER' && e.kind === 'PROMPT');
     expect(firstReviewerPrompt?.content).toContain('I wrote sample.txt. Commit abc.');
     // Both roles are told the turn is all they get — a live reviewer once armed watchers on
@@ -795,6 +799,112 @@ describe('codemoot relay (real command, two scripted models)', () => {
 
     await relayResumeCommand('relay-afterbatch', {});
     expect(printedStatus().status).toBe('COMPLETE');
+  });
+
+  it('--review-from starts the batch at the REVIEWER — nothing is re-implemented', async () => {
+    // The loop's opening move assumes every batch is unbuilt. Pointed at a batch that is
+    // already implemented and committed, "Implement it fully per the plan" re-implements
+    // code that already exists on the branch. A review-only batch begins at the reviewer,
+    // against the repository as it stands — and the implementer is NEVER called before it.
+    writeFileSync(implFile, JSON.stringify(['must never be requested']));
+    writeFileSync(
+      revFile,
+      JSON.stringify([`${FINDINGS}VERDICT: PROCEED`, `${FINDINGS}VERDICT: COMPLETE`]),
+    );
+    await relayRunCommand({ plan: 'plan.md', id: 'relay-review-only', reviewFrom: 1 });
+    expect(printedStatus().status).toBe('COMPLETE');
+
+    const log = events('relay-review-only');
+    // The FIRST role call is the reviewer; the implementer was never called at all.
+    expect(log[0]?.role).toBe('REVIEWER');
+    expect(log[0]?.kind).toBe('PROMPT');
+    expect(log.filter((e) => e.role === 'IMPLEMENTER')).toHaveLength(0);
+    expect(existsSync(`${implFile}.prompts.jsonl`)).toBe(false);
+    // No fabricated implementer summary — the reviewer is told the truth about the batch.
+    expect(log[0]?.content).toContain('implemented outside this run');
+    expect(log[0]?.content).not.toContain('The implementer reports the following');
+    // The verdict contract is unchanged: findings required, one closing VERDICT line.
+    expect(log[0]?.content).toContain('VERDICT: FIX');
+  });
+
+  it('a review-only batch that draws FIX engages the existing fix loop unchanged', async () => {
+    // Review-only changes only the OPENING move. From the first FIX on, the batch is the
+    // normal loop: findings forwarded verbatim via fixPrompt, the implementer's summary
+    // forwarded back for re-review.
+    writeFileSync(implFile, JSON.stringify(['Guarded the spread. Commit abc.']));
+    writeFileSync(
+      revFile,
+      JSON.stringify([
+        'Broken: the spread at api.ts:14 is unguarded.\nVERDICT: FIX',
+        `${FINDINGS}VERDICT: PROCEED`,
+        `${FINDINGS}VERDICT: COMPLETE`,
+      ]),
+    );
+    await relayRunCommand({ plan: 'plan.md', id: 'relay-review-fix', reviewFrom: 1 });
+    expect(printedStatus().status).toBe('COMPLETE');
+
+    const prompts = events('relay-review-fix').filter((e) => e.kind === 'PROMPT');
+    // Review-only opening, then the ordinary fix loop.
+    expect(prompts[0]?.role).toBe('REVIEWER');
+    expect(prompts[0]?.content).toContain('implemented outside this run');
+    expect(prompts[1]?.role).toBe('IMPLEMENTER');
+    expect(prompts[1]?.content).toContain('requires fixes');
+    expect(prompts[1]?.content).toContain('Broken: the spread at api.ts:14 is unguarded.');
+    // The re-review carries the implementer's ACTUAL summary — there is one now.
+    expect(prompts[2]?.role).toBe('REVIEWER');
+    expect(prompts[2]?.content).toContain('The implementer reports the following');
+    expect(prompts[2]?.content).toContain('Guarded the spread. Commit abc.');
+  });
+
+  it('--review-from composes with --start-batch: reviews 9, then 10, never touches 1–8', async () => {
+    const tenBatchPlan = `# Big plan\n\n${Array.from(
+      { length: 10 },
+      (_, index) => `### Batch ${index + 1}\nStep ${index + 1}.\n`,
+    ).join('\n')}`;
+    writeFileSync(join(projectDir, 'big-plan.md'), tenBatchPlan);
+    writeFileSync(implFile, JSON.stringify(['must never be requested']));
+    writeFileSync(
+      revFile,
+      JSON.stringify([`${FINDINGS}VERDICT: PROCEED`, `${FINDINGS}VERDICT: COMPLETE`]),
+    );
+    await relayRunCommand({
+      plan: 'big-plan.md',
+      id: 'relay-review-tail',
+      startBatch: 9,
+      reviewFrom: 9,
+    });
+    const status = printedStatus() as unknown as {
+      status: string;
+      batch: number;
+      reviewFrom?: number;
+    };
+    expect(status.status).toBe('COMPLETE');
+    expect(status.batch).toBe(10);
+    expect(status.reviewFrom).toBe(9);
+
+    const log = events('relay-review-tail');
+    // Batches 1–8 were never touched — no event mentions them.
+    const db = openDatabase(getDbPath());
+    const batches = db
+      .prepare("SELECT DISTINCT batch FROM relay_events WHERE run_id = 'relay-review-tail'")
+      .all() as { batch: number }[];
+    // And the range is DURABLE: a resume after a crash must still know batch 10 is
+    // review-only, so the flag lives in the run row, not in the invocation.
+    const persisted = db
+      .prepare("SELECT review_from FROM relay_runs WHERE run_id = 'relay-review-tail'")
+      .get() as { review_from: number | null };
+    db.close();
+    expect(batches.map((row) => row.batch).sort()).toEqual([10, 9].sort());
+    expect(persisted.review_from).toBe(9);
+    // Both tail batches were review-only: reviewer prompts only, correctly numbered.
+    expect(log.filter((e) => e.role === 'IMPLEMENTER')).toHaveLength(0);
+    const reviewPrompts = log.filter((e) => e.role === 'REVIEWER' && e.kind === 'PROMPT');
+    expect(reviewPrompts).toHaveLength(2);
+    expect(reviewPrompts[0]?.content).toContain('Batch 9 of 10');
+    expect(reviewPrompts[1]?.content).toContain('Batch 10 of 10');
+    for (const prompt of reviewPrompts) {
+      expect(prompt.content).toContain('implemented outside this run');
+    }
   });
 
   it('records the whole exchange — the transcript is the audit', async () => {

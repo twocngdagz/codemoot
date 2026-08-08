@@ -7,7 +7,7 @@ import {
   REVIEW_WORKFLOW_RUNNER_STATE_DDL,
 } from './review-workflow-schema.js';
 
-const SCHEMA_VERSION = '21';
+const SCHEMA_VERSION = '22';
 
 const MIGRATIONS = [
   // Sessions
@@ -419,6 +419,11 @@ export function runMigrations(db: Database.Database): void {
       // command line, signalled itself, and the run advanced through a boundary they
       // meant to stop at. Intent recorded in the row is honoured by the loop instead.
       'pause_intent TEXT',
+      // v22: batches from this number on start at the REVIEWER — the work already exists
+      // on the branch (implemented and committed outside the run), and the loop's opening
+      // "Implement it fully" would re-implement it. Durable in the row, not the invocation:
+      // a resume after a crash must still know the NEXT batch is review-only too.
+      'review_from INTEGER',
     ]) {
       try {
         db.exec(`ALTER TABLE relay_runs ADD COLUMN ${column}`);
