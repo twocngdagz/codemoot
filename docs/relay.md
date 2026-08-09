@@ -31,7 +31,10 @@ The relay does exactly four things: **carry messages, health-check the running m
 feedback cycles, and record everything.** It holds no model of the work and judges nothing.
 The `VERDICT:` line is the single piece of structure in the whole system — the bus has to
 know which wire to put a reply on — and when it is missing or ambiguous the relay pauses and
-asks you rather than guessing.
+asks you rather than guessing. The token is read the way a human reads it: a reviewer that
+runs its next sentence straight onto the verdict (`VERDICT: FIXBoth reviews are complete…`)
+still routes, while a genuinely different word (`fixme`, `Proceeding`) or prose between the
+colon and the token (`VERDICT: CANNOT PROCEED`) does not — those pause.
 
 One shape rule guards the one irreversible act: **`PROCEED` and `COMPLETE` must arrive
 attached to findings.** A reply that is a verdict line and (almost) nothing else is treated
@@ -40,6 +43,13 @@ relay still never grades review quality; it refuses to advance a batch on a rout
 with no review behind it (a live run once advanced an unreviewed batch on 72 characters).
 `FIX` is exempt: it advances nothing and a terse FIX errs in the safe direction. An accepted
 review far shorter than that reviewer's own norm also gets a warning line in the log.
+
+Resuming an unclear-verdict pause first re-reads the **stored** reply: if it parses to a
+routable verdict now (say, after the parser learned a new reviewer's habits), it is routed
+as it stands with no model call — the review already happened. Only a reply with genuinely
+nothing routable gets the full review prompt re-sent. Nothing ever asks a reviewer to
+"restate your conclusion" without context: a session with no memory of the batch once
+answered exactly that by inventing a verdict.
 
 ## Reviewing work that already exists
 

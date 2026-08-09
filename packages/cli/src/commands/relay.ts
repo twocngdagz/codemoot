@@ -88,8 +88,21 @@ export function parseVerdict(reply: string): Verdict | null {
     .slice(-10);
   const found: Verdict[] = [];
   for (const line of tail) {
-    const match = /^VERDICT:\s*(FIX|PROCEED|COMPLETE)\b/i.exec(line);
-    if (match !== null) found.push(match[1]?.toUpperCase() as Verdict);
+    // The token must sit RIGHT AFTER the colon (whitespace and emphasis marks aside). The
+    // line is never scanned for a token further in, because the prose between colon and
+    // token is where negations live — "VERDICT: CANNOT PROCEED" must pause, never advance.
+    const match = /^VERDICT:[\s*_`]*(FIX|PROCEED|COMPLETE)/i.exec(line);
+    if (match === null) continue;
+    // Glue tolerance. A live reviewer ends every review by running its next sentence
+    // straight onto the token — "VERDICT: FIXBoth reviews are complete…" — which a
+    // word-boundary rule reads as no verdict at all, pausing the run on every batch a
+    // human would route instantly. The token counts unless it CONTINUES as a different
+    // word: a lowercase letter or digit right after it is a different word (fixme,
+    // proceeding); end-of-line, whitespace, punctuation, or a capitalized next word
+    // (FIXBoth) is glue.
+    const after = line.charAt(match[0].length);
+    if (after !== '' && /[a-z0-9]/.test(after)) continue;
+    found.push(match[1]?.toUpperCase() as Verdict);
   }
   const distinct = [...new Set(found)];
   if (distinct.length === 1 && distinct[0] !== undefined) return distinct[0];
@@ -215,10 +228,6 @@ ${review}
 The operator has decided this feedback is FINAL for this batch: apply what is quick and essential, commit locally, do NOT push, and reply with a brief summary. There will be no further review round for this batch.
 
 ${SINGLE_TURN_NOTICE}`;
-}
-
-function unclearVerdictPrompt(): string {
-  return 'Your previous reply did not end with a clear VERDICT line, so the loop cannot route it. Restate your conclusion and end with exactly one line: VERDICT: FIX, VERDICT: PROCEED, or VERDICT: COMPLETE.';
 }
 
 // ---------------------------------------------------------------------------
@@ -1013,31 +1022,37 @@ export async function relayResumeCommand(
           advanceBatch(context, run);
         }
       } else if (run.status === 'PAUSED_UNCLEAR_VERDICT') {
-        // Only re-ask when the reviewer's unclear REPLY is the last word. If the last event
-        // is an unanswered PROMPT, the re-ask itself crashed mid-call — runLoop's
+        // Only act when the reviewer's unclear REPLY is the last word. If the last event
+        // is an unanswered PROMPT, the previous re-send crashed mid-call — runLoop's
         // interrupted-prompt path re-sends it with the reconcile preface instead of
-        // stacking a second re-ask on top.
+        // stacking a second re-send on top.
         const last = lastEvent(db, runId);
         if (last !== null && last.kind === 'RESPONSE') {
-          // The restate re-ask presumes a review HAPPENED and only its verdict line was
-          // malformed. That presumption has two prerequisites, and both must hold:
-          //   1. the reply actually said something (a legacy zero-length RESPONSE has
-          //      nothing to restate), and
-          //   2. the reviewer session still exists (a fresh session has no memory of the
-          //      batch — asked only to "restate your conclusion", it will oblige by
-          //      INVENTING one; a live run advanced past an unreviewed batch on a
-          //      72-character manufactured PROCEED exactly this way).
-          // When either fails, the honest re-ask is the ORIGINAL full review prompt.
-          const restatable =
-            findingsOf(last.content).length >= REVIEW_FINDINGS_FLOOR &&
-            run.reviewerSession !== null;
-          // Same stale-field shape as the cycle-cap branch: the re-ask is the run being
-          // active again, and the row must say so before the call, not after it returns.
+          // FIRST, re-read the stored reply itself: the parser may have learned since the
+          // pause was recorded (it learned word-glue tolerance from a reviewer that ends
+          // every review "VERDICT: FIXBoth reviews are complete…"), so a reply that paused
+          // the run may now route AS IT STANDS — no model call at all; runLoop's step()
+          // routes the recorded response. Routable means what step() means: a verdict, and
+          // for the advancing ones a findings body above the floor.
+          const verdict = parseVerdict(last.content);
+          const routable =
+            verdict !== null &&
+            (verdict === 'FIX' || findingsOf(last.content).length >= REVIEW_FINDINGS_FLOOR);
+          // Same stale-field shape as the cycle-cap branch: the resume is the run being
+          // active again, and the row must say so before any call, not after it returns.
           run.status = 'ACTIVE';
           updateRun(db, run);
-          if (restatable) {
-            await callRole(context, run, 'REVIEWER', unclearVerdictPrompt());
+          if (routable) {
+            appendEvent(db, run, {
+              role: 'RELAY',
+              kind: 'NOTE',
+              content: `The stored reviewer reply parses to VERDICT: ${verdict}; routing it as it stands — no re-ask`,
+            });
           } else {
+            // Nothing routable: re-send the ORIGINAL full review prompt. Never a
+            // context-less "restate your conclusion" re-ask — it carried none of the prior
+            // reply, and a session with no memory of the batch once answered it by
+            // INVENTING a verdict (the 72-character manufactured PROCEED).
             const originalPrompt = lastEventOf(db, runId, 'REVIEWER', 'PROMPT');
             if (originalPrompt === null) {
               throw new Error(
@@ -1048,7 +1063,7 @@ export async function relayResumeCommand(
               role: 'RELAY',
               kind: 'NOTE',
               content:
-                'There is no conclusion to restate (empty reply or fresh reviewer session); re-sending the full review prompt instead of the restate re-ask',
+                'No routable verdict in the stored reply; re-sending the full review prompt',
             });
             await callRole(context, run, 'REVIEWER', originalPrompt.content);
           }

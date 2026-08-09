@@ -57,6 +57,28 @@ describe('parseVerdict — the single routing token', () => {
     const body = `${'If tests failed I would say VERDICT: FIX.\n'.repeat(15)}All good.\nVERDICT: PROCEED`;
     expect(parseVerdict(body)).toBe('PROCEED');
   });
+
+  it('routes a verdict with prose GLUED to the token — the live FIXBoth case', () => {
+    // Observed live (gpt-5.6-sol, every review): the reviewer writes the verdict and runs
+    // the next sentence straight onto it. A human reads it instantly; a \b cannot.
+    expect(
+      parseVerdict('findings…\nVERDICT: FIXBoth reviews are complete and need the same guard.'),
+    ).toBe('FIX');
+    expect(parseVerdict('fine\nVERDICT: PROCEED.')).toBe('PROCEED');
+    expect(parseVerdict('done\nVERDICT: COMPLETE — the plan is finished.')).toBe('COMPLETE');
+    expect(parseVerdict('fine\nVERDICT: **FIX**')).toBe('FIX');
+  });
+
+  it('does not read a DIFFERENT word as a verdict — glue is not prefix-matching', () => {
+    // A lowercase or digit continuation is a different word (fixme, proceeding), not a
+    // sentence glued onto the token.
+    expect(parseVerdict('VERDICT: fixme later')).toBeNull();
+    expect(parseVerdict('VERDICT: Proceeding with caution')).toBeNull();
+    // No token at the anchor at all — including one buried in prose after the colon,
+    // where negations live ("CANNOT PROCEED" must pause, never advance).
+    expect(parseVerdict('VERDICT: PREFIX')).toBeNull();
+    expect(parseVerdict('VERDICT: CANNOT PROCEED WITHOUT THE MIGRATION')).toBeNull();
+  });
 });
 
 describe('countPlanBatches — the plan IS the decomposition', () => {
@@ -220,7 +242,10 @@ describe('codemoot relay (real command, two scripted models)', () => {
     expect(log.some((e) => e.kind === 'DECISION' && e.content === 'accept')).toBe(true);
   });
 
-  it('pauses on a missing verdict and resume re-asks the reviewer', async () => {
+  it('pauses on a missing verdict; resume re-sends the FULL prompt, never a bare restate', async () => {
+    // The context-less "restate your conclusion" re-ask is gone: it carried none of the
+    // prior reply, and a session with no memory of the batch once answered it by inventing
+    // a verdict. A reply with genuinely no verdict gets the full review prompt again.
     writeFileSync(implFile, JSON.stringify(['Did batch 1.', 'Did batch 2.']));
     writeFileSync(
       revFile,
@@ -236,12 +261,17 @@ describe('codemoot relay (real command, two scripted models)', () => {
     await relayResumeCommand('relay-unclear', {});
     expect(printedStatus().status).toBe('COMPLETE');
     const log = events('relay-unclear');
+    const reAsk = log.filter((e) => e.role === 'REVIEWER' && e.kind === 'PROMPT')[1];
+    expect(reAsk?.content).toContain('The implementer reports the following');
+    expect(
+      log.some((e) => e.kind === 'PROMPT' && e.content.includes('did not end with a clear')),
+    ).toBe(false);
     expect(
       log.some(
         (e) =>
-          e.role === 'REVIEWER' &&
-          e.kind === 'PROMPT' &&
-          e.content.includes('did not end with a clear VERDICT'),
+          e.role === 'RELAY' &&
+          e.kind === 'NOTE' &&
+          e.content.includes('No routable verdict in the stored reply'),
       ),
     ).toBe(true);
   });
@@ -293,7 +323,8 @@ describe('codemoot relay (real command, two scripted models)', () => {
     await relayRunCommand({ plan: 'plan.md', id: 'relay-boundary' });
     expect(printedStatus().status).toBe('PAUSED_UNCLEAR_VERDICT');
 
-    // The re-ask itself dies at the adapter level. No throw, no dead process — a note.
+    // The full-prompt re-send itself dies at the adapter level. No throw, no dead
+    // process — a note.
     await relayResumeCommand('relay-boundary', {});
     expect(printedStatus().status).toBe('STOPPED');
     const afterCrash = events('relay-boundary');
@@ -303,8 +334,8 @@ describe('codemoot relay (real command, two scripted models)', () => {
       ),
     ).toBe(true);
 
-    // Resume again: the log ends with the unanswered re-ask, so it is re-sent with the
-    // reconcile preface — not stacked with a second re-ask — and the run completes.
+    // Resume again: the log ends with the unanswered re-send, so it goes out again with
+    // the reconcile preface — not stacked with another re-send — and the run completes.
     await relayResumeCommand('relay-boundary', {});
     expect(printedStatus().status).toBe('COMPLETE');
     const log = events('relay-boundary');
@@ -316,13 +347,9 @@ describe('codemoot relay (real command, two scripted models)', () => {
     );
     expect(
       resent,
-      'the unanswered re-ask must be re-sent with the reconcile preface',
+      'the unanswered re-send must go out again with the reconcile preface',
     ).toBeDefined();
-    expect(
-      log.filter(
-        (e) => e.content.includes('did not end with a clear VERDICT') && e.kind === 'PROMPT',
-      ),
-    ).toHaveLength(2);
+    expect(resent?.content).toContain('The implementer reports the following');
   });
 
   it('a consumed decision flips the summary row to ACTIVE in the same transaction', async () => {
@@ -555,7 +582,9 @@ describe('codemoot relay (real command, two scripted models)', () => {
     expect(
       log.some(
         (e) =>
-          e.role === 'RELAY' && e.kind === 'NOTE' && e.content.includes('no conclusion to restate'),
+          e.role === 'RELAY' &&
+          e.kind === 'NOTE' &&
+          e.content.includes('No routable verdict in the stored reply'),
       ),
     ).toBe(true);
   });
@@ -630,6 +659,54 @@ describe('codemoot relay (real command, two scripted models)', () => {
     const reAsk = log.filter((e) => e.role === 'REVIEWER' && e.kind === 'PROMPT')[1];
     expect(reAsk?.content).toContain('The implementer reports the following');
     expect(reAsk?.content).not.toContain('did not end with a clear VERDICT');
+  });
+
+  it('a run paused on a GLUED verdict resumes by routing the stored reply — no re-ask call', async () => {
+    // The live shape: a run paused under the old word-boundary parser, its last event a
+    // recorded reply whose verdict is glued ("VERDICT: PROCEEDBoth…"). Resume must re-read
+    // that reply with the current parser and route it AS IT STANDS — the review already
+    // happened; asking any model anything about batch 1 again would be waste at best and
+    // a manufactured-verdict door at worst.
+    const now = new Date().toISOString();
+    const db = openDatabase(getDbPath());
+    db.prepare(
+      `INSERT INTO relay_runs (run_id, plan_path, project_dir, total_batches, max_cycles, batch, cycle, status, pending, implementer_session, reviewer_session, created_at, updated_at)
+       VALUES ('relay-glue', ?, ?, 2, 3, 1, 1, 'PAUSED_UNCLEAR_VERDICT', NULL, NULL, 'live-session', ?, ?)`,
+    ).run(join(projectDir, 'plan.md'), projectDir, now, now);
+    const insertEvent = db.prepare(
+      `INSERT INTO relay_events (run_id, batch, cycle, role, kind, content, created_at)
+       VALUES ('relay-glue', 1, 1, ?, ?, ?, ?)`,
+    );
+    insertEvent.run('IMPLEMENTER', 'PROMPT', 'Work on Batch 1', now);
+    insertEvent.run('IMPLEMENTER', 'RESPONSE', 'Did batch 1.', now);
+    insertEvent.run('REVIEWER', 'PROMPT', 'review batch 1', now);
+    insertEvent.run(
+      'REVIEWER',
+      'RESPONSE',
+      `${FINDINGS}VERDICT: PROCEEDBoth reviews are complete and the batch is sound.`,
+      now,
+    );
+    db.close();
+
+    writeFileSync(implFile, JSON.stringify(['Did batch 2.']));
+    writeFileSync(revFile, JSON.stringify([`${FINDINGS}VERDICT: COMPLETE`]));
+    await relayResumeCommand('relay-glue', {});
+    expect(printedStatus().status).toBe('COMPLETE');
+
+    // The reviewer was called exactly ONCE — for batch 2. The stored batch-1 reply routed
+    // itself; no restate, no full-prompt re-send.
+    const revCalls = readFileSync(`${revFile}.prompts.jsonl`, 'utf8').trim().split('\n');
+    expect(revCalls).toHaveLength(1);
+    expect(JSON.parse(revCalls[0] ?? '{}').prompt).toContain('Batch 2');
+    const log = events('relay-glue');
+    expect(
+      log.some(
+        (e) =>
+          e.role === 'RELAY' &&
+          e.kind === 'NOTE' &&
+          e.content.includes('parses to VERDICT: PROCEED; routing it as it stands'),
+      ),
+    ).toBe(true);
   });
 
   it('a terse FIX still routes — the floor guards only the irreversible direction', async () => {
