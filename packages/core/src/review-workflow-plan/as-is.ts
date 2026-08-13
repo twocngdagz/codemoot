@@ -19,11 +19,48 @@ import type { GeneralPlanVersion, PlanRequirement } from '../review-workflow/typ
 import { importGeneralPlan } from './importer.js';
 import { deriveBatchPlanVersionId, deriveWorkflowBatchId } from './service.js';
 
-/** A heading that opens a batch: `## Batch 3 — migrations` etc. Order of appearance rules. */
+/** A heading title that names a batch: `Batch 3 — migrations` etc. Order of appearance rules. */
 const BATCH_HEADING_PATTERN = /^Batch\s+\d+\b/i;
 
 /** The same heading shape the importer splits requirements on — the two MUST stay aligned. */
 const HEADING_PATTERN = /^(#{2,6})\s+(.+?)\s*$/;
+
+interface ScannedHeading {
+  readonly line: number;
+  readonly level: number;
+  readonly title: string;
+  readonly opensBatch: boolean;
+}
+
+/**
+ * Scans the plan's headings and marks the ones that OPEN a batch. Batches are siblings:
+ * only headings at the SAME level as the first batch-titled heading open batches, so a
+ * deeper `### Batch 1 verification` under `## Batch 1` is content of batch 1 — a human
+ * reads it as a subsection, and so does this.
+ */
+function scanHeadings(lines: readonly string[]): readonly ScannedHeading[] {
+  const headings = lines.flatMap((line, index) => {
+    const match = HEADING_PATTERN.exec(line);
+    return match === null
+      ? []
+      : [{ line: index, level: match[1]?.length ?? 0, title: match[2]?.trim() ?? '' }];
+  });
+  const batchLevel = headings.find((heading) => BATCH_HEADING_PATTERN.test(heading.title))?.level;
+  return headings.map((heading) => ({
+    ...heading,
+    opensBatch:
+      batchLevel !== undefined &&
+      heading.level === batchLevel &&
+      BATCH_HEADING_PATTERN.test(heading.title),
+  }));
+}
+
+/** A heading whose section declares the plan's own verification commands. */
+const VERIFICATION_HEADING_PATTERN = /verif/i;
+
+/** Fence openers whose contents are commands, one per line. */
+const COMMAND_FENCE_PATTERN = /^```(?:sh|bash|shell|zsh)\s*$/i;
+const FENCE_CLOSE_PATTERN = /^```\s*$/;
 
 export interface PlanAsIsBuildInput {
   readonly workflowId: string;
@@ -37,6 +74,56 @@ export interface PlanAsIsBuildResult {
   /** The operator's plan, byte-for-byte. */
   readonly refinedPlanContent: string;
   readonly batchPlans: readonly BatchPlanDraft[];
+  /** Ordinals of batches that declared NO verification commands and use the minimal fallback. */
+  readonly fallbackVerificationOrdinals: readonly number[];
+}
+
+/**
+ * The plan's own verification commands, read mechanically.
+ *
+ * Contract (documented in docs/configuration.md): fenced ```sh / ```bash / ```shell /
+ * ```zsh blocks inside any section whose heading contains "verif" (Verification, Verify,
+ * Verification Commands …) are command lists, one command per line. A verification section
+ * inside a batch's span belongs to that batch; one before the first batch heading is
+ * plan-wide and applies to EVERY batch. Each line runs through `sh -c` exactly as written,
+ * so `composer check`, pipes, and env prefixes all behave as they would in the operator's
+ * own shell. Comment lines, blank lines, and a leading `$ ` prompt are dropped.
+ */
+function extractDeclaredVerification(lines: readonly string[]): {
+  /** line index of the owning batch heading, or -1 for plan-wide. */
+  readonly commandsByScope: ReadonlyMap<number, readonly string[]>;
+} {
+  const headings = scanHeadings(lines);
+  const commandsByScope = new Map<number, string[]>();
+  for (const [headingIndex, heading] of headings.entries()) {
+    if (!VERIFICATION_HEADING_PATTERN.test(heading.title)) continue;
+    const sectionEnd = headings[headingIndex + 1]?.line ?? lines.length;
+    // The batch this section belongs to: the last batch-OPENING heading at or before it.
+    const owner = headings
+      .slice(0, headingIndex + 1)
+      .filter((candidate) => candidate.opensBatch)
+      .at(-1);
+    const scope = owner?.line ?? -1;
+    const commands = commandsByScope.get(scope) ?? [];
+    let inFence = false;
+    for (const raw of lines.slice(heading.line + 1, sectionEnd)) {
+      const line = raw.trim();
+      if (!inFence && COMMAND_FENCE_PATTERN.test(line)) {
+        inFence = true;
+        continue;
+      }
+      if (inFence && FENCE_CLOSE_PATTERN.test(line)) {
+        inFence = false;
+        continue;
+      }
+      if (!inFence) continue;
+      const command = line.replace(/^\$\s+/, '');
+      if (command.length === 0 || command.startsWith('#')) continue;
+      commands.push(command);
+    }
+    commandsByScope.set(scope, commands);
+  }
+  return { commandsByScope };
 }
 
 export class PlanAsIsBuildError extends Error {
@@ -90,10 +177,7 @@ function orderedRequirements(input: PlanAsIsBuildInput): readonly OrderedRequire
   // Walk the plan's headings the way the importer does, so section order matches the
   // re-derived requirement order exactly: optional preamble first, then one per heading.
   const lines = input.generalPlan.content.trim().split(/\r?\n/);
-  const headings = lines.flatMap((line, index) => {
-    const match = HEADING_PATTERN.exec(line);
-    return match === null ? [] : [{ line: index, title: match[2]?.trim() ?? '' }];
-  });
+  const headings = scanHeadings(lines);
   const hasPreamble =
     headings.length > 0 &&
     lines
@@ -117,7 +201,7 @@ function orderedRequirements(input: PlanAsIsBuildInput): readonly OrderedRequire
       requirementId: requirement.requirementId,
       statement: requirement.statement,
       headingLine: heading?.line ?? -1,
-      opensBatch: heading !== null && BATCH_HEADING_PATTERN.test(heading.title),
+      opensBatch: heading?.opensBatch ?? false,
       headingTitle: heading?.title ?? null,
     };
   });
@@ -126,8 +210,9 @@ function orderedRequirements(input: PlanAsIsBuildInput): readonly OrderedRequire
 /**
  * Builds the batch-plan drafts for a plan used verbatim.
  *
- * Batch boundaries: each `## Batch N` heading (any level 2–6, order of appearance is
- * authoritative) opens a batch that runs to the next batch heading. Everything before the
+ * Batch boundaries: each `Batch N`-titled heading AT THE LEVEL OF THE FIRST ONE (batches
+ * are siblings; a deeper `### Batch 1 verification` is content, not a new batch) opens a
+ * batch that runs to the next batch heading, in order of appearance. Everything before the
  * first batch heading — the preamble and any general sections — belongs to batch 1, so
  * every requirement is covered and `validateLifecycleRefinement`'s exact-coverage rule
  * holds. A plan with no batch headings is one batch.
@@ -141,11 +226,19 @@ export function buildPlanAsIsBatchPlans(input: PlanAsIsBuildInput): PlanAsIsBuil
   // Partition requirements into batches by document position: each batch heading starts a
   // group; everything before the first batch heading is folded into batch 1 so every
   // requirement is covered; no batch headings at all means one batch of everything.
-  const batchGroups: { title: string | null; requirements: OrderedRequirement[] }[] = [];
+  const batchGroups: {
+    title: string | null;
+    scopeLine: number;
+    requirements: OrderedRequirement[];
+  }[] = [];
   const beforeFirstBatch: OrderedRequirement[] = [];
   for (const requirement of ordered) {
     if (requirement.opensBatch) {
-      batchGroups.push({ title: requirement.headingTitle, requirements: [requirement] });
+      batchGroups.push({
+        title: requirement.headingTitle,
+        scopeLine: requirement.headingLine,
+        requirements: [requirement],
+      });
     } else if (batchGroups.length > 0) {
       batchGroups.at(-1)?.requirements.push(requirement);
     } else {
@@ -154,16 +247,34 @@ export function buildPlanAsIsBatchPlans(input: PlanAsIsBuildInput): PlanAsIsBuil
   }
   const merged =
     batchGroups.length === 0
-      ? [{ title: null, requirements: beforeFirstBatch }]
+      ? [{ title: null, scopeLine: -1, requirements: beforeFirstBatch }]
       : batchGroups.map((group, index) =>
           index === 0
             ? { ...group, requirements: [...beforeFirstBatch, ...group.requirements] }
             : group,
         );
 
+  // The plan's OWN verification commands: declared per batch or plan-wide. A batch with
+  // none falls back to a minimal worktree check — the merge gate hard-requires at least
+  // one accepted verification record — and the fallback is REPORTED, never silent.
+  const { commandsByScope } = extractDeclaredVerification(
+    input.generalPlan.content.trim().split(/\r?\n/),
+  );
+  const planWideCommands = commandsByScope.get(-1) ?? [];
+  const fallbackVerificationOrdinals: number[] = [];
+
   const batchPlans = merged.map((group, index) => {
     const ordinal = index + 1;
     const batchId = deriveWorkflowBatchId(input.workflowId, ordinal);
+    // Plan-wide commands apply to every batch; batch-scoped ones only to their own. The
+    // no-batch-headings fallback group carries scopeLine -1 — the plan-wide key — so its
+    // scoped lookup must be skipped or every plan-wide command would be added twice and
+    // run (and be attested) twice per batch.
+    const declaredCommands = [
+      ...planWideCommands,
+      ...(group.scopeLine === -1 ? [] : (commandsByScope.get(group.scopeLine) ?? [])),
+    ];
+    if (declaredCommands.length === 0) fallbackVerificationOrdinals.push(ordinal);
     const objective =
       group.title ?? 'Deliver the operator-supplied plan as written (plan-as-is mode).';
     // The plan text of this batch's sections, verbatim. Statements are non-empty by the
@@ -197,9 +308,14 @@ export function buildPlanAsIsBatchPlans(input: PlanAsIsBuildInput): PlanAsIsBuil
           acceptanceCriterionId: 'criterion-1',
           kind: 'TECHNICAL',
           statement:
-            'The work of this batch is committed and the synthesized verification command succeeds at the reviewed commit.',
+            declaredCommands.length > 0
+              ? 'The work of this batch is committed and every verification command the plan declares for it succeeds at the reviewed commit.'
+              : 'The work of this batch is committed and the fallback worktree check succeeds at the reviewed commit (the plan declares no verification commands for this batch).',
           required: true,
-          passCondition: 'git status --porcelain exits 0 at the reviewed commit.',
+          passCondition:
+            declaredCommands.length > 0
+              ? `Each declared command exits 0: ${declaredCommands.join(' ; ')}`
+              : 'git status --porcelain exits 0 at the reviewed commit.',
           sourceRequirementIds: group.requirements.map(
             (requirement) => requirement.requirementId,
           ),
@@ -213,21 +329,29 @@ export function buildPlanAsIsBatchPlans(input: PlanAsIsBuildInput): PlanAsIsBuil
         reason:
           'Plan-as-is mode synthesizes no browser criteria; the plan text is authoritative.',
       },
-      // The merge gate hard-requires at least one ACCEPTED verification record per batch
-      // (it does not consult configuration), so a synthesized batch always carries one
-      // command. `git status` is explicitly allowed by the git guard; the criterion above
-      // claims only what this command proves — execution evidence at the reviewed commit —
-      // and deeper verification stays where this mode puts it: code review and the plan's
-      // own instructions to the implementer.
-      verificationCommands: [
-        {
-          executable: 'git',
-          arguments: ['status', '--porcelain'],
-          workingDirectory: '.',
-          verificationType: 'custom',
-          relatedCriterionIds: ['criterion-1'],
-        },
-      ],
+      // The plan's OWN checks run, exactly as written, each line through `sh -c` so shell
+      // semantics (arguments, pipes, env prefixes) match the operator's intent. Only when
+      // the plan declares nothing does the batch fall back to `git status --porcelain`
+      // (guard-allowed, always-passing) purely to satisfy the merge gate's hard ≥1-record
+      // requirement — and that fallback is surfaced to the operator, never silent.
+      verificationCommands:
+        declaredCommands.length > 0
+          ? declaredCommands.map((command) => ({
+              executable: 'sh',
+              arguments: ['-c', command],
+              workingDirectory: '.',
+              verificationType: 'custom' as const,
+              relatedCriterionIds: ['criterion-1'],
+            }))
+          : [
+              {
+                executable: 'git',
+                arguments: ['status', '--porcelain'],
+                workingDirectory: '.',
+                verificationType: 'custom' as const,
+                relatedCriterionIds: ['criterion-1'],
+              },
+            ],
       manualVerification: [],
       documentationChanges: [],
       outOfScope: [],
@@ -236,10 +360,15 @@ export function buildPlanAsIsBatchPlans(input: PlanAsIsBuildInput): PlanAsIsBuil
     return draft;
   });
 
+  const fallbackNote =
+    fallbackVerificationOrdinals.length === 0
+      ? ''
+      : ` WARNING: batch(es) ${fallbackVerificationOrdinals.join(', ')} declare no verification commands (no fenced sh block under a "Verification" heading) and fall back to a minimal worktree check that proves nothing about correctness.`;
   return {
-    summary: `Plan-as-is: ${batchPlans.length} batch(es) derived mechanically from the plan's own headings; no model authored or altered any plan content.`,
+    summary: `Plan-as-is: ${batchPlans.length} batch(es) derived mechanically from the plan's own headings; no model authored or altered any plan content.${fallbackNote}`,
     refinedPlanContent: input.generalPlan.content,
     batchPlans,
+    fallbackVerificationOrdinals,
   };
 }
 

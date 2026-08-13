@@ -630,7 +630,10 @@ async function performPlanAsIsRefinement(runtime: ReviewWorkflowRuntime, workflo
     workflowId,
     entryType: 'CHECKPOINT',
     phase: 'PLAN_REFINEMENT',
-    message: `Plan-as-is: ${built.batchPlans.length} batch(es) derived mechanically from the plan's own headings; no model invocation`,
+    // Carries the builder's own summary so the fallback-verification warning (a batch
+    // declaring no checks) reaches the durable log and `workflow watch`, never only a
+    // return value nobody reads.
+    message: built.summary,
   });
   return runtime.service.captureRefinement({
     transcriptId: `${workflowId}:refinement:${generateId('transcript')}`,
@@ -3934,6 +3937,28 @@ export async function reviewWorkflowRunCommand(options: WorkflowRunOptions): Pro
     // records the mode; the durable authority across resumes is the runner-state freeze
     // below (the snapshot is re-derived from CURRENT config on every resolve).
     const planAsIs = options.planAsIs === true || config.reviewGated?.planAsIs === true;
+    // A config schema that predates the mode STRIPS the unknown key at parse, so a
+    // config-driven request would silently vanish before the line above ever sees it —
+    // and the workflow would rewrite the very plan it was told to use verbatim. When the
+    // parsed config carries no planAsIs key at all (a current schema always materializes
+    // its default) but the raw file asks for the mode, refuse loudly instead.
+    if (
+      config.reviewGated !== undefined &&
+      !('planAsIs' in config.reviewGated) &&
+      ['.cowork.yml', '.cowork.yaml', '.cowork.json'].some((name) => {
+        try {
+          return /["']?planAsIs["']?\s*:\s*true/.test(
+            readFileSync(resolve(projectDir, name), 'utf8'),
+          );
+        } catch {
+          return false;
+        }
+      })
+    ) {
+      throw new Error(
+        'The configuration requests plan-as-is mode, but the loaded @codemoot/core config schema does not know the planAsIs field — rebuild the workspace (pnpm -r build) or update the dependency. Refusing to run: the fallback would rewrite the plan you asked to use verbatim.',
+      );
+    }
     const effectiveConfig =
       planAsIs && config.reviewGated !== undefined
         ? { ...config, reviewGated: { ...config.reviewGated, planAsIs: true } }
@@ -3997,6 +4022,22 @@ export async function reviewWorkflowRunCommand(options: WorkflowRunOptions): Pro
       limits: autonomousLimits,
       planAsIs,
     });
+    // ENGAGE OR FAIL — never silently fall back. If plan-as-is was requested, both the
+    // configuration snapshot and the frozen runner state must actually carry it before a
+    // single agent is invoked. The failure this guards against is real and was observed:
+    // a stale @codemoot/core build whose config schema did not know the field stripped it
+    // at parse, the mode quietly disengaged, and the workflow REWROTE the plan it was told
+    // to use verbatim — the exact behaviour the operator banned, with no error saying so.
+    if (planAsIs) {
+      const frozen = runtime.runnerStore.require(workflowId).planAsIs === true;
+      const recorded = configuration.gates.planAsIs === true;
+      if (!frozen || !recorded) {
+        throw new Error(
+          `Plan-as-is mode was requested but could not be engaged (snapshot: ${String(recorded)}, runner state: ${String(frozen)}). ` +
+            'The loaded @codemoot/core does not support plan-as-is — rebuild the workspace (pnpm -r build) or update the dependency. Refusing to run: the fallback would rewrite the plan you asked to use verbatim.',
+        );
+      }
+    }
     runtime.runnerStore.appendLog({
       workflowId,
       entryType: 'CHECKPOINT',

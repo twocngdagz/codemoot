@@ -181,10 +181,20 @@ workflow, where a rewrite re-plans redundantly and can degrade precision.
   (HUMAN/SYSTEM + WORKFLOW_OWNER, recorded in the immutable audit) — never a fabricated
   reviewer approval, and agents can never fire it.
 - **Everything from implementation on is unchanged**: code review ↔ correction,
-  verification, final audit, merge gate, gated push. Each synthesized batch carries one
-  minimal verification command (`git status --porcelain`) because the merge gate requires
-  at least one accepted verification record; deeper verification stays where this mode puts
-  it — code review and the plan's own instructions.
+  verification, final audit, merge gate, gated push.
+- **Verification runs the plan's OWN commands.** Put them in fenced ` ```sh ` / ` ```bash `
+  blocks under any heading containing "Verification" — one command per line, run exactly as
+  written via `sh -c` (so `composer check`, pipes, and env prefixes behave like your
+  shell). A verification section inside a batch's span belongs to that batch; one before
+  the first batch heading is plan-wide and runs for **every** batch. Comment lines, blanks,
+  and a leading `$ ` are dropped. Only when a batch declares **nothing** does it fall back
+  to a minimal `git status --porcelain` (the merge gate requires ≥1 accepted verification
+  record) — and that fallback is a logged **WARNING** naming the batch, because it proves
+  nothing about correctness.
+- **The mode must engage or fail.** If plan-as-is is requested but cannot be recorded in
+  both the configuration snapshot and the frozen runner state (for example, a stale
+  `@codemoot/core` build whose schema predates the field), `workflow run` refuses with an
+  explicit error instead of silently falling back to the refined rewrite.
 - **The mode is frozen at workflow start** (runner state), like the autonomous limits: a
   config edit or dropped flag never flips a running workflow. `run-resume --plan-as-is` on
   a workflow that started refined fails instead of switching.
