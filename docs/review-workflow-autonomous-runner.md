@@ -42,6 +42,31 @@ verified before every phase, pushes happen only after each batch's gate passes, 
 HEAD is verified after every push and at completion. No merge, rebase, reset, clean, stash,
 force-push, or branch deletion — ever.
 
+## Plan-as-is: skip refinement and plan review entirely
+
+`--plan-as-is` (or `reviewGated.planAsIs: true`) uses the supplied plan **verbatim**: no
+model rewrites it into batch plans, and no plan-review gate runs. Batches come from the
+plan's own `Batch N` headings (siblings of the first such heading; deeper ones are that
+batch's content), each batch is opened by an explicit operator-authority
+`ACCEPT_PLAN_AS_IS` transition instead of a reviewer approval, and everything from
+implementation onward is unchanged. Use it when the plan was already authored and reviewed
+outside the workflow.
+
+Two things to know before driving it:
+
+- **Verification runs the plan's own commands** — fenced ` ```sh ` blocks under any
+  "Verification" heading, one per line, executed as written via `sh -c` (plan-wide before
+  the first batch heading, or scoped inside a batch). A batch that declares none falls back
+  to a minimal worktree check and says so with a logged WARNING, because that check proves
+  nothing about correctness. Put your real checks in the plan.
+- **The mode engages or the run refuses.** If plan-as-is cannot be recorded in both the
+  configuration snapshot and the frozen runner state — a stale `@codemoot/core` build, for
+  instance — `workflow run` fails with a named error rather than silently falling back to
+  the rewrite. The mode is frozen at start like the limits, so config edits and dropped
+  flags never flip a running workflow.
+
+The rest of this section describes the DEFAULT (refined) path.
+
 ## Plan refinement is per batch
 Refinement issues ONE invocation per batch, never a single response carrying the whole plan:
 

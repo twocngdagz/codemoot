@@ -45,7 +45,7 @@ export const CONFIG_TOOL_DEFINITIONS = [
   {
     name: 'codemoot_docs',
     description:
-      'Read the canonical CodeMoot documentation. ALWAYS read topic "configuration" before creating or editing a .cowork.yml, "autonomous-runner" before driving codemoot workflow commands, and "handoff-contracts" before authoring or debugging any agent JSON response (a wrong envelope field costs a full invocation). Adapter kinds are claude, codex and cursor — for cursor, read "configuration" first: it is a router (one CLI, many vendors), its effort level is part of the model id, and a headless run without --force silently produces nothing.',
+      'Read the canonical CodeMoot documentation. ALWAYS read topic "configuration" before creating or editing a .cowork.yml, "autonomous-runner" before driving codemoot workflow commands, and "handoff-contracts" before authoring or debugging any agent JSON response (a wrong envelope field costs a full invocation). Adapter kinds are claude, codex and cursor — for cursor, read "configuration" first: it is a router (one CLI, many vendors), its effort level is part of the model id, and a headless run without --force silently produces nothing. A workflow can also run a plan VERBATIM (--plan-as-is / reviewGated.planAsIs: no refinement rewrite, no plan-review gate) — read "autonomous-runner" first: batches come from the plan\'s own "Batch N" headings and verification runs the plan\'s OWN fenced sh commands, so a plan that declares none gets only a minimal worktree check.',
     inputSchema: {
       type: 'object' as const,
       properties: {
@@ -63,7 +63,7 @@ export const CONFIG_TOOL_DEFINITIONS = [
   {
     name: 'codemoot_config_get',
     description:
-      "Read a project's .cowork.yml (raw YAML plus a validation verdict and a role/model summary). projectDir may point at any repository. Reported adapter kinds are claude, codex or cursor.",
+      "Read a project's .cowork.yml (raw YAML plus a validation verdict and a role/model summary). projectDir may point at any repository. Reported adapter kinds are claude, codex or cursor. reviewGated.planAsIs (default false) means workflows use the supplied plan verbatim: no refinement rewrite and no plan-review gate.",
     inputSchema: {
       type: 'object' as const,
       properties: {
