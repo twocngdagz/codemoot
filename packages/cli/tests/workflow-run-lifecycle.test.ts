@@ -27,6 +27,7 @@ import {
   openDatabase,
   reviewWorkflowGate,
   reviewWorkflowImplementation,
+  reviewWorkflowPersistence,
   reviewWorkflowPlan,
   reviewWorkflowRunner,
 } from '@codemoot/core';
@@ -1052,9 +1053,7 @@ describe('codemoot workflow run lifecycle (real command, scenario-driven adapter
         if (batch === undefined) throw new Error('batch 1 missing');
         const plan = planStore.getBatchPlan(batch.currentPlanVersionId);
         expect(plan).not.toBeNull();
-        expect(plan?.technicalImplementation.join('\n')).toContain(
-          'Write the sample output file.',
-        );
+        expect(plan?.technicalImplementation.join('\n')).toContain('Write the sample output file.');
         expect(plan?.verificationCommands).toHaveLength(1);
         expect(plan?.verificationCommands[0]?.executable).toBe('sh');
         expect(plan?.verificationCommands[0]?.arguments).toEqual(['-c', 'test -f sample.txt']);
@@ -1139,13 +1138,14 @@ describe('codemoot workflow run lifecycle (real command, scenario-driven adapter
         expect(
           log.some(
             (entry) =>
-              entry.entryType === 'CHECKPOINT' &&
-              entry.message.startsWith('Batch scope reached:'),
+              entry.entryType === 'CHECKPOINT' && entry.message.startsWith('Batch scope reached:'),
           ),
         ).toBe(true);
         const notificationEntries = log.filter((entry) => entry.entryType === 'NOTIFICATION');
         expect(notificationEntries).toHaveLength(1);
-        expect(notificationEntries[0]?.message).toContain('stopped at its batch scope as requested');
+        expect(notificationEntries[0]?.message).toContain(
+          'stopped at its batch scope as requested',
+        );
         // AC3: batch 1's commits are pushed; the branch is not merged anywhere.
         const localHead = git(projectDir, ['rev-parse', 'HEAD']);
         expect(
@@ -1160,7 +1160,12 @@ describe('codemoot workflow run lifecycle (real command, scenario-driven adapter
       logSpy.mockClear();
       await reviewWorkflowStatusCommand(workflowId);
       const printedStatus = JSON.parse(String(logSpy.mock.calls.at(-1)?.[0])) as {
-        runner: { maxBatches: number | null; planAsIs: boolean; stopReason: string | null; nextAction: string | null };
+        runner: {
+          maxBatches: number | null;
+          planAsIs: boolean;
+          stopReason: string | null;
+          nextAction: string | null;
+        };
       };
       expect(printedStatus.runner.maxBatches).toBe(1);
       expect(printedStatus.runner.planAsIs).toBe(true);
@@ -1330,9 +1335,8 @@ describe('codemoot workflow run lifecycle (real command, scenario-driven adapter
         // The write-nothing retry's evidence CREDITS attempt 1's commit: the recorded
         // range runs from the batch base to the HEAD attempt 1 left behind, and the batch
         // HEAD never moved during the retry (no reconciliation commit was needed).
-        const implementationStore = new reviewWorkflowImplementation.ReviewWorkflowImplementationStore(
-          done,
-        );
+        const implementationStore =
+          new reviewWorkflowImplementation.ReviewWorkflowImplementationStore(done);
         const evidence = implementationStore.getImplementationReadyEvidence(
           `${workflowId}:batch:1:implementation:1:ready`,
         );
@@ -1412,6 +1416,158 @@ describe('codemoot workflow run lifecycle (real command, scenario-driven adapter
         expect(new Set(rows.map((row) => row.side_effect_identity)).size).toBe(2);
         expect(rows.filter((row) => row.command_id.includes(':superseded:'))).toHaveLength(1);
         expect(rows.filter((row) => !row.command_id.includes(':superseded:'))).toHaveLength(1);
+      } finally {
+        done.close();
+      }
+    },
+  );
+
+  it(
+    'code-review resume: a review reserved but never started is continued, not blocked',
+    { timeout: 180_000 },
+    async () => {
+      // THE REAL CASE. Reserve-before-invoke makes the receipt durable BEFORE the reviewer is
+      // called. A run stopped inside that window leaves a reservation that did nothing:
+      // receipt RESERVED, side effect NOT_STARTED, identity NULL. The command ID is
+      // deterministic, so the resumed run derives the ID its own interrupted attempt already
+      // holds — and refused it with "has already reserved its external side effect".
+      const { projectDir } = createProject(buildConfig({ planAsIs: true }));
+      const workflowId = 'workflow-unstarted-review';
+      writeFileSync(join(projectDir, 'plan.md'), AS_IS_PLAN_CONTENT);
+      git(projectDir, ['add', 'plan.md']);
+      git(projectDir, ['commit', '-q', '-m', 'as-is plan']);
+      writeSteps(projectDir, 'claude', [
+        PREFLIGHT_READY_STEP,
+        // The delay makes the pause land while the implementation is genuinely in flight, so
+        // the run settles at the boundary BEFORE code review.
+        { ...IMPLEMENTATION_STEP, shell: `sleep 4; ${IMPLEMENTATION_STEP.shell}` },
+      ]);
+      writeSteps(projectDir, 'codex', [
+        CODE_REVIEW_APPROVED_STEP,
+        VERIFICATION_ACCEPT_STEP,
+        planAsIsFinalAuditStep(workflowId),
+      ]);
+
+      const runPromise = reviewWorkflowRunCommand({
+        plan: 'plan.md',
+        timeout: 120,
+        id: workflowId,
+      });
+      const deadline = Date.now() + 60_000;
+      for (;;) {
+        if (Date.now() > deadline) throw new Error('the preflight never appeared in the audit');
+        const probe = openDatabase(getDbPath(projectDir));
+        try {
+          const started = new reviewWorkflowPlan.ReviewWorkflowPlanStore(probe).workflowStore
+            .listInvocationAudit(workflowId)
+            .some((row) => row.phase === 'IMPLEMENTATION');
+          if (started) break;
+        } finally {
+          probe.close();
+        }
+        await new Promise((resolveSleep) => setTimeout(resolveSleep, 100));
+      }
+      await reviewWorkflowPauseCommand(workflowId);
+      await runPromise;
+
+      const batchId = `${workflowId}:batch:1`;
+      const commandId = `${batchId}:code-review-1`;
+      const paused = openDatabase(getDbPath(projectDir));
+      try {
+        const state = new reviewWorkflowRunner.ReviewWorkflowRunnerStore(paused).require(
+          workflowId,
+        );
+        expect(state.status).toBe('PAUSED_BY_USER');
+        expect(phaseCounts(paused, workflowId).CODE_REVIEW).toBeUndefined();
+        const workflowStore = new reviewWorkflowPlan.ReviewWorkflowPlanStore(paused).workflowStore;
+        const batch = workflowStore.getBatch(batchId);
+        expect(batch?.persistedState).toBe('IMPLEMENTATION_COMPLETE');
+        if (batch === null) throw new Error('the batch is missing');
+        const workflow = workflowStore.getWorkflow(workflowId);
+        if (workflow === null) throw new Error('the workflow is missing');
+        const implementer = workflowStore.getEntity(
+          'AGENT_ASSIGNMENT',
+          workflow.implementerAssignmentId,
+        );
+        const reviewer = workflowStore.getEntity('AGENT_ASSIGNMENT', workflow.reviewerAssignmentId);
+        if (implementer?.kind !== 'AGENT_ASSIGNMENT' || reviewer?.kind !== 'AGENT_ASSIGNMENT') {
+          throw new Error('the role assignments are missing');
+        }
+        // Recreate exactly what the interrupted attempt left behind: the real reserve call
+        // the runner makes, with no claim after it.
+        const head = git(projectDir, ['rev-parse', 'HEAD']);
+        const commands = new reviewWorkflowPersistence.ReviewWorkflowCommandStore(paused);
+        commands.reserve(
+          {
+            commandId,
+            workflowId,
+            batchId,
+            expectedAggregateVersion: batch.aggregateVersion,
+            canonicalRequestHash: 'hash-interrupted-attempt',
+            targetCommitSha: head,
+            requester: {
+              actorExecutionId: `${commandId}:requester:interrupted`,
+              actorType: 'AGENT',
+              assignmentId: workflow.reviewerAssignmentId,
+              sessionIdentityId: `${batchId}:reviewer:interrupted`,
+              invocationIdentityId: `${commandId}:invocation:interrupted`,
+              authoritiesExercised: ['REVIEWER'],
+              identityAssurance: 'PROCESS_ATTESTED',
+              observedEvidence: [],
+              startedAt: new Date().toISOString(),
+            },
+            authorityExercised: 'REVIEWER',
+            command: {
+              type: 'START_CODE_REVIEW',
+              evidence: {
+                reviewedCommitSha: head,
+                currentHeadSha: head,
+                cleanWorktree: true,
+                unresolvedFindingCount: 0,
+                incompleteDispositionCount: 0,
+                roleSeparation: {
+                  implementerAssignment: implementer.value,
+                  reviewerAssignment: reviewer.value,
+                  reviewerSessionIdentityId: `${batchId}:reviewer:interrupted`,
+                  minimumIdentityAssurance: 'PROCESS_ATTESTED',
+                },
+              },
+            },
+          },
+          'AGENT_INVOCATION',
+        );
+        const orphan = commands.get(commandId);
+        expect(orphan?.receipt.status).toBe('RESERVED');
+        expect(orphan?.sideEffect?.state).toBe('NOT_STARTED');
+        expect(orphan?.receipt.sideEffectIdentity).toBeUndefined();
+      } finally {
+        paused.close();
+      }
+
+      // AC1: the resumed run continues the review it had only reserved.
+      await reviewWorkflowResumeCommand(workflowId, { timeout: 120 });
+
+      const done = openDatabase(getDbPath(projectDir));
+      try {
+        requireReady(done, workflowId);
+        expect(phaseCounts(done, workflowId).CODE_REVIEW).toBe(1);
+        const commands = new reviewWorkflowPersistence.ReviewWorkflowCommandStore(done);
+        // The live command belongs to the resumed attempt and completed...
+        expect(commands.get(commandId)?.receipt.status).toBe('SUCCEEDED');
+        // ...and the abandoned reservation is archived beside it, never destroyed.
+        const archived = done
+          .prepare(
+            `SELECT command_id, status, requester_actor_execution_id
+             FROM review_workflow_command_receipts WHERE command_id LIKE ?`,
+          )
+          .all(`${commandId}:superseded:%`) as {
+          command_id: string;
+          status: string;
+          requester_actor_execution_id: string;
+        }[];
+        expect(archived).toHaveLength(1);
+        expect(archived[0]?.status).toBe('RESERVED');
+        expect(archived[0]?.requester_actor_execution_id).toContain('interrupted');
       } finally {
         done.close();
       }

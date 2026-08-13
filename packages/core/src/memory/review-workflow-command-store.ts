@@ -322,51 +322,124 @@ export class ReviewWorkflowCommandStore {
       // A RECORDED side effect is deliberately NOT a reason to refuse. The failed command
       // really did invoke an agent, and that invocation stays in the immutable invocation
       // audit either way — releasing the reservation neither erases it nor replays it.
-      const archive = this.db
-        .prepare(
-          `INSERT INTO review_workflow_superseded_commands
+      this.supersedeReceipt(stored, reason);
+      return true;
+    })();
+  }
+
+  /**
+   * Frees a reservation that was created but NEVER STARTED, so the interrupted work it was
+   * reserved for can be re-attempted.
+   *
+   * Reserve-before-invoke opens a window: the receipt exists (`RESERVED`) and its side effect
+   * is still `NOT_STARTED`. Any stop inside that window — a crash, a kill, a pause, a raw
+   * persistence error before the claim — leaves a reservation that did nothing. It is not
+   * `FAILED_FINAL`, so `releaseRetryableReservations` never sweeps it, and the deterministic
+   * command ID means the next attempt derives the same ID and collides with the corpse of its
+   * own predecessor. A resumed run could not continue work it had itself merely reserved.
+   *
+   * The reservation is superseded rather than reused: its stored request carries the previous
+   * attempt's expected aggregate version, target commit and evidence, all of which may have
+   * moved while the run was stopped. Reusing it would complete the command against a world it
+   * no longer describes (or fail late at AGGREGATE_VERSION_CONFLICT); re-reserving with the
+   * current attempt's request records what is actually true now, and the archived receipt
+   * keeps the abandoned reservation on the record.
+   *
+   * Refused unless NOTHING happened under it: the receipt must still be `RESERVED`, no
+   * side-effect identity may be bound, any reserved side effect must still be `NOT_STARTED`,
+   * and no durable state may be recorded. A command that started or completed its side effect
+   * follows the ordinary replay/conflict rules, untouched. Returns false when there is nothing
+   * to release.
+   */
+  releaseUnstartedReservation(commandId: string, reason: string): boolean {
+    return this.db.transaction(() => {
+      const stored = this.get(commandId);
+      if (stored === null) return false;
+      if (stored.receipt.status !== 'RESERVED') {
+        throw new ReviewWorkflowPersistenceError(
+          'COMMAND_STATE_CONFLICT',
+          `Command ${commandId} is ${stored.receipt.status}, not RESERVED, and is not an unstarted reservation`,
+        );
+      }
+      // Either half of the claim having landed means the external call may already have been
+      // made: the receipt binds the identity and the side effect leaves NOT_STARTED in one
+      // transaction, so both are checked rather than trusting one.
+      if (stored.receipt.sideEffectIdentity !== undefined) {
+        throw new ReviewWorkflowPersistenceError(
+          'COMMAND_STATE_CONFLICT',
+          `Command ${commandId} is bound to side-effect identity ${stored.receipt.sideEffectIdentity} and did not stop before starting`,
+        );
+      }
+      if (stored.sideEffect !== null && stored.sideEffect.state !== 'NOT_STARTED') {
+        throw new ReviewWorkflowPersistenceError(
+          'COMMAND_STATE_CONFLICT',
+          `Command ${commandId} side effect is ${stored.sideEffect.state}, not NOT_STARTED, and cannot be superseded as unstarted`,
+        );
+      }
+      if (
+        stored.receipt.resultingAggregateVersion !== undefined ||
+        stored.receipt.resultingEventSequence !== undefined
+      ) {
+        throw new ReviewWorkflowPersistenceError(
+          'COMMAND_STATE_CONFLICT',
+          `Command ${commandId} recorded durable state (aggregate version ${stored.receipt.resultingAggregateVersion ?? 'unset'}, event ${stored.receipt.resultingEventSequence ?? 'unset'}) and cannot be superseded`,
+        );
+      }
+      this.supersedeReceipt(stored, reason);
+      return true;
+    })();
+  }
+
+  /**
+   * Archives a receipt under a superseded ID and frees the original command ID.
+   *
+   * Callers own the decision that superseding is permitted; this only performs it.
+   */
+  private supersedeReceipt(stored: StoredReviewWorkflowCommand, reason: string): void {
+    const commandId = stored.receipt.commandId;
+    const archive = this.db
+      .prepare(
+        `INSERT INTO review_workflow_superseded_commands
              (command_id, workflow_id, batch_id, reason, receipt_json, created_at)
            VALUES (?, ?, ?, ?, ?, ?)`,
-        )
-        .run(
-          commandId,
-          stored.request.workflowId,
-          stored.request.batchId,
-          reason,
-          JSON.stringify(stored),
-          this.timestamp(),
-        );
-      // Side effects, role invocations and events are foreign-keyed to the receipt, and they
-      // are EVIDENCE of calls that really happened — so the receipt is RENAMED rather than
-      // deleted, and its children follow it. Nothing is destroyed; the original command ID
-      // is simply free again. (The immutable `review_workflow_invocation_audit` — prompt,
-      // response, tokens, cost — is not keyed on the command and is untouched throughout.)
-      const archivedCommandId = `${commandId}:superseded:${archive.lastInsertRowid}`;
-      this.db
-        .prepare(
-          `INSERT INTO review_workflow_command_receipts
+      )
+      .run(
+        commandId,
+        stored.request.workflowId,
+        stored.request.batchId,
+        reason,
+        JSON.stringify(stored),
+        this.timestamp(),
+      );
+    // Side effects, role invocations and events are foreign-keyed to the receipt, and they
+    // are EVIDENCE of calls that really happened — so the receipt is RENAMED rather than
+    // deleted, and its children follow it. Nothing is destroyed; the original command ID
+    // is simply free again. (The immutable `review_workflow_invocation_audit` — prompt,
+    // response, tokens, cost — is not keyed on the command and is untouched throughout.)
+    const archivedCommandId = `${commandId}:superseded:${archive.lastInsertRowid}`;
+    this.db
+      .prepare(
+        `INSERT INTO review_workflow_command_receipts
              SELECT ?, workflow_id, batch_id, command_type, expected_aggregate_version,
                     canonical_request_hash, target_commit_sha, requester_actor_execution_id,
                     authority_exercised, status, side_effect_identity,
                     resulting_aggregate_version, resulting_event_sequence, result_hash,
                     result_json, error_code, request_json, created_at, updated_at
              FROM review_workflow_command_receipts WHERE command_id = ?`,
-        )
-        .run(archivedCommandId, commandId);
-      for (const table of [
-        'review_workflow_command_side_effects',
-        'review_workflow_invocations',
-        'review_workflow_events',
-      ]) {
-        this.db
-          .prepare(`UPDATE ${table} SET command_id = ? WHERE command_id = ?`)
-          .run(archivedCommandId, commandId);
-      }
+      )
+      .run(archivedCommandId, commandId);
+    for (const table of [
+      'review_workflow_command_side_effects',
+      'review_workflow_invocations',
+      'review_workflow_events',
+    ]) {
       this.db
-        .prepare('DELETE FROM review_workflow_command_receipts WHERE command_id = ?')
-        .run(commandId);
-      return true;
-    })();
+        .prepare(`UPDATE ${table} SET command_id = ? WHERE command_id = ?`)
+        .run(archivedCommandId, commandId);
+    }
+    this.db
+      .prepare('DELETE FROM review_workflow_command_receipts WHERE command_id = ?')
+      .run(commandId);
   }
 
   get(commandId: string): StoredReviewWorkflowCommand | null {
