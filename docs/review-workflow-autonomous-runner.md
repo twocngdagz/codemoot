@@ -161,6 +161,16 @@ then could not be recovered:
 - **`fix_again` always has a lane.** A retry is a genuinely new execution and records its
   own requester actor-execution (attempt-suffixed ID); both attempts sit side by side in
   the audit. Immutability is unchanged — the same ID with different content still fails.
+- **A retry can stand on work its failed attempt already committed.** Implementation
+  evidence is judged against the BATCH's progress (its established base SHA → HEAD, plus
+  any uncommitted worktree changes), not this attempt's own before/after delta. A retry
+  whose work is already committed files an honest `COMPLETE` handoff, writes nothing, and
+  is accepted; its implementation-ready evidence records the credited commit range
+  (base → HEAD) so the audit shows it standing on the earlier commit rather than claiming
+  authorship. The safety rules keep their teeth: a batch with no work anywhere still
+  rejects, a claim naming files the batch never touched still rejects, an agent attempt
+  ending with a dirty worktree still rejects, and another batch's commits (before this
+  batch's base) never count.
 
 ## Monitoring
 `workflow watch` streams durable heartbeats (each carrying worker, batch, phase, current

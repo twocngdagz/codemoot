@@ -698,6 +698,16 @@ export const implementationReadyEvidenceSchema = z
     worktreeFingerprint: contentHashSchema,
     changedFiles: z.array(z.string().min(1)),
     summary: z.string().min(1),
+    /**
+     * The commits this handoff stands on: batch base → current HEAD. On a retry after a
+     * failed-but-productive attempt this range covers the PREVIOUS attempt's commits, so
+     * an auditor sees the handoff crediting them rather than claiming to have authored
+     * work in this invocation. Optional: records predating the field have no range.
+     */
+    creditedCommitRange: z
+      .object({ fromSha: gitShaSchema, toSha: gitShaSchema })
+      .strict()
+      .optional(),
     capturedAt: isoTimestampSchema,
   })
   .strict();

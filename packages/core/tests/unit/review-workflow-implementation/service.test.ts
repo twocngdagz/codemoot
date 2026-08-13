@@ -134,6 +134,8 @@ const UNUSED_ADAPTER: CliBridge = {
 interface QueuedInvocation {
   readonly text: string;
   readonly mutateRepository?: () => void;
+  /** Thrown AFTER mutateRepository ran — an invocation that did its work and then died. */
+  readonly failAfterMutation?: Error;
 }
 
 class FakeRoleInvoker {
@@ -149,6 +151,7 @@ class FakeRoleInvoker {
     const next = this.queue.shift();
     if (next === undefined) throw new Error('No fake role invocation was queued');
     next.mutateRepository?.();
+    if (next.failAfterMutation !== undefined) throw next.failAfterMutation;
     const resumed = input.previousSessionIdentityId !== undefined;
     const sessionIdentityId = input.previousSessionIdentityId ?? input.sessionIdentityId;
     const vendorSessionId = 'vendor-implementer-session';
@@ -554,6 +557,133 @@ describe('ReviewWorkflowImplementationService', () => {
     expect(store.workflowStore.getEvents('batch-11').at(-1)?.eventType).toBe(
       'IMPLEMENTATION_RESUMED',
     );
+  });
+
+  function executeInput(
+    attempt: number,
+    creationMode: 'AGENT_AUTHORIZED' | 'HUMAN_CREATED',
+    run = 'a',
+  ) {
+    // `run` distinguishes a RETRY of the same attempt: the command/attempt identifiers are
+    // stable, but each execution is a new invocation with its own identity — exactly what
+    // the real flow generates fresh per call.
+    return {
+      workflowId: snapshot.workflowId,
+      batchId: 'batch-11',
+      configuration: snapshot,
+      resolution,
+      commandId: `batch-11:implementation:${attempt}:ready`,
+      actorExecutionId: `actor-implementation-${attempt}-${run}`,
+      invocationId: `invocation-implementation-${attempt}-${run}`,
+      sessionIdentityId: 'session-implementer',
+      previousSessionIdentityId: 'session-implementer',
+      transcriptId: `implementation-transcript-${attempt}-${run}`,
+      implementationAttemptId: `batch-11:implementation:${attempt}`,
+      implementationReadyEvidenceId: `batch-11:implementation:${attempt}:ready`,
+      attemptNumber: attempt,
+      creationMode,
+      prompt: 'Implement per the plan.',
+    } as const;
+  }
+
+  it('AC1: a retry standing on its failed attempt\'s commits is ACCEPTED, crediting them', async () => {
+    // THE REAL CASE at the service seam: attempt 1 commits all its work and then the
+    // invocation dies; the retry resumes, writes nothing, and files a COMPLETE handoff.
+    // The batch's progress — not this attempt's delta — is the evidence.
+    await startImplementation();
+    let committedSha = '';
+    roleInvoker.enqueue({
+      text: 'never returned',
+      mutateRepository: () => {
+        committedSha = commitFile(repositoryRoot, 'src/example.txt', 'implemented\n', 'impl');
+      },
+      failAfterMutation: new Error('protocol failure after the work was committed'),
+    });
+    await expect(service.execute(executeInput(1, 'AGENT_AUTHORIZED'))).rejects.toThrow(
+      'protocol failure',
+    );
+    // The offered recovery path releases the failed reservation, exactly as fix_again does.
+    commandStore.releaseRetryableReservations(
+      snapshot.workflowId,
+      'batch-11',
+      'Human-authorised retry after the committed-then-died attempt',
+    );
+
+    roleInvoker.enqueue({ text: implementationTranscript('COMPLETE', ['src/example.txt']) });
+    const retried = await service.execute(executeInput(1, 'AGENT_AUTHORIZED', 'b'));
+    expect(retried.status).toBe('AWAITING_COMMIT');
+    // AC6: the credited range names the previous attempt's commits explicitly.
+    const evidence = store.getImplementationReadyEvidence('batch-11:implementation:1:ready');
+    expect(evidence?.creditedCommitRange).toEqual({ fromSha: baseSha, toSha: committedSha });
+    expect(evidence?.changedFiles).toEqual(['src/example.txt']);
+  });
+
+  it('AC2: a normal first agent attempt that commits its own work is accepted as before', async () => {
+    await startImplementation();
+    let committedSha = '';
+    roleInvoker.enqueue({
+      text: implementationTranscript('COMPLETE', ['src/example.txt']),
+      mutateRepository: () => {
+        committedSha = commitFile(repositoryRoot, 'src/example.txt', 'implemented\n', 'impl');
+      },
+    });
+    const result = await service.execute(executeInput(1, 'AGENT_AUTHORIZED'));
+    expect(result.status).toBe('AWAITING_COMMIT');
+    const evidence = store.getImplementationReadyEvidence('batch-11:implementation:1:ready');
+    expect(evidence?.creditedCommitRange).toEqual({ fromSha: baseSha, toSha: committedSha });
+  });
+
+  it('AC3: a batch with no work anywhere is still rejected with NO_IMPLEMENTATION_CHANGE', async () => {
+    await startImplementation();
+    roleInvoker.enqueue({ text: implementationTranscript('COMPLETE', []) });
+    const result = await service.execute(executeInput(1, 'AGENT_AUTHORIZED'));
+    expect(result).toMatchObject({ status: 'REJECTED', errorCode: 'NO_IMPLEMENTATION_CHANGE' });
+  });
+
+  it('AC4: a claim naming files the batch never touched is still rejected', async () => {
+    // Retry shape: attempt 1 committed src/example.txt; the retry claims an extra file the
+    // batch never changed. Exact-set equality against the EFFECTIVE set must still hold.
+    await startImplementation();
+    roleInvoker.enqueue({
+      text: 'never returned',
+      mutateRepository: () => {
+        commitFile(repositoryRoot, 'src/example.txt', 'implemented\n', 'impl');
+      },
+      failAfterMutation: new Error('died after committing'),
+    });
+    await expect(service.execute(executeInput(1, 'AGENT_AUTHORIZED'))).rejects.toThrow();
+    commandStore.releaseRetryableReservations(snapshot.workflowId, 'batch-11', 'retry');
+    roleInvoker.enqueue({
+      text: implementationTranscript('COMPLETE', ['src/example.txt', 'src/never-touched.txt']),
+    });
+    const result = await service.execute(executeInput(1, 'AGENT_AUTHORIZED', 'b'));
+    expect(result).toMatchObject({ status: 'REJECTED', errorCode: 'CHANGED_FILES_MISMATCH' });
+  });
+
+  it('AC5: an agent attempt ending with a dirty worktree is still rejected', async () => {
+    await startImplementation();
+    roleInvoker.enqueue({
+      text: implementationTranscript('COMPLETE', ['src/example.txt', 'src/uncommitted.txt']),
+      mutateRepository: () => {
+        commitFile(repositoryRoot, 'src/example.txt', 'implemented\n', 'impl');
+        writeFileSync(join(repositoryRoot, 'src/uncommitted.txt'), 'left dirty\n');
+      },
+    });
+    const result = await service.execute(executeInput(1, 'AGENT_AUTHORIZED'));
+    expect(result).toMatchObject({ status: 'REJECTED', errorCode: 'AGENT_COMMIT_REQUIRED' });
+  });
+
+  it('AC7: work committed before the batch base never satisfies this batch\'s evidence', async () => {
+    // Another batch's work exists BEFORE this batch establishes its base: start() records
+    // the post-that-work HEAD as the base, so the baseline→HEAD effective set is empty and
+    // claiming those files cannot succeed.
+    commitFile(repositoryRoot, 'src/other-batch.txt', 'someone else\n', 'other batch work');
+    await startImplementation();
+    roleInvoker.enqueue({
+      text: implementationTranscript('COMPLETE', ['src/other-batch.txt']),
+    });
+    const result = await service.execute(executeInput(1, 'AGENT_AUTHORIZED'));
+    expect(result).toMatchObject({ status: 'REJECTED', errorCode: 'NO_IMPLEMENTATION_CHANGE' });
   });
 
   it('fails a preflight that mutates the repository without starting implementation', async () => {

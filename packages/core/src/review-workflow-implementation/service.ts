@@ -337,7 +337,14 @@ export class ReviewWorkflowImplementationService {
     }
     const evidenceMismatch =
       parsed?.outcome === 'COMPLETE'
-        ? this.validateCompletedEvidence(input, before, after, changedPaths, parsed.changedFiles)
+        ? this.validateCompletedEvidence(
+            input,
+            before,
+            after,
+            changedPaths,
+            parsed.changedFiles,
+            originalBatchBaseSha,
+          )
         : undefined;
     const roleSeparation = this.roleSeparation(input.configuration, prepared);
     const implementationReadyEvidence: ImplementationReadyEvidence = {
@@ -347,6 +354,9 @@ export class ReviewWorkflowImplementationService {
       worktreeFingerprint: after.worktreeFingerprint,
       changedFiles: changedPaths,
       summary: parsed?.summary ?? 'Implementation handoff was rejected.',
+      // The commits being credited, batch base → HEAD: on a retry this range holds the
+      // previous attempt's commits, making explicit that this handoff STANDS ON them.
+      creditedCommitRange: { fromSha: originalBatchBaseSha, toSha: after.headSha },
       capturedAt: this.timestamp(),
     };
     const markCommand: TransitionCommand = {
@@ -806,14 +816,27 @@ export class ReviewWorkflowImplementationService {
     return [...new Set([...committed, ...after.changedPaths])].sort();
   }
 
+  /**
+   * A COMPLETE handoff is judged against the BATCH's progress, not this attempt's delta.
+   * `actualChangedPaths` is already the effective set (batch base → HEAD, plus any
+   * uncommitted worktree changes), so on a first attempt these rules behave exactly as
+   * before — and on a retry after a failed-but-productive attempt, the work the previous
+   * attempt committed counts. A live batch was otherwise unrecoverable: attempt 1 wrote
+   * and committed everything, died on a protocol failure, and every retry was rejected for
+   * "producing no changes" — the only way to satisfy an attempt-scoped check was to redo
+   * work that was already committed.
+   */
   private validateCompletedEvidence(
     input: ExecuteImplementationInput,
     before: GitWorktreeSnapshot,
     after: GitWorktreeSnapshot,
     actualChangedPaths: readonly string[],
     claimedChangedPaths: readonly string[],
+    originalBatchBaseSha: string,
   ): EvidenceMismatch | undefined {
     if (actualChangedPaths.length === 0) {
+      // The BATCH genuinely has no work — nothing committed since its base and a clean
+      // worktree. A batch whose earlier attempt committed work never lands here.
       return {
         code: 'NO_IMPLEMENTATION_CHANGE',
         message: 'A complete implementation must produce repository changes',
@@ -826,10 +849,14 @@ export class ReviewWorkflowImplementationService {
       };
     }
     if (input.creationMode === 'AGENT_AUTHORIZED') {
-      if (!after.clean || after.headSha === before.headSha) {
+      // HEAD must be ahead of the BATCH base with a clean worktree — not ahead of this
+      // attempt's start. A retry that legitimately wrote nothing (the work is already
+      // committed) still proves a clean tree and a HEAD carrying the batch's commits.
+      if (!after.clean || after.headSha === originalBatchBaseSha) {
         return {
           code: 'AGENT_COMMIT_REQUIRED',
-          message: 'Agent-authorized mode requires a new committed HEAD and clean worktree',
+          message:
+            'Agent-authorized mode requires the batch HEAD to be ahead of its established base with a clean worktree',
         };
       }
       return undefined;
