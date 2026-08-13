@@ -77,6 +77,8 @@ const stateRowSchema = z.object({
   counters_json: z.string().min(1),
   // Written once at init and never updated — the mode is frozen exactly like the limits.
   plan_as_is: z.number().int().nullable().default(0),
+  // NULL = unlimited. Frozen at init; rewritten ONLY by an explicit resume --max-batches.
+  max_batches: z.number().int().positive().nullable().default(null),
   started_at: z.string().min(1),
   updated_at: z.string().min(1),
 });
@@ -166,6 +168,7 @@ export class ReviewWorkflowRunnerStore {
     readonly baseSha: string;
     readonly limits?: RunnerConfig;
     readonly planAsIs?: boolean;
+    readonly maxBatches?: number;
   }): RunnerState {
     const now = this.timestamp();
     const counters: RunnerCounters = {
@@ -178,8 +181,8 @@ export class ReviewWorkflowRunnerStore {
       .prepare(
         `INSERT INTO review_workflow_runner_state (
           workflow_id, status, branch, base_branch, base_sha, total_batches,
-          notified, limits_json, counters_json, plan_as_is, started_at, updated_at
-        ) VALUES (?, 'RUNNING', ?, ?, ?, 0, 0, ?, ?, ?, ?, ?)`,
+          notified, limits_json, counters_json, plan_as_is, max_batches, started_at, updated_at
+        ) VALUES (?, 'RUNNING', ?, ?, ?, 0, 0, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         input.workflowId,
@@ -189,10 +192,37 @@ export class ReviewWorkflowRunnerStore {
         input.limits === undefined ? null : JSON.stringify(input.limits),
         JSON.stringify(counters),
         input.planAsIs === true ? 1 : 0,
+        input.maxBatches ?? null,
         now,
         now,
       );
     return this.require(input.workflowId);
+  }
+
+  /**
+   * Rewrites the frozen batch scope — the ONE deliberate exception to "frozen at start".
+   * Only an explicit `resume --max-batches <n>` calls this; the caller records the operator
+   * act in the runner log. A dropped flag never reaches here, so it can never widen a run.
+   */
+  setMaxBatches(workflowId: string, maxBatches: number | null): void {
+    // A stale BATCH_SCOPE_REACHED stop record is cleared in the same write: the operator
+    // just rewrote the scope, so the old scope's stop no longer describes the run. (SET
+    // right-hand sides all read the PRE-update row, so both CASEs see the original
+    // stop_reason.) If the new scope is also already reached, the gate or the runner
+    // re-records it immediately.
+    const changed = this.db
+      .prepare(
+        `UPDATE review_workflow_runner_state SET
+           max_batches = ?,
+           stop_details = CASE WHEN stop_reason = 'BATCH_SCOPE_REACHED' THEN NULL ELSE stop_details END,
+           stop_reason = CASE WHEN stop_reason = 'BATCH_SCOPE_REACHED' THEN NULL ELSE stop_reason END,
+           updated_at = ?
+         WHERE workflow_id = ?`,
+      )
+      .run(maxBatches, this.timestamp(), workflowId);
+    if (changed.changes !== 1) {
+      throw new RunnerError('RUNNER_STATE_MISSING', `No runner state for workflow ${workflowId}`);
+    }
   }
 
   get(workflowId: string): RunnerState | null {
@@ -222,6 +252,7 @@ export class ReviewWorkflowRunnerStore {
         ? {}
         : { limits: limitsSchema.parse(JSON.parse(parsed.limits_json)) }),
       ...(parsed.plan_as_is === 1 ? { planAsIs: true } : {}),
+      ...(parsed.max_batches === null ? {} : { maxBatches: parsed.max_batches }),
       ...(parsed.active_invocation_json === null
         ? {}
         : {

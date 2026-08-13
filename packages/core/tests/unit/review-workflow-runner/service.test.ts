@@ -262,6 +262,83 @@ describe('AutonomousWorkflowRunner', () => {
     expect(phases.calls.some((call) => call.startsWith('implement'))).toBe(false);
   });
 
+  it('batch scope: stops cleanly after N fully-complete batches; complete() never runs', async () => {
+    runnerStore.setMaxBatches(WORKFLOW_ID, 1);
+    const phases = happyPhases(batches);
+    const result = await makeRunner(phases).run(WORKFLOW_ID);
+    // A scope stop settles like a pause — resumable — but under its own named reason.
+    expect(result.status).toBe('PAUSED_BY_USER');
+    expect(result.stopReason).toBe('BATCH_SCOPE_REACHED');
+    const state = runnerStore.require(WORKFLOW_ID);
+    expect(state.status).toBe('PAUSED_BY_USER');
+    expect(state.stopReason).toBe('BATCH_SCOPE_REACHED');
+    expect(state.stopDetails).toContain('--max-batches');
+    // Batch 1 is FULLY complete — including its push — and batch 2 never started an action.
+    expect(state.counters.completedOrdinals).toEqual([1]);
+    expect(git.pushes).toBe(1);
+    expect(phases.calls.filter((call) => call.startsWith('implement'))).toEqual(['implement:1']);
+    // complete() belongs to a finished workflow only: no workflow-wide audit ran.
+    expect(phases.calls).not.toContain('workflow-audit');
+    // Exactly one notification, worded as the expected stop it is — not an error.
+    expect(notifications).toHaveLength(1);
+    expect(notifications[0]).toContain('stopped at its batch scope as requested');
+    // The checkpoint names the scope and how to continue.
+    const checkpoints = runnerStore.listLog(WORKFLOW_ID, { types: ['CHECKPOINT'] });
+    expect(
+      checkpoints.some((entry) => entry.message.startsWith('Batch scope reached:')),
+    ).toBe(true);
+  });
+
+  it('batch scope equal to the total never fires — normal completion, complete() included', async () => {
+    runnerStore.setMaxBatches(WORKFLOW_ID, 2);
+    const phases = happyPhases(batches);
+    const result = await makeRunner(phases).run(WORKFLOW_ID);
+    expect(result.status).toBe('READY_FOR_HUMAN_VERIFICATION');
+    expect(runnerStore.require(WORKFLOW_ID).counters.completedOrdinals).toEqual([1, 2]);
+    expect(phases.calls).toContain('workflow-audit');
+    expect(runnerStore.require(WORKFLOW_ID).stopReason).toBeUndefined();
+  });
+
+  it('batch scope survives a blind worker restart — re-read from frozen state, never argv', async () => {
+    runnerStore.setMaxBatches(WORKFLOW_ID, 1);
+    await makeRunner(happyPhases(batches)).run(WORKFLOW_ID);
+    expect(runnerStore.require(WORKFLOW_ID).counters.completedOrdinals).toEqual([1]);
+    // A restarted worker knows nothing the durable state does not: flip the status back to
+    // RUNNING (as a crash-recovery launcher would) and run again with NO scope anywhere in
+    // the runner's inputs. The frozen scope must re-stop it before batch 2 acts.
+    runnerStore.update(WORKFLOW_ID, { status: 'RUNNING', stopReason: null, stopDetails: null });
+    const secondWorker = happyPhases(batches);
+    const result = await makeRunner(secondWorker).run(WORKFLOW_ID);
+    expect(result.stopReason).toBe('BATCH_SCOPE_REACHED');
+    expect(secondWorker.calls.filter((call) => call.startsWith('implement'))).toEqual([]);
+    expect(runnerStore.require(WORKFLOW_ID).counters.completedOrdinals).toEqual([1]);
+  });
+
+  it('an explicitly widened scope continues from batch N+1 without redoing batch N', async () => {
+    runnerStore.setMaxBatches(WORKFLOW_ID, 1);
+    await makeRunner(happyPhases(batches)).run(WORKFLOW_ID);
+    // The explicit operator act: rewrite the frozen scope, then resume.
+    runnerStore.setMaxBatches(WORKFLOW_ID, 2);
+    // setMaxBatches clears the now-stale scope stop record in the same write.
+    expect(runnerStore.require(WORKFLOW_ID).stopReason).toBeUndefined();
+    runnerStore.update(WORKFLOW_ID, { status: 'RUNNING' });
+    const resumed = happyPhases(batches);
+    const result = await makeRunner(resumed).run(WORKFLOW_ID);
+    expect(result.status).toBe('READY_FOR_HUMAN_VERIFICATION');
+    expect(resumed.calls.filter((call) => call.startsWith('implement'))).toEqual(['implement:2']);
+    expect(runnerStore.require(WORKFLOW_ID).counters.completedOrdinals).toEqual([1, 2]);
+  });
+
+  it('without a scope, a 3-batch plan runs all 3 to READY — byte-for-byte default', async () => {
+    const three = [...batches, { ordinal: 3, batchId: 'batch-3' }];
+    const phases = happyPhases(three);
+    const result = await makeRunner(phases).run(WORKFLOW_ID);
+    expect(result.status).toBe('READY_FOR_HUMAN_VERIFICATION');
+    expect(result.stopReason).toBeUndefined();
+    expect(runnerStore.require(WORKFLOW_ID).counters.completedOrdinals).toEqual([1, 2, 3]);
+    expect(phases.calls).toContain('workflow-audit');
+  });
+
   it('freezes the batch count at refinement and stops on unapproved expansion', async () => {
     await makeRunner(happyPhases(batches)).run(WORKFLOW_ID);
     // A second run must not accept a changed batch count.

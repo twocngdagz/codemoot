@@ -481,6 +481,11 @@ reviewWorkflow
     '--plan-as-is',
     'Use the plan VERBATIM: no LLM refinement rewrite, no plan-review gate — batches come from the plan\'s own "## Batch N" headings and go straight to implement → code review',
   )
+  .option(
+    '--max-batches <n>',
+    'Stop cleanly after this many batches are FULLY complete (verified, gated, pushed), leaving the workflow resumable; frozen at start — widening later requires an explicit resume --max-batches',
+    positiveInteger,
+  )
   .option('--background', 'Run detached and return the workflow ID immediately')
   .option(
     '--timeout <seconds>',
@@ -551,9 +556,17 @@ reviewWorkflow
     'Per-invocation timeout in seconds (default: cliAdapter.timeout from .cowork.yml)',
     positiveInteger,
   )
+  .option(
+    '--max-batches <n>',
+    'Explicitly rewrite the frozen batch scope (the only way to continue past a batch-scope stop); a bare resume never widens a scoped run',
+    positiveInteger,
+  )
   .option('--background', 'Resume detached', false)
-  .action((workflowId: string, options: { timeout: number; background?: boolean }) =>
-    reviewWorkflowResumeCommand(workflowId, options),
+  .action(
+    (
+      workflowId: string,
+      options: { timeout: number; background?: boolean; maxBatches?: number },
+    ) => reviewWorkflowResumeCommand(workflowId, options),
   );
 
 reviewWorkflow
@@ -569,10 +582,22 @@ reviewWorkflow
     '--plan-as-is',
     'Assert the workflow runs in plan-as-is mode (the mode was frozen at start; a mismatch fails rather than switching)',
   )
+  .option(
+    '--max-batches <n>',
+    'Explicitly rewrite the frozen batch scope (the only way to continue past a batch-scope stop); a bare resume never widens a scoped run',
+    positiveInteger,
+  )
   .option('--background', 'Resume detached', false)
   .action(
-    (workflowId: string, options: { timeout: number; background?: boolean; planAsIs?: boolean }) =>
-      reviewWorkflowRunResumeCommand(workflowId, options),
+    (
+      workflowId: string,
+      options: {
+        timeout: number;
+        background?: boolean;
+        planAsIs?: boolean;
+        maxBatches?: number;
+      },
+    ) => reviewWorkflowRunResumeCommand(workflowId, options),
   );
 
 reviewWorkflow

@@ -7,7 +7,7 @@ import {
   REVIEW_WORKFLOW_RUNNER_STATE_DDL,
 } from './review-workflow-schema.js';
 
-const SCHEMA_VERSION = '23';
+const SCHEMA_VERSION = '24';
 
 const MIGRATIONS = [
   // Sessions
@@ -438,6 +438,15 @@ export function runMigrations(db: Database.Database): void {
       db.exec(
         'ALTER TABLE review_workflow_runner_state ADD COLUMN plan_as_is INTEGER NOT NULL DEFAULT 0',
       );
+    } catch {
+      // Column already exists
+    }
+    // v24: the batch scope (`workflow run --max-batches N`) is frozen the same way. NULL
+    // means unlimited — every pre-v24 workflow reads as unscoped, which is what it was.
+    // Frozen because a dropped flag on a later resume must never silently WIDEN a run the
+    // operator deliberately scoped; widening is an explicit, recorded resume act.
+    try {
+      db.exec('ALTER TABLE review_workflow_runner_state ADD COLUMN max_batches INTEGER');
     } catch {
       // Column already exists
     }

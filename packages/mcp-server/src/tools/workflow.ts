@@ -421,7 +421,7 @@ export const WORKFLOW_TOOL_DEFINITIONS = [
   {
     name: 'codemoot_workflow_status',
     description:
-      'Read a review-gated workflow: batch states, effective merge-approval state, and review rounds.',
+      'Read a review-gated workflow: batch states, effective merge-approval state, and review rounds. The runner block also reports the frozen execution scope (planAsIs, maxBatches) and, for a stopped run, the named stop reason — BATCH_SCOPE_REACHED means the workflow stopped at its operator-set --max-batches boundary as requested, and only an explicit resume --max-batches above the completed count continues it.',
     inputSchema: {
       type: 'object' as const,
       properties: { workflowId: WORKFLOW_ID_JSON },
