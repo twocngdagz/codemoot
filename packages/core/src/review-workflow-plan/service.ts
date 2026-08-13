@@ -523,6 +523,69 @@ export class ReviewWorkflowPlanService {
   }
 
   /**
+   * Accepts a batch's plan AS SUPPLIED: DRAFT → APPROVED_FOR_IMPLEMENTATION through the
+   * explicit ACCEPT_PLAN_AS_IS command, on operator authority (HUMAN/SYSTEM +
+   * WORKFLOW_OWNER). No reviewer is involved and no review evidence exists — that is the
+   * point of the command: the audit records that the operator supplied the plan verbatim
+   * and vouched for it, instead of a fabricated approval pretending a review happened.
+   */
+  acceptPlanAsIs(input: {
+    readonly workflowId: string;
+    readonly batchId: string;
+    readonly actor: ActorExecutionIdentity;
+    readonly rationale: string;
+  }): ReviewWorkflowBatch {
+    const batch = this.requireBatch(input.batchId);
+    if (batch.workflowId !== input.workflowId) {
+      throw new ReviewWorkflowPlanError(
+        'BATCH_NOT_FOUND',
+        `Batch ${input.batchId} does not belong to workflow ${input.workflowId}`,
+      );
+    }
+    const plan = this.store.getBatchPlan(batch.currentPlanVersionId);
+    if (plan === null) {
+      throw new ReviewWorkflowPlanError(
+        'BATCH_NOT_FOUND',
+        `Current batch plan ${batch.currentPlanVersionId} does not exist`,
+      );
+    }
+    const command: TransitionCommand = {
+      type: 'ACCEPT_PLAN_AS_IS',
+      evidence: {
+        acceptedPlanVersionId: plan.batchPlanVersionId,
+        currentPlanVersionId: batch.currentPlanVersionId,
+        acceptedPlanContentHash: plan.contentHash,
+        currentPlanContentHash: plan.contentHash,
+        rationale: input.rationale,
+      },
+    };
+    const commandId = derivePlanCommandId(input.batchId, 'accept-as-is');
+    return this.store.runAtomically(() => {
+      this.reserveCommand({
+        commandId,
+        workflowId: input.workflowId,
+        batchId: input.batchId,
+        expectedAggregateVersion: batch.aggregateVersion,
+        requester: input.actor,
+        authorityExercised: 'WORKFLOW_OWNER',
+        command,
+      });
+      const transition = requireAllowedTransition(batch.persistedState, command, input.actor);
+      this.commandStore.succeedWithTransition({
+        commandId,
+        transition,
+        eventType: 'PLAN_ACCEPTED_AS_IS',
+        eventPayload: {
+          batchPlanVersionId: plan.batchPlanVersionId,
+          rationale: input.rationale,
+        },
+        resultHash: hashValue({ batchId: input.batchId, state: transition.nextState }),
+      });
+      return this.requireBatch(input.batchId);
+    });
+  }
+
+  /**
    * Captures an implementer-authored revised batch plan after a NEEDS_REVISION plan review:
    * persists the new immutable plan version, requires one response per open plan finding,
    * and emits SUBMIT_REVISED_PLAN so the kernel repoints the batch plan and returns to DRAFT.

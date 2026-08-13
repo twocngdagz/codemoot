@@ -229,6 +229,16 @@ export const reviewGatedConfigSchema = z.object({
   pacing: reviewGatedPacingConfigSchema.default(COMPATIBILITY_REVIEW_GATED_CONFIG.pacing),
   autonomous: reviewGatedAutonomousConfigSchema.default({}),
   operatorMode: reviewGatedOperatorModeSchema,
+  /**
+   * Plan-as-is mode: the supplied plan is used VERBATIM. No agent rewrites it into batch
+   * plans (batches are derived mechanically from the plan's own `## Batch N` headings) and
+   * no plan-review gate runs — the batch goes straight to implementation via an explicit
+   * operator-authority ACCEPT_PLAN_AS_IS transition. For plans that were already authored
+   * and reviewed outside the workflow, where an LLM rewrite re-plans redundantly and can
+   * degrade precision. Everything from implementation on — code review, correction,
+   * verification, final audit, gate, push — is unchanged.
+   */
+  planAsIs: z.boolean().default(false),
 });
 
 const memoryConfigSchema = z.object({

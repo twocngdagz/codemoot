@@ -23,7 +23,12 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { openDatabase, reviewWorkflowPlan, reviewWorkflowRunner } from '@codemoot/core';
+import {
+  openDatabase,
+  reviewWorkflowGate,
+  reviewWorkflowPlan,
+  reviewWorkflowRunner,
+} from '@codemoot/core';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   reviewWorkflowDecideCommand,
@@ -50,7 +55,7 @@ function git(projectDir: string, args: readonly string[]): string {
   return execFileSync('git', [...args], { cwd: projectDir, encoding: 'utf8' }).trim();
 }
 
-function buildConfig(): string {
+function buildConfig(options: { planAsIs?: boolean } = {}): string {
   return JSON.stringify({
     configVersion: 3,
     workflow: 'review-gated-batches',
@@ -96,16 +101,30 @@ function buildConfig(): string {
         requireAllFindingResponses: true,
         requireAcceptedAttestations: true,
       },
+      ...(options.planAsIs === true ? { planAsIs: true } : {}),
     },
     debate: { enabled: false },
   });
 }
 
-/** The requirement id the plan importer derives — needed for the final-audit checks. */
-function importedRequirementId(workflowId: string): string {
+// The plan for plan-as-is runs declares its OWN verification command — the real check that
+// the implementer's commit produced the file, run exactly as written via `sh -c`.
+const AS_IS_PLAN_CONTENT = `## Deliver the sample feature
+
+Write the sample output file.
+
+## Verification
+
+\`\`\`sh
+test -f sample.txt
+\`\`\`
+`;
+
+/** Every requirement id the plan importer derives — needed for the final-audit checks. */
+function importedRequirementIds(workflowId: string, content: string = PLAN_CONTENT): string[] {
   const imported = reviewWorkflowPlan.importGeneralPlan({
     workflowId,
-    content: PLAN_CONTENT,
+    content,
     sourceType: 'MARKDOWN_FILE',
     authorEvidence: [
       {
@@ -116,7 +135,12 @@ function importedRequirementId(workflowId: string): string {
     ],
     createdAt: '2026-08-02T12:00:00.000Z',
   });
-  const requirementId = imported.requirements[0]?.requirementId;
+  if (imported.requirements.length === 0) throw new Error('Plan fixture produced no requirement');
+  return imported.requirements.map((requirement) => requirement.requirementId);
+}
+
+function importedRequirementId(workflowId: string): string {
+  const requirementId = importedRequirementIds(workflowId)[0];
   if (requirementId === undefined) throw new Error('Plan fixture produced no requirement');
   return requirementId;
 }
@@ -378,6 +402,46 @@ function finalAuditApprovedStep(workflowId: string): Record<string, unknown> {
   };
 }
 
+/** Final audit for a plan-as-is run: PASSED checks for every requirement of the AS-IS plan. */
+function planAsIsFinalAuditStep(workflowId: string): Record<string, unknown> {
+  return {
+    response: {
+      schemaVersion: 1,
+      contractKind: 'FINAL_AUDIT_RESULT',
+      target: '{{TARGET}}',
+      verdict: 'APPROVED',
+      summary: 'Every requirement of the operator-supplied plan is delivered as written.',
+      findings: [],
+      requirementChecks: importedRequirementIds(workflowId, AS_IS_PLAN_CONTENT).map(
+        (requirementId) => ({
+          subjectId: requirementId,
+          status: 'PASSED',
+          explanation: 'The delivered repository satisfies this plan section as written.',
+          evidence: [
+            { kind: 'FILE', location: 'sample.txt', description: 'The delivered output file.' },
+          ],
+        }),
+      ),
+      acceptanceCriterionChecks: [
+        {
+          subjectId: materializedCriterionId(workflowId),
+          status: 'PASSED',
+          explanation: "The plan's own verification command (test -f sample.txt) exits 0.",
+          evidence: [
+            {
+              kind: 'COMMAND',
+              location: 'sh -c "test -f sample.txt"',
+              description: 'The declared verification command evidence.',
+            },
+          ],
+        },
+      ],
+      scopeComplete: true,
+      documentationComplete: true,
+    },
+  };
+}
+
 interface ProjectFixture {
   readonly projectDir: string;
   readonly remoteDir: string;
@@ -410,7 +474,7 @@ describe('codemoot workflow run lifecycle (real command, scenario-driven adapter
     cleanupDirs.length = 0;
   });
 
-  function createProject(): ProjectFixture {
+  function createProject(config: string = buildConfig()): ProjectFixture {
     const projectDir = mkdtempSync(join(tmpdir(), 'codemoot-lifecycle-'));
     const remoteDir = mkdtempSync(join(tmpdir(), 'codemoot-lifecycle-remote-'));
     cleanupDirs.push(projectDir, remoteDir);
@@ -420,7 +484,7 @@ describe('codemoot workflow run lifecycle (real command, scenario-driven adapter
     git(projectDir, ['config', 'user.name', 'Test']);
     writeFileSync(join(projectDir, 'README.md'), '# Sample project\n');
     writeFileSync(join(projectDir, 'plan.md'), PLAN_CONTENT);
-    writeFileSync(join(projectDir, '.cowork.yml'), buildConfig());
+    writeFileSync(join(projectDir, '.cowork.yml'), config);
     // `.codemoot/` holds the patch/verification-log artifact sinks the gate writes during
     // review capture; both stores must stay invisible to worktree cleanliness evidence.
     writeFileSync(join(projectDir, '.gitignore'), '.cowork/\n.codemoot/\n');
@@ -460,8 +524,10 @@ describe('codemoot workflow run lifecycle (real command, scenario-driven adapter
       const planStore = new reviewWorkflowPlan.ReviewWorkflowPlanStore(db);
       const failures = planStore.workflowStore
         .listInvocationAudit(workflowId)
-        .filter((row) => row.resultStatus === 'FAILED')
-        .map((row) => `${row.phase ?? 'unknown-phase'}: ${row.failure?.message ?? 'no message'}`);
+        .map(
+          (row) =>
+            `${row.phase ?? 'unknown-phase'} [${row.resultStatus}] ${row.invocationId}: ${row.failure?.message ?? 'ok'}`,
+        );
       const log = runnerStore
         .listLog(workflowId, { limit: 1000 })
         .filter((entry) => entry.entryType !== 'HEARTBEAT')
@@ -469,7 +535,7 @@ describe('codemoot workflow run lifecycle (real command, scenario-driven adapter
       throw new Error(
         `Runner stopped with ${state.status} (${state.stopReason ?? 'no reason'}): ${
           state.stopDetails ?? 'no details'
-        }\nFailed invocations:\n${failures.join('\n')}\nRunner log:\n${log.join('\n')}`,
+        }\nInvocation audit:\n${failures.join('\n')}\nRunner log:\n${log.join('\n')}`,
       );
     }
     return state;
@@ -842,6 +908,170 @@ describe('codemoot workflow run lifecycle (real command, scenario-driven adapter
         await expect(reviewWorkflowResumeCommand(workflowId, { timeout: 120 })).rejects.toThrow(
           /READY_FOR_HUMAN_VERIFICATION/,
         );
+      } finally {
+        db.close();
+      }
+    },
+  );
+
+  it(
+    'plan-as-is: the plan is used VERBATIM — zero refinement/plan-review invocations, ACCEPT_PLAN_AS_IS opens the batch',
+    { timeout: 120_000 },
+    async () => {
+      const { projectDir } = createProject(buildConfig({ planAsIs: true }));
+      const workflowId = 'workflow-plan-as-is';
+      // The plan declares its OWN verification command; the mode must run it, not a no-op.
+      writeFileSync(join(projectDir, 'plan.md'), AS_IS_PLAN_CONTENT);
+      git(projectDir, ['add', 'plan.md']);
+      git(projectDir, ['commit', '-q', '-m', 'plan-as-is plan']);
+      // NO refinement steps and NO plan-review step exist in either scenario: any attempt
+      // to invoke an agent for those phases would exhaust the scenario and fail the run.
+      writeSteps(projectDir, 'claude', [PREFLIGHT_READY_STEP, IMPLEMENTATION_STEP]);
+      writeSteps(projectDir, 'codex', [
+        CODE_REVIEW_APPROVED_STEP,
+        VERIFICATION_ACCEPT_STEP,
+        planAsIsFinalAuditStep(workflowId),
+      ]);
+
+      await reviewWorkflowRunCommand({ plan: 'plan.md', timeout: 120, id: workflowId });
+
+      const db = openDatabase(getDbPath(projectDir));
+      try {
+        requireReady(db, workflowId);
+        const planStore = new reviewWorkflowPlan.ReviewWorkflowPlanStore(db);
+
+        // 1. ZERO PLAN_REFINEMENT / PLAN_REVIEW / PLAN_REVISION agent invocations — the
+        // immutable invocation audit carries only the implement→review loop.
+        expect(phaseCounts(db, workflowId)).toEqual({
+          IMPLEMENTATION: 2, // preflight + execute
+          CODE_REVIEW: 1,
+          VERIFICATION: 1,
+          FINAL_AUDIT: 1,
+        });
+        expect(scenarioCallCount(projectDir, 'claude')).toBe(2);
+        expect(scenarioCallCount(projectDir, 'codex')).toBe(3);
+
+        // 2. The batch reached APPROVED_FOR_IMPLEMENTATION via ACCEPT_PLAN_AS_IS on the
+        // operator's own execution — never via APPROVE_PLAN, never entering PLAN_REVIEW.
+        const batchId = `${workflowId}:batch:1`;
+        const events = db
+          .prepare(
+            'SELECT event_type, actor_execution_id FROM review_workflow_events WHERE batch_id = ? ORDER BY event_id',
+          )
+          .all(batchId) as { event_type: string; actor_execution_id: string }[];
+        const acceptances = events.filter((event) => event.event_type === 'PLAN_ACCEPTED_AS_IS');
+        expect(acceptances).toHaveLength(1);
+        expect(acceptances[0]?.actor_execution_id).toContain('plan-as-is-owner');
+        const eventTypes = events.map((event) => event.event_type);
+        expect(eventTypes).not.toContain('PLAN_REVIEW_STARTED');
+        expect(eventTypes).not.toContain('BATCH_PLAN_APPROVED');
+
+        // 3. The BatchPlanVersion carries the plan VERBATIM, and verification is the
+        // plan's OWN declared command — run as written via sh -c, not a hardcoded no-op.
+        const batch = planStore
+          .listBatches(workflowId)
+          .find((candidate) => candidate.ordinal === 1);
+        expect(batch).toBeDefined();
+        if (batch === undefined) throw new Error('batch 1 missing');
+        const plan = planStore.getBatchPlan(batch.currentPlanVersionId);
+        expect(plan).not.toBeNull();
+        expect(plan?.technicalImplementation.join('\n')).toContain(
+          'Write the sample output file.',
+        );
+        expect(plan?.verificationCommands).toHaveLength(1);
+        expect(plan?.verificationCommands[0]?.executable).toBe('sh');
+        expect(plan?.verificationCommands[0]?.arguments).toEqual(['-c', 'test -f sample.txt']);
+        // The declared command really ran: a SUCCEEDED verification record exists for
+        // exactly this command.
+        const records = new reviewWorkflowGate.ReviewWorkflowGateStore(db).listVerificationRecords(
+          batch.batchId,
+        );
+        expect(
+          records.some(
+            (record) =>
+              record.command === 'sh' &&
+              record.arguments.join(' ') === '-c test -f sample.txt' &&
+              record.observedStatus === 'SUCCEEDED',
+          ),
+        ).toBe(true);
+
+        // The delivered artefact exists and was pushed like any refined-mode batch.
+        expect(readFileSync(join(projectDir, 'sample.txt'), 'utf8')).toBe('content\n');
+      } finally {
+        db.close();
+      }
+    },
+  );
+
+  it(
+    'plan-as-is: an interrupted workflow resumes without plan review, and the acceptance never repeats',
+    { timeout: 120_000 },
+    async () => {
+      // Same interruption the refined-mode restart test proves recoverable — the gated
+      // push fails on a read-only remote — driven end to end in plan-as-is mode. The mode
+      // survives the resume via the value frozen in runner state; across BOTH runs there
+      // is not one plan-refinement/review/revision invocation, and the ACCEPT_PLAN_AS_IS
+      // transition fired exactly once.
+      const { projectDir, remoteDir } = createProject(buildConfig({ planAsIs: true }));
+      const workflowId = 'workflow-plan-as-is-resume';
+      writeSteps(projectDir, 'claude', [PREFLIGHT_READY_STEP, IMPLEMENTATION_STEP]);
+      writeSteps(projectDir, 'codex', [
+        CODE_REVIEW_APPROVED_STEP,
+        VERIFICATION_ACCEPT_STEP,
+        finalAuditApprovedStep(workflowId),
+      ]);
+      execFileSync('chmod', ['-R', 'a-w', remoteDir]);
+
+      await reviewWorkflowRunCommand({ plan: 'plan.md', timeout: 120, id: workflowId });
+
+      const dbAfterStop = openDatabase(getDbPath(projectDir));
+      try {
+        const runnerStore = new reviewWorkflowRunner.ReviewWorkflowRunnerStore(dbAfterStop);
+        const stopped = runnerStore.require(workflowId);
+        expect(stopped.status).toBe('HUMAN_DECISION_REQUIRED');
+        expect(stopped.stopReason).toBe('PUSH_FAILED');
+        // The frozen mode is durable and visible on the stopped run.
+        expect(stopped.planAsIs).toBe(true);
+      } finally {
+        dbAfterStop.close();
+      }
+      execFileSync('chmod', ['-R', 'u+w', remoteDir]);
+
+      await reviewWorkflowDecideCommand(workflowId, {
+        action: 'fix_again',
+        rationale: 'The remote is writable again; retry the gated push.',
+      });
+      await reviewWorkflowRunResumeCommand(workflowId, { timeout: 120 });
+
+      const db = openDatabase(getDbPath(projectDir));
+      try {
+        requireReady(db, workflowId);
+        // Across both runs: zero plan-phase invocations, and no fake CLI was ever called
+        // beyond the implement→review loop.
+        expect(phaseCounts(db, workflowId)).toEqual({
+          IMPLEMENTATION: 2,
+          CODE_REVIEW: 1,
+          VERIFICATION: 1,
+          FINAL_AUDIT: 1,
+        });
+        expect(scenarioCallCount(projectDir, 'claude')).toBe(2);
+        expect(scenarioCallCount(projectDir, 'codex')).toBe(3);
+        const batchId = `${workflowId}:batch:1`;
+        const eventTypes = (
+          db
+            .prepare(
+              'SELECT event_type FROM review_workflow_events WHERE batch_id = ? ORDER BY event_id',
+            )
+            .all(batchId) as { event_type: string }[]
+        ).map((event) => event.event_type);
+        expect(eventTypes.filter((type) => type === 'PLAN_ACCEPTED_AS_IS')).toHaveLength(1);
+        expect(eventTypes).not.toContain('PLAN_REVIEW_STARTED');
+        // The resumed worker never entered a plan-review phase.
+        const log = new reviewWorkflowRunner.ReviewWorkflowRunnerStore(db).listLog(workflowId, {
+          limit: 10_000,
+        });
+        expect(log.some((entry) => (entry.phase ?? '').startsWith('PLAN_REVIEW'))).toBe(false);
+        expect(readFileSync(join(projectDir, 'sample.txt'), 'utf8')).toBe('content\n');
       } finally {
         db.close();
       }

@@ -116,6 +116,10 @@ export function hashReviewWorkflowConfiguration(config: ProjectConfig): string {
   const {
     autonomous: _operationalLimits,
     operatorMode: _operatorMode,
+    // planAsIs is excluded for the same reason: it says nothing about which model holds
+    // which role, and it is frozen separately (runner state) with its own guard on resume.
+    // Including it would shift the hash of every existing workflow the day it shipped.
+    planAsIs: _planAsIs,
     ...assignmentPolicy
   } = config.reviewGated ?? {};
   return createHash('sha256')
@@ -176,6 +180,7 @@ export function createReviewWorkflowConfigurationSnapshot(
       codeReviewRequired: policy.gates.codeReview === 'required',
       verificationRequired: policy.gates.verification === 'required',
       humanMergeRequired: policy.gates.humanMerge === 'required',
+      planAsIs: policy.planAsIs === true,
       blockingSeverities: policy.gates.blockingSeverities.map(
         (severity) => CONFIG_SEVERITY_TO_DOMAIN[severity],
       ),

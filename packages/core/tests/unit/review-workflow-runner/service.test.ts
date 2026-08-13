@@ -223,6 +223,45 @@ describe('AutonomousWorkflowRunner', () => {
     ]);
   });
 
+  it('plan-as-is: opens every batch with the acceptance, never a plan-review round', async () => {
+    const phases = happyPhases(batches, {
+      resumeStage: async (batch) => {
+        // The CLI's mode-aware mapping: DRAFT re-enters at IMPLEMENTATION in this mode.
+        void batch;
+        return 'IMPLEMENTATION';
+      },
+    });
+    const accepted: number[] = [];
+    phases.acceptPlanAsIs = async (batch) => {
+      accepted.push(batch.ordinal);
+      phases.calls.push(`accept-as-is:${batch.ordinal}`);
+    };
+    const result = await makeRunner(phases, {}, { planAsIs: true }).run(WORKFLOW_ID);
+    expect(result.status).toBe('READY_FOR_HUMAN_VERIFICATION');
+    expect(accepted).toEqual([1, 2]);
+    // ZERO plan-review or plan-revision activity — the stage is skipped, not short-circuited.
+    expect(phases.calls.some((call) => call.startsWith('plan-review'))).toBe(false);
+    expect(phases.calls.some((call) => call.startsWith('plan-revision'))).toBe(false);
+    // The acceptance opens the batch: it precedes that batch's implementation.
+    expect(phases.calls.indexOf('accept-as-is:1')).toBeLessThan(
+      phases.calls.indexOf('implement:1'),
+    );
+    expect(phases.calls.indexOf('accept-as-is:2')).toBeLessThan(
+      phases.calls.indexOf('implement:2'),
+    );
+  });
+
+  it('plan-as-is without an acceptPlanAsIs phase stops instead of reverting to plan review', async () => {
+    // happyPhases deliberately carries no acceptPlanAsIs — the refined-mode surface.
+    const phases = happyPhases(batches);
+    const result = await makeRunner(phases, {}, { planAsIs: true }).run(WORKFLOW_ID);
+    expect(result.status).toBe('HUMAN_DECISION_REQUIRED');
+    expect(result.stopDetails).toContain('acceptPlanAsIs');
+    // It stopped BEFORE any review or implementation could run.
+    expect(phases.calls.some((call) => call.startsWith('plan-review'))).toBe(false);
+    expect(phases.calls.some((call) => call.startsWith('implement'))).toBe(false);
+  });
+
   it('freezes the batch count at refinement and stops on unapproved expansion', async () => {
     await makeRunner(happyPhases(batches)).run(WORKFLOW_ID);
     // A second run must not accept a changed batch count.

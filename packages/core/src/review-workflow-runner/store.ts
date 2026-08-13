@@ -75,6 +75,8 @@ const stateRowSchema = z.object({
   active_invocation_json: z.string().nullable(),
   paused_repo_json: z.string().nullable(),
   counters_json: z.string().min(1),
+  // Written once at init and never updated — the mode is frozen exactly like the limits.
+  plan_as_is: z.number().int().nullable().default(0),
   started_at: z.string().min(1),
   updated_at: z.string().min(1),
 });
@@ -163,6 +165,7 @@ export class ReviewWorkflowRunnerStore {
     readonly baseBranch: string;
     readonly baseSha: string;
     readonly limits?: RunnerConfig;
+    readonly planAsIs?: boolean;
   }): RunnerState {
     const now = this.timestamp();
     const counters: RunnerCounters = {
@@ -175,8 +178,8 @@ export class ReviewWorkflowRunnerStore {
       .prepare(
         `INSERT INTO review_workflow_runner_state (
           workflow_id, status, branch, base_branch, base_sha, total_batches,
-          notified, limits_json, counters_json, started_at, updated_at
-        ) VALUES (?, 'RUNNING', ?, ?, ?, 0, 0, ?, ?, ?, ?)`,
+          notified, limits_json, counters_json, plan_as_is, started_at, updated_at
+        ) VALUES (?, 'RUNNING', ?, ?, ?, 0, 0, ?, ?, ?, ?, ?)`,
       )
       .run(
         input.workflowId,
@@ -185,6 +188,7 @@ export class ReviewWorkflowRunnerStore {
         input.baseSha,
         input.limits === undefined ? null : JSON.stringify(input.limits),
         JSON.stringify(counters),
+        input.planAsIs === true ? 1 : 0,
         now,
         now,
       );
@@ -217,6 +221,7 @@ export class ReviewWorkflowRunnerStore {
       ...(parsed.limits_json === null
         ? {}
         : { limits: limitsSchema.parse(JSON.parse(parsed.limits_json)) }),
+      ...(parsed.plan_as_is === 1 ? { planAsIs: true } : {}),
       ...(parsed.active_invocation_json === null
         ? {}
         : {

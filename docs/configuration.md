@@ -166,6 +166,41 @@ Legacy multi-model debate (not used by review-gated workflows — set `enabled: 
 `[critical, high]`) — add `medium` to make medium findings block reviews and the merge gate.
 `requireAllFindingResponses` (default true), `requireAcceptedAttestations` (default true).
 
+### `planAsIs` — use the supplied plan verbatim
+
+`reviewGated.planAsIs: true` (or `codemoot workflow run --plan-as-is`) runs the workflow
+with the plan **exactly as written**: no LLM refinement rewrites it into batch plans, and no
+plan-review gate runs. Built for plans that were already authored and reviewed outside the
+workflow, where a rewrite re-plans redundantly and can degrade precision.
+
+- **Batches** come from the plan's own `## Batch N` headings (order of appearance; any
+  heading level). Everything before the first batch heading belongs to batch 1. A plan with
+  no batch headings is one batch.
+- **Approval is honest**: each batch moves `DRAFT → APPROVED_FOR_IMPLEMENTATION` through an
+  explicit `ACCEPT_PLAN_AS_IS` transition on the operator's own authority
+  (HUMAN/SYSTEM + WORKFLOW_OWNER, recorded in the immutable audit) — never a fabricated
+  reviewer approval, and agents can never fire it.
+- **Everything from implementation on is unchanged**: code review ↔ correction,
+  verification, final audit, merge gate, gated push.
+- **Verification runs the plan's OWN commands.** Put them in fenced ` ```sh ` / ` ```bash `
+  blocks under any heading containing "Verification" — one command per line, run exactly as
+  written via `sh -c` (so `composer check`, pipes, and env prefixes behave like your
+  shell). A verification section inside a batch's span belongs to that batch; one before
+  the first batch heading is plan-wide and runs for **every** batch. Comment lines, blanks,
+  and a leading `$ ` are dropped. Only when a batch declares **nothing** does it fall back
+  to a minimal `git status --porcelain` (the merge gate requires ≥1 accepted verification
+  record) — and that fallback is a logged **WARNING** naming the batch, because it proves
+  nothing about correctness.
+- **The mode must engage or fail.** If plan-as-is is requested but cannot be recorded in
+  both the configuration snapshot and the frozen runner state (for example, a stale
+  `@codemoot/core` build whose schema predates the field), `workflow run` refuses with an
+  explicit error instead of silently falling back to the refined rewrite.
+- **The mode is frozen at workflow start** (runner state), like the autonomous limits: a
+  config edit or dropped flag never flips a running workflow. `run-resume --plan-as-is` on
+  a workflow that started refined fails instead of switching.
+
+The default (`planAsIs: false`) is the refined behavior, unchanged.
+
 ### `pacing` — the immutable per-workflow review contract
 
 Frozen into each workflow's configuration snapshot at start; the coordinators enforce it.

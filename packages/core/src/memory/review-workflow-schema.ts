@@ -30,6 +30,7 @@ export const REVIEW_WORKFLOW_RUNNER_STATE_DDL = `CREATE TABLE IF NOT EXISTS revi
     active_invocation_json TEXT,
     paused_repo_json   TEXT,
     counters_json      TEXT NOT NULL,
+    plan_as_is         INTEGER NOT NULL DEFAULT 0,
     started_at         TEXT NOT NULL,
     updated_at         TEXT NOT NULL
   )`;

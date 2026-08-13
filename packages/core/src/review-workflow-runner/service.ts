@@ -470,7 +470,15 @@ export class AutonomousWorkflowRunner {
       );
     }
     const startIndex = BATCH_STAGE_ORDER.indexOf(stage);
-    if (startIndex <= BATCH_STAGE_ORDER.indexOf('PLAN_REVIEW')) {
+    if (this.options.planAsIs === true) {
+      // Plan-as-is: no plan-review stage at all. The batch is opened by the explicit
+      // operator-authority acceptance instead — fired before IMPLEMENTATION so a resume
+      // whose stage maps DRAFT → IMPLEMENTATION still passes through it (the phase is
+      // idempotent; a batch already approved or beyond is untouched).
+      if (startIndex <= BATCH_STAGE_ORDER.indexOf('IMPLEMENTATION')) {
+        await this.planAsIsAcceptanceStage(workflowId, batch, workflowStartedAt, heartbeat);
+      }
+    } else if (startIndex <= BATCH_STAGE_ORDER.indexOf('PLAN_REVIEW')) {
       await this.planReviewStage(workflowId, batch, workflowStartedAt, heartbeat);
     }
     if (startIndex <= BATCH_STAGE_ORDER.indexOf('IMPLEMENTATION')) {
@@ -562,6 +570,33 @@ export class AutonomousWorkflowRunner {
       );
       this.recordProgress(workflowId, true);
     }
+  }
+
+  /** Plan-as-is: the batch opens with the operator's acceptance, never a review round. */
+  private async planAsIsAcceptanceStage(
+    workflowId: string,
+    batch: RunnerBatchDescriptor,
+    workflowStartedAt: number,
+    heartbeat: HeartbeatContext,
+  ): Promise<void> {
+    const accept = this.phases.acceptPlanAsIs;
+    if (accept === undefined) {
+      throw new RunnerStop(
+        'HUMAN_DECISION_REQUIRED',
+        'Plan-as-is mode is on but this phase surface has no acceptPlanAsIs implementation',
+      );
+    }
+    this.assertBatchBudgets(workflowId, batch, workflowStartedAt);
+    await this.withPhase(workflowId, batch, 'PLAN_AS_IS_ACCEPTANCE', heartbeat, () =>
+      accept.call(this.phases, batch),
+    );
+    this.checkpoint(
+      workflowId,
+      batch.batchId,
+      'PLAN_AS_IS_ACCEPTANCE',
+      `Batch ${batch.ordinal} plan accepted as supplied (plan-as-is)`,
+    );
+    this.recordProgress(workflowId, true);
   }
 
   private async implementationStage(

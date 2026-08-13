@@ -57,6 +57,14 @@ const COMMAND_ACTOR_RULES: Record<TransitionCommand['type'], ActorRule> = {
     actorTypes: ['AGENT'],
     authorities: ['REVIEWER'],
   },
+  // Plan-as-is acceptance is an OPERATOR act, never an agent's: the human who supplied the
+  // plan (or the system process acting on their explicit flag) vouches for it. An AGENT
+  // accepting a plan without review would be the manufactured-approval failure this
+  // command exists to avoid.
+  ACCEPT_PLAN_AS_IS: {
+    actorTypes: ['HUMAN', 'SYSTEM'],
+    authorities: ['WORKFLOW_OWNER'],
+  },
   SUBMIT_REVISED_PLAN: {
     actorTypes: ['AGENT', 'HUMAN'],
     authorities: ['PLAN_REFINER'],
@@ -276,6 +284,23 @@ export function transitionBatch(input: TransitionInput): TransitionResult {
         );
       }
       return allow(currentState, command, 'PLAN_NEEDS_REVISION');
+    }
+
+    case 'ACCEPT_PLAN_AS_IS': {
+      // Same stale-version guard as APPROVE_PLAN: the acceptance binds to the exact
+      // immutable plan version and hash it was issued against.
+      if (
+        command.evidence.acceptedPlanVersionId !== command.evidence.currentPlanVersionId ||
+        command.evidence.acceptedPlanContentHash !== command.evidence.currentPlanContentHash
+      ) {
+        return reject(
+          currentState,
+          command,
+          'PLAN_VERSION_STALE',
+          'Plan-as-is acceptance must target the current immutable plan version and hash',
+        );
+      }
+      return allow(currentState, command, 'APPROVED_FOR_IMPLEMENTATION');
     }
 
     case 'SUBMIT_REVISED_PLAN':
@@ -541,6 +566,9 @@ function expectedSourceStates(command: TransitionCommand): readonly (BatchState 
     case 'APPROVE_PLAN':
     case 'REJECT_PLAN':
       return ['PLAN_REVIEW'];
+    case 'ACCEPT_PLAN_AS_IS':
+      // Straight from DRAFT: the whole point is that no plan-review state is ever entered.
+      return ['DRAFT'];
     case 'SUBMIT_REVISED_PLAN':
       return ['PLAN_NEEDS_REVISION'];
     case 'START_IMPLEMENTATION':
