@@ -98,6 +98,14 @@ export function deriveFinalAuditRoundId(batchId: string): string {
  * final audit a durable identity distinct from code review (whose claimed identity must be
  * its invocation, for transition-actor binding) even when command IDs collide.
  */
+/**
+ * The STABLE PREFIX of a final-audit side-effect identity. The claimed identity appends a
+ * per-attempt suffix: `releaseFailedFinalReservation` archives a failed command WITH its
+ * bound identity as evidence, and the globally-unique side-effect index (correctly) rejects
+ * any retry re-deriving the same value — a command-stable identity therefore collides with
+ * its own archive on the first fix_again (observed live on the code-review path; this site
+ * has the identical shape).
+ */
 export function deriveFinalAuditSideEffectIdentity(commandId: string): string {
   return `${commandId}:final-audit-invocation`;
 }
@@ -126,10 +134,11 @@ export class ReviewWorkflowGateService {
       workflowId: input.workflowId,
       batchId: input.batchId,
       commandType: 'START_CODE_REVIEW',
-      sideEffect: {
-        kind: 'AGENT_INVOCATION',
-        identity: deriveFinalAuditSideEffectIdentity(input.commandId),
-      },
+      // The identity is per-attempt now (see deriveFinalAuditSideEffectIdentity), so the
+      // replay match cannot demand an exact value it can no longer re-derive. The receipt
+      // itself — same command id, type, workflow, batch, SUCCEEDED, AGENT_INVOCATION side
+      // effect — still identifies the completed operation.
+      sideEffect: { kind: 'AGENT_INVOCATION' },
     });
     if (replayed !== null) return this.replayFinalAudit(input.batchId);
     this.requireState(context.batch, 'VERIFYING');
@@ -236,7 +245,7 @@ export class ReviewWorkflowGateService {
     this.commandStore.reserve(request, 'AGENT_INVOCATION');
     this.commandStore.claimSideEffect(
       input.commandId,
-      deriveFinalAuditSideEffectIdentity(input.commandId),
+      `${deriveFinalAuditSideEffectIdentity(input.commandId)}:${generateId('attempt')}`,
     );
     let prepared: PreparedRoleInvocation;
     try {

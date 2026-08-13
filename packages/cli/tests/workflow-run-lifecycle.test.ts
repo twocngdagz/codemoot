@@ -1349,6 +1349,76 @@ describe('codemoot workflow run lifecycle (real command, scenario-driven adapter
   );
 
   it(
+    'code-review retry: a rejected review artifact is fix_again-able — no side-effect identity collision',
+    { timeout: 180_000 },
+    async () => {
+      // THE REAL CASE: batch 1 reached CODE_REVIEW; the review artifact was rejected for an
+      // environmental reason; fix_again + run-resume then died on
+      // "UNIQUE constraint failed: review_workflow_command_side_effects.side_effect_identity"
+      // — the released command's ARCHIVE keeps its bound side-effect identity as evidence,
+      // and the retry re-derived the same command-stable identity. Identities are now
+      // per-attempt; the retry must re-run the review and the batch must proceed.
+      const { projectDir } = createProject(buildConfig({ planAsIs: true }));
+      const workflowId = 'workflow-review-retry';
+      writeFileSync(join(projectDir, 'plan.md'), AS_IS_PLAN_CONTENT);
+      git(projectDir, ['add', 'plan.md']);
+      git(projectDir, ['commit', '-q', '-m', 'as-is plan']);
+      writeSteps(projectDir, 'claude', [PREFLIGHT_READY_STEP, IMPLEMENTATION_STEP]);
+      // Round 1's reviewer reply is NOT a REVIEW_RESULT contract → artifact REJECTED.
+      writeSteps(projectDir, 'codex', [
+        { response: 'This is prose, not the required REVIEW_RESULT contract.' },
+      ]);
+
+      await reviewWorkflowRunCommand({ plan: 'plan.md', timeout: 120, id: workflowId });
+
+      const stopped = openDatabase(getDbPath(projectDir));
+      try {
+        const state = new reviewWorkflowRunner.ReviewWorkflowRunnerStore(stopped).require(
+          workflowId,
+        );
+        expect(state.status).toBe('HUMAN_DECISION_REQUIRED');
+        expect(state.stopDetails).toContain('Code review artifact rejected');
+      } finally {
+        stopped.close();
+      }
+
+      // The recovery the operator is offered — and the exact step that used to die.
+      writeSteps(projectDir, 'codex', [
+        { response: 'unused round-1 slot (already consumed)' },
+        CODE_REVIEW_APPROVED_STEP,
+        VERIFICATION_ACCEPT_STEP,
+        planAsIsFinalAuditStep(workflowId),
+      ]);
+      await reviewWorkflowDecideCommand(workflowId, {
+        action: 'fix_again',
+        rationale: 'The rejection was environmental; re-run the code review.',
+      });
+      await reviewWorkflowRunResumeCommand(workflowId, { timeout: 120 });
+
+      const done = openDatabase(getDbPath(projectDir));
+      try {
+        requireReady(done, workflowId);
+        // AC2: both attempts' side-effect records persist — the archived one under its
+        // superseded command id, the retry under the live command id — with DISTINCT
+        // per-attempt identities sharing the code-review prefix.
+        const rows = done
+          .prepare(
+            `SELECT command_id, side_effect_identity FROM review_workflow_command_side_effects
+             WHERE side_effect_identity LIKE '%:code-review-invocation%'
+             ORDER BY command_id`,
+          )
+          .all() as { command_id: string; side_effect_identity: string }[];
+        expect(rows).toHaveLength(2);
+        expect(new Set(rows.map((row) => row.side_effect_identity)).size).toBe(2);
+        expect(rows.filter((row) => row.command_id.includes(':superseded:'))).toHaveLength(1);
+        expect(rows.filter((row) => !row.command_id.includes(':superseded:'))).toHaveLength(1);
+      } finally {
+        done.close();
+      }
+    },
+  );
+
+  it(
     'plan-as-is: an interrupted workflow resumes without plan review, and the acceptance never repeats',
     { timeout: 120_000 },
     async () => {
