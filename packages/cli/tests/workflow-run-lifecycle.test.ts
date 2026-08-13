@@ -26,6 +26,7 @@ import { fileURLToPath } from 'node:url';
 import {
   openDatabase,
   reviewWorkflowGate,
+  reviewWorkflowImplementation,
   reviewWorkflowPlan,
   reviewWorkflowRunner,
 } from '@codemoot/core';
@@ -1281,14 +1282,17 @@ describe('codemoot workflow run lifecycle (real command, scenario-driven adapter
         stopped.close();
       }
 
-      // AC5: the offered recovery actually works. The retry commits a reconciliation
-      // commit (the implementer finds its work already present) and crosses a refresh
-      // boundary: two result messages, same session, last one carries the contract.
+      // The offered recovery actually works — and the retry WRITES NOTHING. The work is
+      // already committed by attempt 1, so the honest handoff is a COMPLETE claim standing
+      // on that commit; evidence is judged against the batch's base, not this attempt's
+      // delta. (An earlier version of this test smuggled in an --allow-empty commit to get
+      // past the attempt-scoped check — that workaround was this defect.) The retry also
+      // crosses a refresh boundary: two result messages, same session, last one wins.
       writeFileSync(
         join(projectDir, '.cowork', 'scenario', 'claude-3.json'),
         JSON.stringify({
           ...IMPLEMENTATION_STEP,
-          shell: 'git commit -q --allow-empty -m impl-reconcile',
+          shell: undefined,
           doubleResult: true,
         }),
       );
@@ -1312,7 +1316,7 @@ describe('codemoot workflow run lifecycle (real command, scenario-driven adapter
           .all() as { actor_execution_id: string }[];
         expect(requesters.length).toBe(2);
         expect(new Set(requesters.map((row) => row.actor_execution_id)).size).toBe(2);
-        // AC1 live: the retry's stream held TWO results; the LAST one won — the forwarded
+        // The retry's stream held TWO results; the LAST one won — the forwarded
         // implementation summary parsed as a contract, which the superseded garbage first
         // result could never have done. The persisted raw stream shows both.
         const successRow = new reviewWorkflowPlan.ReviewWorkflowPlanStore(done).workflowStore
@@ -1323,6 +1327,21 @@ describe('codemoot workflow run lifecycle (real command, scenario-driven adapter
               (row.rawStdout ?? '').includes('SUPERSEDED-EARLY-RESULT'),
           );
         expect(successRow).toBeDefined();
+        // The write-nothing retry's evidence CREDITS attempt 1's commit: the recorded
+        // range runs from the batch base to the HEAD attempt 1 left behind, and the batch
+        // HEAD never moved during the retry (no reconciliation commit was needed).
+        const implementationStore = new reviewWorkflowImplementation.ReviewWorkflowImplementationStore(
+          done,
+        );
+        const evidence = implementationStore.getImplementationReadyEvidence(
+          `${workflowId}:batch:1:implementation:1:ready`,
+        );
+        // With no reconciliation commit, attempt 1's commit IS the final HEAD, and the
+        // range starts at the batch base (the commit before it).
+        expect(evidence?.creditedCommitRange).toEqual({
+          fromSha: git(projectDir, ['rev-parse', 'HEAD~1']),
+          toSha: git(projectDir, ['rev-parse', 'HEAD']),
+        });
       } finally {
         done.close();
       }
