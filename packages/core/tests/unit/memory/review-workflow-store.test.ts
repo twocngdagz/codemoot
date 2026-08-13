@@ -551,6 +551,46 @@ describe('ReviewWorkflowStore', () => {
     expect(store.getEntity('REFINED_PLAN_VERSION', batchPlan.batchPlanVersionId)).toBeNull();
   });
 
+  it('actor executions: per-attempt IDs coexist; a genuine same-ID conflict still throws', () => {
+    // The retry wall, pinned at the store layer: a retried command is a NEW execution and
+    // persists under its own attempt-suffixed ID beside the original — while re-saving the
+    // SAME ID with different content (a genuine conflict) stays exactly as fatal as before.
+    const attempt = (suffix: string, startedAt: string) => ({
+      actorExecutionId: `workflow-1:batch:1:implementation:1:ready:requester:${suffix}`,
+      actorType: 'AGENT' as const,
+      authoritiesExercised: ['IMPLEMENTER' as const],
+      identityAssurance: 'CONFIG_ONLY' as const,
+      observedEvidence: [],
+      startedAt,
+    });
+    const first = attempt('attempt_one', NOW);
+    const retry = attempt('attempt_two', '2026-07-29T11:00:00.000Z');
+    expect(store.saveEntity({ kind: 'ACTOR_EXECUTION', value: first })).toEqual({
+      inserted: true,
+    });
+    expect(store.saveEntity({ kind: 'ACTOR_EXECUTION', value: retry })).toEqual({
+      inserted: true,
+    });
+    // Both attempts persist side by side — the audit shows the retry honestly.
+    expect(store.getEntity('ACTOR_EXECUTION', first.actorExecutionId)).not.toBeNull();
+    expect(store.getEntity('ACTOR_EXECUTION', retry.actorExecutionId)).not.toBeNull();
+    // Identical re-save is an idempotent no-op; changed content under the SAME id throws.
+    expect(store.saveEntity({ kind: 'ACTOR_EXECUTION', value: first })).toEqual({
+      inserted: false,
+    });
+    try {
+      store.saveEntity({
+        kind: 'ACTOR_EXECUTION',
+        value: { ...first, startedAt: '2026-07-29T12:00:00.000Z' },
+      });
+      throw new Error('Expected immutable entity conflict');
+    } catch (error) {
+      expect(error).toBeInstanceOf(ReviewWorkflowPersistenceError);
+      if (!(error instanceof ReviewWorkflowPersistenceError)) throw error;
+      expect(error.code).toBe('IMMUTABLE_ENTITY_CONFLICT');
+    }
+  });
+
   it('rejects conflicting immutable entity content and direct evidence mutation', () => {
     const plan = {
       generalPlanVersionId: WORKFLOW.generalPlanVersionId,

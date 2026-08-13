@@ -2,6 +2,7 @@
 
 import { createHash } from 'node:crypto';
 import type { ReviewWorkflowCommandStore } from '../memory/review-workflow-command-store.js';
+import { generateId } from '../utils/id.js';
 import type {
   DispositionCaptureValue,
   HandoffCaptureContext,
@@ -760,7 +761,7 @@ export class ReviewWorkflowCodeReviewService {
     boundReviewerSessionIdentityId: string | undefined,
   ): ActorExecutionIdentity {
     return {
-      actorExecutionId: `${input.commandId}:requester`,
+      actorExecutionId: `${input.commandId}:requester:${generateId('attempt')}`,
       actorType: 'AGENT',
       assignmentId: input.configuration.assignments.reviewer.assignmentId,
       invocationIdentityId: input.invocationId,

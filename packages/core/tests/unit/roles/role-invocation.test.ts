@@ -6,6 +6,7 @@ import { ReviewWorkflowCommandStore } from '../../../src/memory/review-workflow-
 import { ReviewWorkflowStore } from '../../../src/memory/review-workflow-store.js';
 import type { BridgeCallResult } from '../../../src/models/bridge.js';
 import { ModelRegistry } from '../../../src/models/registry.js';
+import { ModelError } from '../../../src/utils/errors.js';
 import {
   createReviewWorkflowConfigurationSnapshot,
   hashReviewWorkflowConfiguration,
@@ -474,6 +475,65 @@ describe('review-workflow role invocation', () => {
       }),
     ).rejects.toBeInstanceOf(RoleInvocationError);
     expect(store.getEntity('INVOCATION_IDENTITY', 'invocation-reviewer')).toBeNull();
+  });
+
+  it('persists the CLI output when a BOUND resume fails — a transcript is never discarded', async () => {
+    // The live failure: a ~60-minute implementer call was rejected by the protocol parser
+    // AFTER the CLI ran to completion; the resume path wrapped the adapter's error and the
+    // failure audit wrote NULL, discarding the whole transcript exactly when it was the
+    // only diagnostic. The wrapper must carry the evidence and the audit must persist it.
+    const { roles } = setup();
+    reserve('command-evidence-first');
+    reserve('command-evidence-retry');
+    vi.spyOn(roles.implementer.adapter, 'send').mockResolvedValue(
+      bridgeResult(roles.implementer, 'bound-vendor-session', 1001),
+    );
+    const service = new RoleInvocationService(store);
+    const first = await service.prepare({
+      resolution: roles.implementer,
+      workflowId: 'workflow-6',
+      commandId: 'command-evidence-first',
+      actorExecutionId: 'execution-evidence-first',
+      invocationId: 'invocation-evidence-first',
+      sessionIdentityId: 'session-evidence-first',
+      prompt: 'Implement the batch.',
+      sessionBinding: { batchId: 'batch-6', role: 'IMPLEMENTER' },
+      auditPhase: 'IMPLEMENTATION',
+    });
+    service.persistPrepared(first);
+
+    const protocolFailure = new ModelError(
+      'Invalid Claude CLI output: Claude CLI result session ID matches none of the announced init sessions',
+      'anthropic',
+      'claude-sonnet-4-6',
+    );
+    protocolFailure.partialOutput = {
+      stdout: '{"type":"system","subtype":"init"}\nSIXTY-MINUTE-TRANSCRIPT-EVIDENCE',
+      stderr: '',
+    };
+    vi.spyOn(roles.implementer.adapter, 'resume').mockRejectedValue(protocolFailure);
+
+    await expect(
+      service.prepare({
+        resolution: roles.implementer,
+        workflowId: 'workflow-6',
+        commandId: 'command-evidence-retry',
+        actorExecutionId: 'execution-evidence-retry',
+        invocationId: 'invocation-evidence-retry',
+        sessionIdentityId: 'session-evidence-unused',
+        prompt: 'Continue the batch.',
+        sessionBinding: { batchId: 'batch-6', role: 'IMPLEMENTER', expectExisting: true },
+        auditPhase: 'IMPLEMENTATION',
+      }),
+    ).rejects.toMatchObject({ code: 'SESSION_RESUME_FAILED' });
+
+    const failureRow = store
+      .listInvocationAudit('workflow-6')
+      .find((row) => row.resultStatus === 'FAILED');
+    expect(failureRow).toBeDefined();
+    // The evidence survived the wrapper: raw stdout persisted, parse error recorded.
+    expect(failureRow?.rawStdout).toContain('SIXTY-MINUTE-TRANSCRIPT-EVIDENCE');
+    expect(failureRow?.failure?.message).toContain('matches none of the announced');
   });
 
   it('resumes only the role-owned session and stores the new invocation link', async () => {

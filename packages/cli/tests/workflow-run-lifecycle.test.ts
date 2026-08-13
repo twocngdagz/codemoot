@@ -1233,6 +1233,103 @@ describe('codemoot workflow run lifecycle (real command, scenario-driven adapter
   );
 
   it(
+    'long-implementation recovery: committed work + failed resume is diagnosable and fix_again-able to READY',
+    { timeout: 180_000 },
+    async () => {
+      // THE REAL CASE, reproduced end to end. Attempt 1: the implementer commits its work,
+      // then the CLI stream ends with a result from a session no init announced — the
+      // adapter rejects it AFTER the work is done, the bound resume fails, the run stops.
+      // The failure must persist the transcript (AC4). fix_again must not collide on the
+      // immutable requester record (AC5) — both attempts' requesters persist (AC6) — and
+      // the retry, resuming the SAME bound session, crosses a refresh boundary emitting
+      // TWO result messages (AC1 live) and runs to READY (AC8).
+      const { projectDir } = createProject(buildConfig({ planAsIs: true }));
+      const workflowId = 'workflow-long-impl-recovery';
+      writeFileSync(join(projectDir, 'plan.md'), AS_IS_PLAN_CONTENT);
+      git(projectDir, ['add', 'plan.md']);
+      git(projectDir, ['commit', '-q', '-m', 'as-is plan']);
+      writeSteps(projectDir, 'claude', [
+        PREFLIGHT_READY_STEP,
+        // The work is committed by the shell, THEN the stream is corrupt.
+        { ...IMPLEMENTATION_STEP, corruptResultSession: true },
+      ]);
+      writeSteps(projectDir, 'codex', [
+        CODE_REVIEW_APPROVED_STEP,
+        VERIFICATION_ACCEPT_STEP,
+        planAsIsFinalAuditStep(workflowId),
+      ]);
+
+      await reviewWorkflowRunCommand({ plan: 'plan.md', timeout: 120, id: workflowId });
+
+      const stopped = openDatabase(getDbPath(projectDir));
+      try {
+        const state = new reviewWorkflowRunner.ReviewWorkflowRunnerStore(stopped).require(
+          workflowId,
+        );
+        expect(state.status).toBe('HUMAN_DECISION_REQUIRED');
+        expect(state.stopReason).toBe('SESSION_CONTINUITY_FAILURE');
+        // The work IS committed — that is what makes discarding the evidence so costly.
+        expect(readFileSync(join(projectDir, 'sample.txt'), 'utf8')).toBe('content\n');
+        // AC4: the failed invocation persisted the stream it rejected, plus the parse error.
+        const failureRow = new reviewWorkflowPlan.ReviewWorkflowPlanStore(stopped).workflowStore
+          .listInvocationAudit(workflowId)
+          .find((row) => row.resultStatus === 'FAILED');
+        expect(failureRow).toBeDefined();
+        expect(failureRow?.rawStdout ?? '').toContain('corrupted-');
+        expect(failureRow?.failure?.message).toContain('matches none of the announced');
+      } finally {
+        stopped.close();
+      }
+
+      // AC5: the offered recovery actually works. The retry commits a reconciliation
+      // commit (the implementer finds its work already present) and crosses a refresh
+      // boundary: two result messages, same session, last one carries the contract.
+      writeFileSync(
+        join(projectDir, '.cowork', 'scenario', 'claude-3.json'),
+        JSON.stringify({
+          ...IMPLEMENTATION_STEP,
+          shell: 'git commit -q --allow-empty -m impl-reconcile',
+          doubleResult: true,
+        }),
+      );
+      await reviewWorkflowDecideCommand(workflowId, {
+        action: 'fix_again',
+        rationale: 'The implementation is committed; retry the interrupted invocation.',
+      });
+      await reviewWorkflowRunResumeCommand(workflowId, { timeout: 120 });
+
+      const done = openDatabase(getDbPath(projectDir));
+      try {
+        requireReady(done, workflowId);
+        // AC6: BOTH attempts' requester executions persist side by side — the audit shows
+        // the retry honestly, and nothing was overwritten to make it fit.
+        const requesters = done
+          .prepare(
+            `SELECT actor_execution_id FROM review_workflow_actor_executions
+             WHERE actor_execution_id LIKE '%:implementation:1:ready:requester%'
+             ORDER BY actor_execution_id`,
+          )
+          .all() as { actor_execution_id: string }[];
+        expect(requesters.length).toBe(2);
+        expect(new Set(requesters.map((row) => row.actor_execution_id)).size).toBe(2);
+        // AC1 live: the retry's stream held TWO results; the LAST one won — the forwarded
+        // implementation summary parsed as a contract, which the superseded garbage first
+        // result could never have done. The persisted raw stream shows both.
+        const successRow = new reviewWorkflowPlan.ReviewWorkflowPlanStore(done).workflowStore
+          .listInvocationAudit(workflowId)
+          .find(
+            (row) =>
+              row.resultStatus === 'SUCCEEDED' &&
+              (row.rawStdout ?? '').includes('SUPERSEDED-EARLY-RESULT'),
+          );
+        expect(successRow).toBeDefined();
+      } finally {
+        done.close();
+      }
+    },
+  );
+
+  it(
     'plan-as-is: an interrupted workflow resumes without plan review, and the acceptance never repeats',
     { timeout: 120_000 },
     async () => {

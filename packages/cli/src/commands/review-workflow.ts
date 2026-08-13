@@ -3161,7 +3161,7 @@ async function performAutonomousImplementation(
     const dispositionCommandId = `${stored.batchId}:dispositions:${correction.pass}:invoke`;
     const dispositionInvocationId = `${dispositionCommandId}:invocation`;
     const dispositionRequester: reviewWorkflow.ActorExecutionIdentity = {
-      actorExecutionId: `${dispositionCommandId}:requester`,
+      actorExecutionId: `${dispositionCommandId}:requester:${generateId('attempt')}`,
       actorType: 'AGENT',
       assignmentId: context.snapshot.assignments.implementer.assignmentId,
       invocationIdentityId: dispositionInvocationId,
@@ -3257,7 +3257,7 @@ async function performAutonomousVerification(
   const assessCommandId = `${commandId}:assess`;
   const invocationId = `${assessCommandId}:invocation`;
   const requester: reviewWorkflow.ActorExecutionIdentity = {
-    actorExecutionId: `${assessCommandId}:requester`,
+    actorExecutionId: `${assessCommandId}:requester:${generateId('attempt')}`,
     actorType: 'AGENT',
     assignmentId: context.snapshot.assignments.reviewer.assignmentId,
     invocationIdentityId: invocationId,

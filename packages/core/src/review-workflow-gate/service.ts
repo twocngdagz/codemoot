@@ -8,6 +8,7 @@ import type {
   StoredReviewWorkflowCommand,
 } from '../memory/review-workflow-command-store.js';
 import { parseFinalAuditResult } from '../review-workflow-contracts/parser.js';
+import { generateId } from '../utils/id.js';
 import type { ReviewWorkflowContractService } from '../review-workflow-contracts/service.js';
 import type { GitRepository, ReviewWorkflowGitService } from '../review-workflow-git/index.js';
 import {
@@ -215,7 +216,7 @@ export class ReviewWorkflowGateService {
       workflowId: input.workflowId,
       batch: context.batch,
       requester: {
-        actorExecutionId: `${input.commandId}:requester`,
+        actorExecutionId: `${input.commandId}:requester:${generateId('attempt')}`,
         actorType: 'AGENT',
         assignmentId: context.configuration.assignments.reviewer.assignmentId,
         invocationIdentityId: input.invocationId,
@@ -398,7 +399,7 @@ export class ReviewWorkflowGateService {
         workflowId: input.workflowId,
         batch: context.batch,
         requester: {
-          actorExecutionId: `${input.commandId}:requester`,
+          actorExecutionId: `${input.commandId}:requester:${generateId('attempt')}`,
           actorType: 'HUMAN',
           authoritiesExercised: ['VERIFICATION_EXECUTOR'],
           identityAssurance: 'CLI_ASSERTED',
