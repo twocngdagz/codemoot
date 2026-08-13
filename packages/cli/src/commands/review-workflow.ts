@@ -154,6 +154,10 @@ export async function reviewWorkflowStatusCommand(workflowId: string): Promise<v
         currentOrdinal: reconciled.currentOrdinal ?? null,
         totalBatches: reconciled.totalBatches,
         completedOrdinals: reconciled.counters.completedOrdinals,
+        // The frozen execution scope, always surfaced: a live run once printed nothing
+        // about an ENGAGED plan-as-is mode, which read as the mode being off.
+        planAsIs: reconciled.planAsIs === true,
+        maxBatches: reconciled.maxBatches ?? null,
         lastHeartbeatAt: reconciled.lastHeartbeatAt ?? null,
         workerId: reconciled.workerId ?? null,
         leaseExpiresAt: reconciled.leaseExpiresAt ?? null,
@@ -172,7 +176,11 @@ export async function reviewWorkflowStatusCommand(workflowId: string): Promise<v
               ? `codemoot workflow decide ${workflowId} --action <fix_again|accept_risk|cancel> --rationale "..."`
               : `codemoot workflow run-resume ${workflowId} --background   (a ${reconciled.counters.pendingDecision} decision is pending and unconsumed)`
             : reconciled.status === 'PAUSED_BY_USER' || reconciled.status === 'PAUSE_REQUESTED'
-              ? `codemoot workflow resume ${workflowId} --background`
+              ? reconciled.stopReason === 'BATCH_SCOPE_REACHED'
+                ? // A scope stop is not a manual pause: a bare resume fails closed, so the
+                  // next action must name the widening flag.
+                  `codemoot workflow resume ${workflowId} --max-batches <n greater than ${reconciled.maxBatches ?? reconciled.counters.completedOrdinals.length}> --background`
+                : `codemoot workflow resume ${workflowId} --background`
               : reconciled.status === 'RUNNING'
                 ? `codemoot workflow watch ${workflowId}`
                 : null,
@@ -3917,6 +3925,66 @@ interface WorkflowRunOptions {
   readonly id?: string;
   /** Use the supplied plan verbatim: no refinement rewrite, no plan-review gate. */
   readonly planAsIs?: boolean;
+  /** Stop cleanly after this many batches are fully complete. Omitted = every batch. */
+  readonly maxBatches?: number;
+}
+
+/**
+ * The batch-scope gate every resume path passes through, BEFORE any worker is claimed or
+ * spawned. Fail closed, never silently widen:
+ *
+ * - explicit `--max-batches M` rewrites the frozen scope (the one deliberate exception to
+ *   frozen-at-start) and records the operator act in the runner log;
+ * - a scope already reached with no widening flag throws, naming the exact flag to pass —
+ *   a dropped flag must re-stop, not quietly continue past the boundary the operator set;
+ * - an explicit scope at or below the completed count is an idempotent re-stop: the run
+ *   stays stopped, reported as success (it is exactly what was asked for).
+ *
+ * Returns false when the workflow must not continue (the re-stop was already reported).
+ */
+function applyBatchScopeOnResume(
+  runtime: ReviewWorkflowRuntime,
+  workflowId: string,
+  requested: number | undefined,
+): boolean {
+  const state = runtime.runnerStore.get(workflowId);
+  if (state === null) return true; // no runner state: let the normal resume error surface
+  const completed = state.counters.completedOrdinals.length;
+  if (requested !== undefined && requested !== state.maxBatches) {
+    runtime.runnerStore.setMaxBatches(workflowId, requested);
+    runtime.runnerStore.appendLog({
+      workflowId,
+      entryType: 'DECISION',
+      message: `Batch scope set to ${requested} by explicit operator resume (was ${state.maxBatches ?? 'unlimited'}; ${completed} of ${state.totalBatches} batches complete)`,
+    });
+  }
+  const scope = requested ?? state.maxBatches;
+  if (scope === undefined || completed < scope) return true;
+  if (requested === undefined) {
+    throw new Error(
+      `Workflow ${workflowId} is stopped at its batch scope: ${completed} of ${state.totalBatches} batches are fully complete and the frozen scope is ${scope}. ` +
+        `A bare resume never widens a deliberately scoped run — continue with: codemoot workflow resume ${workflowId} --max-batches <n greater than ${scope}>`,
+    );
+  }
+  const details = `${completed} of ${state.totalBatches} batches are fully complete (verified, gated, pushed) and the frozen batch scope is ${scope}.`;
+  // setMaxBatches cleared the previous scope's stop record; the run is still stopped at
+  // the (new) scope, so re-record the cause durably — but only on a settled run: a live
+  // worker owns its own stop record and will write it at its next batch boundary.
+  if (state.status === 'PAUSED_BY_USER') {
+    runtime.runnerStore.update(workflowId, {
+      stopReason: 'BATCH_SCOPE_REACHED',
+      stopDetails: details,
+    });
+  }
+  printJson({
+    status: 'BATCH_SCOPE_REACHED',
+    workflowId,
+    completedBatches: completed,
+    totalBatches: state.totalBatches,
+    maxBatches: scope,
+    resume: `codemoot workflow resume ${workflowId} --max-batches <n greater than ${scope}>`,
+  });
+  return false;
 }
 
 export async function reviewWorkflowRunCommand(options: WorkflowRunOptions): Promise<void> {
@@ -4021,6 +4089,7 @@ export async function reviewWorkflowRunCommand(options: WorkflowRunOptions): Pro
       baseSha,
       limits: autonomousLimits,
       planAsIs,
+      ...(options.maxBatches === undefined ? {} : { maxBatches: options.maxBatches }),
     });
     // ENGAGE OR FAIL — never silently fall back. If plan-as-is was requested, both the
     // configuration snapshot and the frozen runner state must actually carry it before a
@@ -4038,10 +4107,21 @@ export async function reviewWorkflowRunCommand(options: WorkflowRunOptions): Pro
         );
       }
     }
+    // Same engage-or-fail shape for the batch scope: a scope that cannot be read back from
+    // frozen state would be a scope the next resume silently forgets.
+    if (options.maxBatches !== undefined) {
+      const frozenScope = runtime.runnerStore.require(workflowId).maxBatches;
+      if (frozenScope !== options.maxBatches) {
+        throw new Error(
+          `--max-batches ${options.maxBatches} was requested but could not be frozen into runner state (read back: ${String(frozenScope)}). ` +
+            'The loaded @codemoot/core does not support the batch scope — rebuild the workspace (pnpm -r build) or update the dependency. Refusing to run: the scope would be lost on resume.',
+        );
+      }
+    }
     runtime.runnerStore.appendLog({
       workflowId,
       entryType: 'CHECKPOINT',
-      message: `Workflow started on branch ${branch} (base ${baseBranch}@${baseSha.slice(0, 8)})${planAsIs ? ' in PLAN-AS-IS mode: the supplied plan is used verbatim, with no refinement rewrite and no plan-review gate' : ''}`,
+      message: `Workflow started on branch ${branch} (base ${baseBranch}@${baseSha.slice(0, 8)})${planAsIs ? ' in PLAN-AS-IS mode: the supplied plan is used verbatim, with no refinement rewrite and no plan-review gate' : ''}${options.maxBatches === undefined ? '' : ` scoped to the first ${options.maxBatches} batch(es): the run stops cleanly once they are fully complete`}`,
     });
     if (options.background === true) {
       const entry = process.argv[1];
@@ -4075,6 +4155,7 @@ export async function reviewWorkflowRunCommand(options: WorkflowRunOptions): Pro
       baseSha,
       timeoutSeconds,
       ...(planAsIs ? { planAsIs: true } : {}),
+      ...(options.maxBatches === undefined ? {} : { maxBatches: options.maxBatches }),
     });
     await runResumeInProcess(runtime, projectDir, workflowId, timeoutSeconds);
   });
@@ -4179,7 +4260,15 @@ async function runResumeGuarded(
       workflowId,
       ...(result.stopReason === undefined ? {} : { stopReason: result.stopReason }),
       ...(result.stopDetails === undefined ? {} : { stopDetails: result.stopDetails }),
-      decide: `codemoot workflow decide ${workflowId} --action <fix_again|accept_risk|cancel> --rationale "..."`,
+      // A scope stop is the run doing exactly what was asked — the way onward is the
+      // widening resume, not a human decision on a failure.
+      ...(result.stopReason === 'BATCH_SCOPE_REACHED'
+        ? {
+            resume: `codemoot workflow resume ${workflowId} --max-batches <n greater than the current scope>`,
+          }
+        : {
+            decide: `codemoot workflow decide ${workflowId} --action <fix_again|accept_risk|cancel> --rationale "..."`,
+          }),
     });
   }
 }
@@ -4190,6 +4279,7 @@ export async function reviewWorkflowRunResumeCommand(
     readonly timeout?: number;
     readonly background?: boolean;
     readonly planAsIs?: boolean;
+    readonly maxBatches?: number;
   },
 ): Promise<void> {
   // The mode was frozen at workflow start; the resume flag is an assertion, not a switch.
@@ -4205,6 +4295,15 @@ export async function reviewWorkflowRunResumeCommand(
       }
     });
   }
+  // The batch-scope gate, before any worker exists: an explicit --max-batches rewrites the
+  // frozen scope (recorded), a reached scope with no flag fails closed, and a reached scope
+  // WITH the flag is an idempotent re-stop reported as success.
+  let scopeAllowsContinue = true;
+  await withDatabase(async (db) => {
+    const runtime = createRuntime(db, process.cwd());
+    scopeAllowsContinue = applyBatchScopeOnResume(runtime, workflowId, options.maxBatches);
+  });
+  if (!scopeAllowsContinue) return;
   if (options.background === true) {
     const entry = process.argv[1];
     if (entry === undefined) throw new Error('Cannot resolve the CLI entry point');
@@ -4289,8 +4388,20 @@ export async function reviewWorkflowPauseCommand(workflowId: string): Promise<vo
 
 export async function reviewWorkflowResumeCommand(
   workflowId: string,
-  options: { readonly timeout?: number; readonly background?: boolean },
+  options: {
+    readonly timeout?: number;
+    readonly background?: boolean;
+    readonly maxBatches?: number;
+  },
 ): Promise<void> {
+  // Batch-scope gate FIRST, before the pause settle and the resume claim: a fail-closed
+  // refusal must leave the workflow exactly as it was, not claimed-then-reverted.
+  let scopeAllowsContinue = true;
+  await withDatabase(async (db) => {
+    const runtime = createRuntime(db, process.cwd());
+    scopeAllowsContinue = applyBatchScopeOnResume(runtime, workflowId, options.maxBatches);
+  });
+  if (!scopeAllowsContinue) return;
   await withDatabase(async (db) => {
     const runtime = createRuntime(db, process.cwd());
     const state = runtime.runnerStore.get(workflowId);

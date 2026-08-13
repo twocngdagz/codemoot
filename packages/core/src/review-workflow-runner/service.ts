@@ -32,9 +32,19 @@ const defaultScheduler: RunnerScheduler = {
   clearInterval: (handle) => clearInterval(handle as ReturnType<typeof setInterval>),
 };
 
-/** Control-flow signal: a user pause was requested; settle gracefully after the current action. */
+/**
+ * Control-flow signal: a pause was requested; settle gracefully after the current action.
+ * A plain RunnerPause is the operator's manual pause. One carrying a `settlement` is the
+ * runner stopping ITSELF at a declared boundary (the batch scope) — same graceful settle,
+ * but recorded under its own named reason so an operator can tell the two apart.
+ */
 class RunnerPause extends Error {
-  constructor() {
+  constructor(
+    readonly settlement?: {
+      readonly reason: Extract<RunnerStopReason, 'BATCH_SCOPE_REACHED'>;
+      readonly details: string;
+    },
+  ) {
     super('PAUSE_REQUESTED');
     this.name = 'RunnerPause';
   }
@@ -259,6 +269,25 @@ export class AutonomousWorkflowRunner {
       for (const batch of batches) {
         state = this.store.require(workflowId);
         if (state.counters.completedOrdinals.includes(batch.ordinal)) continue;
+        // The batch scope, checked BEFORE a batch begins a single action. Both sides of
+        // the comparison are durable — the frozen scope from runner state (never argv) and
+        // the completed-ordinals count (never a loop index) — so a crashed-and-restarted
+        // worker computes exactly the same answer. Firing here, between batches, means a
+        // begun batch is never abandoned: batch N finishes verification, gate and push
+        // before the scope can stop anything. When the scope covers every remaining batch
+        // this check never fires and the loop falls through to complete() as always.
+        if (
+          state.maxBatches !== undefined &&
+          state.counters.completedOrdinals.length >= state.maxBatches
+        ) {
+          this.store.requestPause(workflowId);
+          throw new RunnerPause({
+            reason: 'BATCH_SCOPE_REACHED',
+            details:
+              `${state.counters.completedOrdinals.length} of ${state.totalBatches} batches are fully complete (verified, gated, pushed) and the frozen batch scope is ${state.maxBatches}. ` +
+              `Continue with: codemoot workflow resume ${workflowId} --max-batches <n greater than ${state.maxBatches}>`,
+          });
+        }
         this.assertWorkflowRuntime(workflowId, workflowStartedAt);
         state = this.beginBatch(workflowId, state, batch);
         await this.runBatch(workflowId, batch, workflowStartedAt, heartbeatContext);
@@ -269,7 +298,7 @@ export class AutonomousWorkflowRunner {
       return await this.complete(workflowId, heartbeatContext);
     } catch (error) {
       if (error instanceof RunnerPause) {
-        return this.settlePause(workflowId);
+        return this.settlePause(workflowId, error.settlement);
       }
       if (error instanceof RunnerStop) {
         return this.stop(workflowId, error.reason, error.details);
@@ -874,7 +903,13 @@ export class AutonomousWorkflowRunner {
    * Settles a graceful pause: the current atomic action already persisted its receipt,
    * response, and state; branch, worktree, sessions, jobs, events, and counters all stay.
    */
-  private settlePause(workflowId: string): RunnerRunResult {
+  private settlePause(
+    workflowId: string,
+    settlement?: {
+      readonly reason: Extract<RunnerStopReason, 'BATCH_SCOPE_REACHED'>;
+      readonly details: string;
+    },
+  ): RunnerRunResult {
     // Capture the exact repository shape being left behind; resume verifies it untouched.
     // The settle is CONDITIONAL (only PAUSE_REQUESTED settles) so it can never overwrite a
     // terminal transition that won a race.
@@ -886,13 +921,30 @@ export class AutonomousWorkflowRunner {
     if (!settled) {
       return { status: this.store.require(workflowId).status };
     }
-    this.checkpoint(
+    if (settlement === undefined) {
+      this.checkpoint(
+        workflowId,
+        null,
+        null,
+        'Workflow paused by user request; resume with codemoot workflow resume',
+      );
+      return { status: 'PAUSED_BY_USER' };
+    }
+    // A scope stop settles like a pause (same durable capture, same resume path) but is
+    // RECORDED under its own name — an operator must be able to tell "the run did exactly
+    // what I scoped it to" from "someone pressed pause" without reading code. The single
+    // notification is worded as the expected stop it is, and the conditional settle above
+    // guarantees it fires once.
+    this.store.update(workflowId, {
+      stopReason: settlement.reason,
+      stopDetails: settlement.details,
+    });
+    this.checkpoint(workflowId, null, null, `Batch scope reached: ${settlement.details}`);
+    this.notify(
       workflowId,
-      null,
-      null,
-      'Workflow paused by user request; resume with codemoot workflow resume',
+      `Workflow ${workflowId} stopped at its batch scope as requested — ${settlement.details}`,
     );
-    return { status: 'PAUSED_BY_USER' };
+    return { status: 'PAUSED_BY_USER', stopReason: settlement.reason, stopDetails: settlement.details };
   }
 
   /** Stops autonomous execution: persist reason + checkpoint summary, notify exactly once. */

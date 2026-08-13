@@ -36,6 +36,7 @@ import {
   reviewWorkflowResumeCommand,
   reviewWorkflowRunCommand,
   reviewWorkflowRunResumeCommand,
+  reviewWorkflowStatusCommand,
 } from '../src/commands/review-workflow.js';
 import { getDbPath } from '../src/utils.js';
 
@@ -392,6 +393,81 @@ function finalAuditApprovedStep(workflowId: string): Record<string, unknown> {
               kind: 'COMMAND',
               location: 'test -f sample.txt',
               description: 'The approved verification command evidence.',
+            },
+          ],
+        },
+      ],
+      scopeComplete: true,
+      documentationComplete: true,
+    },
+  };
+}
+
+// A two-batch plan-as-is plan whose plan-wide Verification section applies to BOTH batches
+// — the batch-scope e2e drives batch 1 to a scope stop, then widens into batch 2.
+const AS_IS_SCOPED_PLAN = `## Verification
+
+\`\`\`sh
+test -f sample.txt
+\`\`\`
+
+## Batch 1 — write the sample file
+
+Write the sample output file.
+
+## Batch 2 — record the receipt
+
+Write the receipt file.
+`;
+
+const B2_IMPLEMENTATION_STEP = {
+  response: {
+    schemaVersion: 1,
+    contractKind: 'IMPLEMENTATION_RESULT',
+    outcome: 'COMPLETE',
+    summary: 'Created receipt.txt and committed batch 2 as one atomic unit.',
+    changedFiles: ['receipt.txt'],
+    verificationRecordIds: [],
+  },
+  shell: "printf 'receipt\\n' > receipt.txt && git add receipt.txt && git commit -q -m impl-b2",
+};
+
+/**
+ * Final audit for ONE batch of a plan-as-is plan: requirement checks must cover EVERY plan
+ * requirement (the gate derives the expected set from the whole plan), criterion checks
+ * only the audited batch's own criterion.
+ */
+function planAsIsBatchFinalAuditStep(
+  workflowId: string,
+  ordinal: number,
+  planContent: string,
+): Record<string, unknown> {
+  return {
+    response: {
+      schemaVersion: 1,
+      contractKind: 'FINAL_AUDIT_RESULT',
+      target: '{{TARGET}}',
+      verdict: 'APPROVED',
+      summary: `Batch ${ordinal} of the operator-supplied plan is delivered as written.`,
+      findings: [],
+      requirementChecks: importedRequirementIds(workflowId, planContent).map((requirementId) => ({
+        subjectId: requirementId,
+        status: 'PASSED',
+        explanation: 'The delivered repository satisfies this plan section as written.',
+        evidence: [
+          { kind: 'FILE', location: 'sample.txt', description: 'The delivered output file.' },
+        ],
+      })),
+      acceptanceCriterionChecks: [
+        {
+          subjectId: `${workflowId}:batch:${ordinal}:criterion:1`,
+          status: 'PASSED',
+          explanation: "The plan's own verification command (test -f sample.txt) exits 0.",
+          evidence: [
+            {
+              kind: 'COMMAND',
+              location: 'sh -c "test -f sample.txt"',
+              description: 'The declared verification command evidence.',
             },
           ],
         },
@@ -999,6 +1075,159 @@ describe('codemoot workflow run lifecycle (real command, scenario-driven adapter
         expect(readFileSync(join(projectDir, 'sample.txt'), 'utf8')).toBe('content\n');
       } finally {
         db.close();
+      }
+    },
+  );
+
+  it(
+    'batch scope: --max-batches 1 stops after a fully-complete batch 1; only an explicit widen continues',
+    { timeout: 180_000 },
+    async () => {
+      // AC1/AC2/AC3/AC4/AC5/AC8 in one operator-shaped flow, with --plan-as-is engaged —
+      // the combination is the real use case: run the plan verbatim, inspect batch 1
+      // before paying for batch 2.
+      const { projectDir } = createProject(buildConfig({ planAsIs: true }));
+      const workflowId = 'workflow-batch-scope';
+      writeFileSync(join(projectDir, 'plan.md'), AS_IS_SCOPED_PLAN);
+      git(projectDir, ['add', 'plan.md']);
+      git(projectDir, ['commit', '-q', '-m', 'scoped plan']);
+      // Scenarios cover BATCH 1 ONLY: any batch-2 action would exhaust them and fail.
+      writeSteps(projectDir, 'claude', [PREFLIGHT_READY_STEP, IMPLEMENTATION_STEP]);
+      writeSteps(projectDir, 'codex', [
+        CODE_REVIEW_APPROVED_STEP,
+        VERIFICATION_ACCEPT_STEP,
+        planAsIsBatchFinalAuditStep(workflowId, 1, AS_IS_SCOPED_PLAN),
+      ]);
+
+      await reviewWorkflowRunCommand({
+        plan: 'plan.md',
+        timeout: 120,
+        id: workflowId,
+        maxBatches: 1,
+      });
+
+      const db = openDatabase(getDbPath(projectDir));
+      const batch2Id = `${workflowId}:batch:2`;
+      try {
+        const runnerStore = new reviewWorkflowRunner.ReviewWorkflowRunnerStore(db);
+        const state = runnerStore.require(workflowId);
+        // AC1+AC2: a resumable stop under its own named reason, after batch 1 fully
+        // completed — and batch 2 never started a single action.
+        expect(state.status).toBe('PAUSED_BY_USER');
+        expect(state.stopReason).toBe('BATCH_SCOPE_REACHED');
+        expect(state.maxBatches).toBe(1);
+        expect(state.planAsIs).toBe(true);
+        expect(state.counters.completedOrdinals).toEqual([1]);
+        expect(scenarioCallCount(projectDir, 'claude')).toBe(2);
+        expect(scenarioCallCount(projectDir, 'codex')).toBe(3);
+        // Batch 2 exists (materialized at refinement, like every batch) but has ACTED on
+        // nothing: its only event is its creation — no acceptance, no implementation.
+        const batch2Events = db
+          .prepare('SELECT event_type FROM review_workflow_events WHERE batch_id = ?')
+          .all(batch2Id) as { event_type: string }[];
+        expect(batch2Events.map((event) => event.event_type)).toEqual([
+          'BATCH_CREATED_FROM_REFINEMENT',
+        ]);
+        const batch2Audit = new reviewWorkflowPlan.ReviewWorkflowPlanStore(db).workflowStore
+          .listInvocationAudit(workflowId)
+          .filter((row) => row.invocationId.includes(':batch:2'));
+        expect(batch2Audit).toHaveLength(0);
+        // AC2: the stop is self-explanatory — checkpoint, notification, and status all
+        // name the scope and the way onward.
+        const log = runnerStore.listLog(workflowId, { limit: 10_000 });
+        expect(
+          log.some(
+            (entry) =>
+              entry.entryType === 'CHECKPOINT' &&
+              entry.message.startsWith('Batch scope reached:'),
+          ),
+        ).toBe(true);
+        const notificationEntries = log.filter((entry) => entry.entryType === 'NOTIFICATION');
+        expect(notificationEntries).toHaveLength(1);
+        expect(notificationEntries[0]?.message).toContain('stopped at its batch scope as requested');
+        // AC3: batch 1's commits are pushed; the branch is not merged anywhere.
+        const localHead = git(projectDir, ['rev-parse', 'HEAD']);
+        expect(
+          git(projectDir, ['ls-remote', 'origin', `refs/heads/${state.branch}`]).split('\t')[0],
+        ).toBe(localHead);
+        expect(readFileSync(join(projectDir, 'sample.txt'), 'utf8')).toBe('content\n');
+      } finally {
+        db.close();
+      }
+
+      // The status surface names the scope and the widening resume (AC2).
+      logSpy.mockClear();
+      await reviewWorkflowStatusCommand(workflowId);
+      const printedStatus = JSON.parse(String(logSpy.mock.calls.at(-1)?.[0])) as {
+        runner: { maxBatches: number | null; planAsIs: boolean; stopReason: string | null; nextAction: string | null };
+      };
+      expect(printedStatus.runner.maxBatches).toBe(1);
+      expect(printedStatus.runner.planAsIs).toBe(true);
+      expect(printedStatus.runner.stopReason).toBe('BATCH_SCOPE_REACHED');
+      expect(printedStatus.runner.nextAction).toContain('--max-batches');
+
+      // AC4: a bare resume fails closed, naming the flag — and changes nothing.
+      await expect(reviewWorkflowResumeCommand(workflowId, { timeout: 120 })).rejects.toThrow(
+        /--max-batches/,
+      );
+      const afterRefused = openDatabase(getDbPath(projectDir));
+      try {
+        const state = new reviewWorkflowRunner.ReviewWorkflowRunnerStore(afterRefused).require(
+          workflowId,
+        );
+        expect(state.status).toBe('PAUSED_BY_USER');
+        expect(state.counters.completedOrdinals).toEqual([1]);
+        expect(scenarioCallCount(projectDir, 'claude')).toBe(2);
+      } finally {
+        afterRefused.close();
+      }
+
+      // AC5 (+AC8 throughout): the explicit widen continues INTO batch 2 without redoing
+      // batch 1, and the whole two-batch run never held a plan-review phase.
+      writeSteps(projectDir, 'claude', [
+        PREFLIGHT_READY_STEP,
+        IMPLEMENTATION_STEP,
+        PREFLIGHT_READY_STEP,
+        B2_IMPLEMENTATION_STEP,
+      ]);
+      writeSteps(projectDir, 'codex', [
+        CODE_REVIEW_APPROVED_STEP,
+        VERIFICATION_ACCEPT_STEP,
+        planAsIsBatchFinalAuditStep(workflowId, 1, AS_IS_SCOPED_PLAN),
+        CODE_REVIEW_APPROVED_STEP,
+        VERIFICATION_ACCEPT_STEP,
+        planAsIsBatchFinalAuditStep(workflowId, 2, AS_IS_SCOPED_PLAN),
+      ]);
+      await reviewWorkflowResumeCommand(workflowId, { timeout: 120, maxBatches: 2 });
+
+      const done = openDatabase(getDbPath(projectDir));
+      try {
+        const state = requireReady(done, workflowId);
+        expect(state.counters.completedOrdinals).toEqual([1, 2]);
+        expect(state.maxBatches).toBe(2);
+        // Batch 1 was NOT redone: exactly one more implement/review/verify/audit cycle ran.
+        expect(scenarioCallCount(projectDir, 'claude')).toBe(4);
+        expect(scenarioCallCount(projectDir, 'codex')).toBe(6);
+        expect(phaseCounts(done, workflowId)).toEqual({
+          IMPLEMENTATION: 4, // preflight + execute, twice
+          CODE_REVIEW: 2,
+          VERIFICATION: 2,
+          FINAL_AUDIT: 2,
+        });
+        // The widen is a recorded operator act.
+        const log = new reviewWorkflowRunner.ReviewWorkflowRunnerStore(done).listLog(workflowId, {
+          limit: 10_000,
+        });
+        expect(
+          log.some(
+            (entry) =>
+              entry.entryType === 'DECISION' &&
+              entry.message.includes('Batch scope set to 2 by explicit operator resume'),
+          ),
+        ).toBe(true);
+        expect(readFileSync(join(projectDir, 'receipt.txt'), 'utf8')).toBe('receipt\n');
+      } finally {
+        done.close();
       }
     },
   );

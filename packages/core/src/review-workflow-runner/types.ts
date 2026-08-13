@@ -5,6 +5,7 @@
 import type { ReviewGatedAutonomousConfig } from '../types/config.js';
 
 export const RUNNER_STOP_REASONS = [
+  'BATCH_SCOPE_REACHED',
   'PLAN_REVIEW_LIMIT_REACHED',
   'CODE_REVIEW_LIMIT_REACHED',
   'CORRECTION_LIMIT_REACHED',
@@ -143,6 +144,13 @@ export interface RunnerState {
   readonly limits?: RunnerConfig;
   /** Plan-as-is mode, frozen at workflow start exactly like the limits. */
   readonly planAsIs?: boolean;
+  /**
+   * The batch scope (`--max-batches`): stop cleanly once this many batches are FULLY
+   * complete (verified, gated, pushed). Absent = unlimited. Frozen at start; rewritten
+   * only by an explicit `resume --max-batches`, so a dropped flag can never silently
+   * widen a deliberately scoped run.
+   */
+  readonly maxBatches?: number;
   /** Set while an agent invocation is in flight; null between invocations. */
   readonly activeInvocation?: RunnerActiveInvocation;
   /** Captured when the workflow pauses; compared and cleared on resume. */

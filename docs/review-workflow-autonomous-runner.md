@@ -105,6 +105,30 @@ Human decisions (`codemoot workflow decide <wf> --action fix_again|accept_risk|c
 --rationale "..." [--findings a,b]`) are recorded immutably with actor, finding IDs,
 rationale, commit SHA, and timestamp; `accept_risk` overrides are SHA-bound.
 
+## Batch scope: stop after N batches, deliberately
+
+`workflow run --plan X --max-batches N` stops the workflow cleanly once N batches are
+**fully complete** — verification, gate and push included — leaving it resumable. Use it to
+inspect batch 1 before paying for batch 2. Without the flag every batch runs, exactly as
+before. (Do not confuse it with `relay run --batches`, which overrides the relay's parsed
+batch *count* — a different concept in a different command.)
+
+- The scope fires **between** batches, never inside one: a begun batch always finishes.
+  A scope at or above the total batch count never fires and the run completes normally.
+- The stop settles like a pause (same durable repository capture, same resume path) but is
+  recorded under its own reason, `BATCH_SCOPE_REACHED`, with a checkpoint and a single
+  owner notification worded as the expected stop it is. `workflow status` shows the frozen
+  scope (`maxBatches`), the cause, and the exact command to continue. Exit code is 0 — the
+  run did precisely what was asked.
+- **The scope is frozen at start** (runner state, like the limits) and re-read from durable
+  state on every restart — never from argv — so a crashed or restarted worker cannot widen
+  it. A bare `resume` on a scope-stopped workflow **fails closed**, naming the flag to
+  pass; `resume --max-batches M` with `M` above the completed count is the explicit,
+  logged operator act that widens the scope and continues (batch N+1 starts, batches 1..N
+  are never redone); `M` at or below the completed count is an idempotent re-stop.
+- Fully orthogonal to `--plan-as-is`; combining them — run the plan verbatim, stop after
+  batch 1 — is the primary use case.
+
 ## Pause, interruption, and resumption
 `codemoot workflow pause <id>` (or the worker's first interrupt signal) requests a graceful
 pause: the durable status becomes `PAUSE_REQUESTED`, no new action is scheduled, the current
