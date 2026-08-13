@@ -197,6 +197,16 @@ const COMMAND_FIXTURES = {
       acceptedCommitSha: SHA_A,
     },
   },
+  ACCEPT_PLAN_AS_IS: {
+    type: 'ACCEPT_PLAN_AS_IS',
+    evidence: {
+      acceptedPlanVersionId: 'plan-1',
+      currentPlanVersionId: 'plan-1',
+      acceptedPlanContentHash: 'plan-hash',
+      currentPlanContentHash: 'plan-hash',
+      rationale: 'The operator supplied the plan verbatim (plan-as-is mode).',
+    },
+  },
   START_IMPLEMENTATION: {
     type: 'START_IMPLEMENTATION',
     evidence: {
@@ -520,6 +530,83 @@ describe('transitionBatch allowed transitions', () => {
       COMMAND_FIXTURES.ACCEPT_FINDINGS_RISK,
       HUMAN_COMMITTER,
       'AUTHORITY_REQUIRED',
+    );
+  });
+
+  it('accepts ACCEPT_PLAN_AS_IS only from the operator, only from DRAFT', () => {
+    // The plan-as-is acceptance is the operator vouching for a plan they supplied verbatim:
+    // DRAFT → APPROVED_FOR_IMPLEMENTATION with no plan-review state ever entered.
+    expectAllowed(
+      'DRAFT',
+      COMMAND_FIXTURES.ACCEPT_PLAN_AS_IS,
+      OWNER,
+      'APPROVED_FOR_IMPLEMENTATION',
+    );
+    expectAllowed(
+      'DRAFT',
+      COMMAND_FIXTURES.ACCEPT_PLAN_AS_IS,
+      makeActor('SYSTEM', ['WORKFLOW_OWNER']),
+      'APPROVED_FOR_IMPLEMENTATION',
+    );
+    // Only DRAFT is a valid source — a batch that entered review must finish it there.
+    expectRejected(
+      'PLAN_REVIEW',
+      COMMAND_FIXTURES.ACCEPT_PLAN_AS_IS,
+      OWNER,
+      'INVALID_TRANSITION',
+    );
+    expectRejected(
+      'APPROVED_FOR_IMPLEMENTATION',
+      COMMAND_FIXTURES.ACCEPT_PLAN_AS_IS,
+      OWNER,
+      'INVALID_TRANSITION',
+    );
+    // An AGENT can never accept a plan without review — that is the manufactured-approval
+    // door this command exists to keep shut — and neither can a human without ownership.
+    expectRejected(
+      'DRAFT',
+      COMMAND_FIXTURES.ACCEPT_PLAN_AS_IS,
+      makeActor('AGENT', ['WORKFLOW_OWNER']),
+      'ACTOR_TYPE_NOT_ALLOWED',
+    );
+    expectRejected(
+      'DRAFT',
+      COMMAND_FIXTURES.ACCEPT_PLAN_AS_IS,
+      HUMAN_COMMITTER,
+      'AUTHORITY_REQUIRED',
+    );
+  });
+
+  it('rejects a stale ACCEPT_PLAN_AS_IS — version and hash must match the current plan', () => {
+    expectRejected(
+      'DRAFT',
+      {
+        type: 'ACCEPT_PLAN_AS_IS',
+        evidence: {
+          acceptedPlanVersionId: 'plan-1',
+          currentPlanVersionId: 'plan-2',
+          acceptedPlanContentHash: 'plan-hash',
+          currentPlanContentHash: 'plan-hash',
+          rationale: 'The operator supplied the plan verbatim (plan-as-is mode).',
+        },
+      },
+      OWNER,
+      'PLAN_VERSION_STALE',
+    );
+    expectRejected(
+      'DRAFT',
+      {
+        type: 'ACCEPT_PLAN_AS_IS',
+        evidence: {
+          acceptedPlanVersionId: 'plan-1',
+          currentPlanVersionId: 'plan-1',
+          acceptedPlanContentHash: 'plan-hash',
+          currentPlanContentHash: 'plan-hash-2',
+          rationale: 'The operator supplied the plan verbatim (plan-as-is mode).',
+        },
+      },
+      OWNER,
+      'PLAN_VERSION_STALE',
     );
   });
 

@@ -40,6 +40,7 @@ export const RUNNER_PHASES = [
   'PLAN_REFINEMENT',
   'PLAN_REVIEW',
   'PLAN_REVISION',
+  'PLAN_AS_IS_ACCEPTANCE',
   'IMPLEMENTATION',
   'COMMIT',
   'CODE_REVIEW',
@@ -140,6 +141,8 @@ export interface RunnerState {
   readonly workflowId: string;
   /** The limits frozen at workflow start; later config edits never change enforcement. */
   readonly limits?: RunnerConfig;
+  /** Plan-as-is mode, frozen at workflow start exactly like the limits. */
+  readonly planAsIs?: boolean;
   /** Set while an agent invocation is in flight; null between invocations. */
   readonly activeInvocation?: RunnerActiveInvocation;
   /** Captured when the workflow pauses; compared and cleared on resume. */
@@ -229,6 +232,14 @@ export interface RunnerPhases {
   refinePlan(): Promise<readonly RunnerBatchDescriptor[]>;
   reviewPlan(batch: RunnerBatchDescriptor, round: number): Promise<{ approved: boolean }>;
   revisePlan(batch: RunnerBatchDescriptor, round: number): Promise<void>;
+  /**
+   * Plan-as-is mode only: fires the explicit operator-authority ACCEPT_PLAN_AS_IS
+   * transition (DRAFT → APPROVED_FOR_IMPLEMENTATION) instead of the plan-review stage.
+   * Must be idempotent — a batch already at or past APPROVED_FOR_IMPLEMENTATION is left
+   * untouched. Optional so refined-mode phase surfaces need not carry it; a plan-as-is
+   * runner without it stops rather than silently reverting to plan review.
+   */
+  acceptPlanAsIs?(batch: RunnerBatchDescriptor): Promise<void>;
   implement(batch: RunnerBatchDescriptor): Promise<{ commitSha: string }>;
   reviewCode(
     batch: RunnerBatchDescriptor,
@@ -321,4 +332,11 @@ export interface RunnerOptions {
   /** Stable identity of this worker process; required for the exclusive lease. */
   readonly workerId?: string;
   readonly leaseSeconds?: number;
+  /**
+   * Plan-as-is mode: skip the plan-review stage and open every batch with the
+   * ACCEPT_PLAN_AS_IS acceptance instead. Resolved by the CLI from the value frozen in
+   * runner state at workflow start (config edits or dropped flags never flip a running
+   * workflow's mode).
+   */
+  readonly planAsIs?: boolean;
 }

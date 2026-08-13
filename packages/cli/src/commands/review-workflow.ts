@@ -589,6 +589,104 @@ async function performRefinement(
   });
 }
 
+/**
+ * Plan-as-is refinement: ZERO model invocations. The supplied plan is the refined plan,
+ * byte for byte; batches come from its own `## Batch N` headings; every synthesized batch
+ * plan satisfies the same contract, assembly, validation, materialization and audit as an
+ * agent-authored one — captureRefinement runs unchanged on the assembled document.
+ */
+async function performPlanAsIsRefinement(runtime: ReviewWorkflowRuntime, workflowId: string) {
+  const workflow = runtime.store.getWorkflow(workflowId);
+  if (workflow === null) throw new Error(`Workflow ${workflowId} does not exist`);
+  if (
+    workflow.refinedPlanVersionId !== undefined ||
+    runtime.store.listBatches(workflowId).length > 0
+  ) {
+    throw new Error(`Workflow ${workflowId} already has an initial materialized refinement`);
+  }
+  const requirements = runtime.store.listRequirements(workflow.generalPlanVersionId);
+  const generalPlan = runtime.store.getGeneralPlan(workflow.generalPlanVersionId);
+  const audit = runtime.store.getLatestRepositoryAudit(workflowId);
+  if (generalPlan === null || audit === null) {
+    throw new Error(`Workflow ${workflowId} is missing its plan or repository audit`);
+  }
+  const actorExecutionId = `${workflowId}:plan-as-is:${generateId('execution')}`;
+  runtime.service.verifyRepositoryContext(workflowId, audit.repositoryAuditId, actorExecutionId);
+  const firstBatchId = reviewWorkflowPlan.deriveWorkflowBatchId(workflowId, 1);
+  const built = reviewWorkflowPlan.buildPlanAsIsBatchPlans({
+    workflowId,
+    generalPlan,
+    requirements,
+  });
+  const assembled = reviewWorkflowContracts.assembleRefinement(built);
+  // Same retry-release as the agent path: a refinement that failed validation leaves its
+  // intake command terminally failed, and the fresh actor execution can never hash
+  // identically to the failed attempt.
+  runtime.commandStore.releaseFailedFinalReservation(
+    reviewWorkflowPlan.derivePlanCommandId(firstBatchId, 'create'),
+    'Plan-as-is refinement retry',
+  );
+  runtime.runnerStore.appendLog({
+    workflowId,
+    entryType: 'CHECKPOINT',
+    phase: 'PLAN_REFINEMENT',
+    message: `Plan-as-is: ${built.batchPlans.length} batch(es) derived mechanically from the plan's own headings; no model invocation`,
+  });
+  return runtime.service.captureRefinement({
+    transcriptId: `${workflowId}:refinement:${generateId('transcript')}`,
+    workflowId,
+    actorExecutionId,
+    rawTranscript: JSON.stringify(assembled),
+    createdAt: new Date().toISOString(),
+    expectedFirstBatchId: firstBatchId,
+    refinedPlanVersionId: `${workflowId}:refined-plan:1`,
+    repositoryAuditId: audit.repositoryAuditId,
+    version: 1,
+    // No agent call was made, so there is no invocation to bind — exactly the pinned-outline
+    // resume shape: the command materializes evidence that is already durable.
+    actor: persistCliActor(runtime.store, {
+      actorExecutionId,
+      actorType: 'SYSTEM',
+      authorities: ['PLAN_REFINER'],
+      assurance: 'PROCESS_ATTESTED',
+    }),
+  });
+}
+
+/**
+ * Fires the explicit operator-authority acceptance for a plan-as-is batch. Idempotent: a
+ * batch at or past APPROVED_FOR_IMPLEMENTATION is untouched, so the runner may route every
+ * (re-)entry through this before implementing.
+ */
+async function performPlanAsIsAcceptance(
+  runtime: ReviewWorkflowRuntime,
+  workflowId: string,
+  batch: reviewWorkflowRunner.RunnerBatchDescriptor,
+): Promise<void> {
+  const stored = requireBatchByOrdinal(runtime.store, workflowId, batch.ordinal);
+  if (stored.persistedState !== 'DRAFT') return; // already accepted, or further along
+  const actorExecutionId = `${stored.batchId}:plan-as-is-owner:${generateId('execution')}`;
+  // HUMAN + WORKFLOW_OWNER + CLI_ASSERTED: the acceptance is the operator's own act — the
+  // --plan-as-is flag / planAsIs config they set is the authorization being recorded.
+  const actor = persistCliActor(runtime.store, {
+    actorExecutionId,
+    actorType: 'HUMAN',
+    authorities: ['WORKFLOW_OWNER'],
+  });
+  const accepted = runtime.service.acceptPlanAsIs({
+    workflowId,
+    batchId: stored.batchId,
+    actor,
+    rationale:
+      'The operator supplied the plan verbatim (plan-as-is mode); the batch proceeds to implementation without a batch-level plan review.',
+  });
+  if (accepted.persistedState !== 'APPROVED_FOR_IMPLEMENTATION') {
+    throw new Error(
+      `Plan-as-is acceptance left batch ${stored.batchId} in ${accepted.persistedState}`,
+    );
+  }
+}
+
 export async function reviewWorkflowRefineCommand(
   workflowId: string,
   options: WorkflowInvocationOptions,
@@ -3273,6 +3371,7 @@ function buildRunnerPhases(
   projectDir: string,
   workflowId: string,
   timeoutSeconds: number,
+  planAsIs: boolean,
 ): reviewWorkflowRunner.RunnerPhases {
   return {
     refinePlan: async () => {
@@ -3280,13 +3379,21 @@ function buildRunnerPhases(
       if (existing.length > 0) {
         return existing.map((batch) => ({ ordinal: batch.ordinal, batchId: batch.batchId }));
       }
-      const result = await performRefinement(runtime, projectDir, workflowId, timeoutSeconds);
+      // Plan-as-is: the batches are derived MECHANICALLY from the plan's own headings and
+      // the plan text is used verbatim — no model invocation, no rewrite. The refined path
+      // is the agent-authored outline + per-batch authoring below.
+      const result = planAsIs
+        ? await performPlanAsIsRefinement(runtime, workflowId)
+        : await performRefinement(runtime, projectDir, workflowId, timeoutSeconds);
       if (!result.accepted) {
         throw new Error(`Plan refinement rejected: ${result.error.message}`);
       }
       return runtime.store
         .listBatches(workflowId)
         .map((batch) => ({ ordinal: batch.ordinal, batchId: batch.batchId }));
+    },
+    acceptPlanAsIs: async (batch) => {
+      await performPlanAsIsAcceptance(runtime, workflowId, batch);
     },
     reviewPlan: async (batch, round) => {
       // Crash-safe re-entry: a batch resumed in PLAN_NEEDS_REVISION submits its pending
@@ -3544,6 +3651,10 @@ function buildRunnerPhases(
       const stored = requireBatchByOrdinal(runtime.store, workflowId, batch.ordinal);
       switch (stored.persistedState) {
         case 'DRAFT':
+          // Plan-as-is: a DRAFT batch re-enters at IMPLEMENTATION — runBatch fires the
+          // idempotent ACCEPT_PLAN_AS_IS acceptance just before implementing, and the
+          // plan-review stage must never run in this mode, on first entry or resume.
+          return planAsIs ? 'IMPLEMENTATION' : 'PLAN_REVIEW';
         case 'PLAN_REVIEW':
         case 'PLAN_NEEDS_REVISION':
           return 'PLAN_REVIEW';
@@ -3769,11 +3880,15 @@ function buildRunner(
       return undefined; // the workflow may not be initialized yet (decide/status paths)
     }
   })();
+  // The mode frozen at workflow start is the authority — a config edit or a dropped
+  // --plan-as-is flag never flips a running workflow between "the plan is authoritative"
+  // and "an agent reviews the plan".
+  const planAsIs = runtime.runnerStore.get(workflowId)?.planAsIs === true;
   return new reviewWorkflowRunner.AutonomousWorkflowRunner(
     runtime.runnerStore,
     autonomous,
     createRunnerGit(projectDir),
-    buildRunnerPhases(runtime, projectDir, workflowId, timeoutSeconds),
+    buildRunnerPhases(runtime, projectDir, workflowId, timeoutSeconds, planAsIs),
     // Stops are already durable (NOTIFICATION runner-log entries); stderr is best-effort
     // transport for a foreground worker.
     { notify: (message) => console.error(`\n[codemoot] ${message}\n`) },
@@ -3786,6 +3901,7 @@ function buildRunner(
       trustedOperator: config.reviewGated?.operatorMode === 'trusted_local',
       workerId: `${process.pid}:${workflowId.slice(-8)}`,
       leaseSeconds: autonomous.heartbeatExpirySeconds,
+      planAsIs,
     },
   );
 }
@@ -3796,6 +3912,8 @@ interface WorkflowRunOptions {
   /** Omitted means: take the ceiling from `cliAdapter.timeout` in .cowork.yml. */
   readonly timeout?: number;
   readonly id?: string;
+  /** Use the supplied plan verbatim: no refinement rewrite, no plan-review gate. */
+  readonly planAsIs?: boolean;
 }
 
 export async function reviewWorkflowRunCommand(options: WorkflowRunOptions): Promise<void> {
@@ -3811,12 +3929,24 @@ export async function reviewWorkflowRunCommand(options: WorkflowRunOptions): Pro
     const config = loadConfig({ projectDir });
     const workflowId = options.id ?? generateId('review-workflow');
     const now = new Date().toISOString();
-    const configuration = reviewWorkflowIdentity.createReviewWorkflowConfigurationSnapshot(config, {
-      workflowId,
-      implementerAssignmentId: `${workflowId}:assignment:implementer`,
-      reviewerAssignmentId: `${workflowId}:assignment:reviewer`,
-      assignedAt: now,
-    });
+    // Plan-as-is may come from config (`reviewGated.planAsIs`) or the --plan-as-is flag.
+    // The flag is folded into the config the snapshot is derived from, so the snapshot
+    // records the mode; the durable authority across resumes is the runner-state freeze
+    // below (the snapshot is re-derived from CURRENT config on every resolve).
+    const planAsIs = options.planAsIs === true || config.reviewGated?.planAsIs === true;
+    const effectiveConfig =
+      planAsIs && config.reviewGated !== undefined
+        ? { ...config, reviewGated: { ...config.reviewGated, planAsIs: true } }
+        : config;
+    const configuration = reviewWorkflowIdentity.createReviewWorkflowConfigurationSnapshot(
+      effectiveConfig,
+      {
+        workflowId,
+        implementerAssignmentId: `${workflowId}:assignment:implementer`,
+        reviewerAssignmentId: `${workflowId}:assignment:reviewer`,
+        assignedAt: now,
+      },
+    );
     const planPath = resolve(projectDir, options.plan);
     const runtime = createRuntime(db, projectDir);
     // `run --plan` ALWAYS creates a new workflow; an existing ID must go through
@@ -3865,11 +3995,12 @@ export async function reviewWorkflowRunCommand(options: WorkflowRunOptions): Pro
       baseBranch,
       baseSha,
       limits: autonomousLimits,
+      planAsIs,
     });
     runtime.runnerStore.appendLog({
       workflowId,
       entryType: 'CHECKPOINT',
-      message: `Workflow started on branch ${branch} (base ${baseBranch}@${baseSha.slice(0, 8)})`,
+      message: `Workflow started on branch ${branch} (base ${baseBranch}@${baseSha.slice(0, 8)})${planAsIs ? ' in PLAN-AS-IS mode: the supplied plan is used verbatim, with no refinement rewrite and no plan-review gate' : ''}`,
     });
     if (options.background === true) {
       const entry = process.argv[1];
@@ -3895,7 +4026,15 @@ export async function reviewWorkflowRunCommand(options: WorkflowRunOptions): Pro
       });
       return;
     }
-    printJson({ status: 'RUNNING', workflowId, branch, baseBranch, baseSha, timeoutSeconds });
+    printJson({
+      status: 'RUNNING',
+      workflowId,
+      branch,
+      baseBranch,
+      baseSha,
+      timeoutSeconds,
+      ...(planAsIs ? { planAsIs: true } : {}),
+    });
     await runResumeInProcess(runtime, projectDir, workflowId, timeoutSeconds);
   });
 }
@@ -4006,8 +4145,25 @@ async function runResumeGuarded(
 
 export async function reviewWorkflowRunResumeCommand(
   workflowId: string,
-  options: { readonly timeout?: number; readonly background?: boolean },
+  options: {
+    readonly timeout?: number;
+    readonly background?: boolean;
+    readonly planAsIs?: boolean;
+  },
 ): Promise<void> {
+  // The mode was frozen at workflow start; the resume flag is an assertion, not a switch.
+  // Passing --plan-as-is on a workflow that started refined (or vice versa: omitting it
+  // changes nothing) can only fail loudly — it can never flip the mode mid-flight.
+  if (options.planAsIs === true) {
+    await withDatabase(async (db) => {
+      const state = new reviewWorkflowRunner.ReviewWorkflowRunnerStore(db).get(workflowId);
+      if (state !== null && state.planAsIs !== true) {
+        throw new Error(
+          `Workflow ${workflowId} was started in refined mode; --plan-as-is cannot change the mode of a running workflow`,
+        );
+      }
+    });
+  }
   if (options.background === true) {
     const entry = process.argv[1];
     if (entry === undefined) throw new Error('Cannot resolve the CLI entry point');

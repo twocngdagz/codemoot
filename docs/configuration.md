@@ -166,6 +166,31 @@ Legacy multi-model debate (not used by review-gated workflows — set `enabled: 
 `[critical, high]`) — add `medium` to make medium findings block reviews and the merge gate.
 `requireAllFindingResponses` (default true), `requireAcceptedAttestations` (default true).
 
+### `planAsIs` — use the supplied plan verbatim
+
+`reviewGated.planAsIs: true` (or `codemoot workflow run --plan-as-is`) runs the workflow
+with the plan **exactly as written**: no LLM refinement rewrites it into batch plans, and no
+plan-review gate runs. Built for plans that were already authored and reviewed outside the
+workflow, where a rewrite re-plans redundantly and can degrade precision.
+
+- **Batches** come from the plan's own `## Batch N` headings (order of appearance; any
+  heading level). Everything before the first batch heading belongs to batch 1. A plan with
+  no batch headings is one batch.
+- **Approval is honest**: each batch moves `DRAFT → APPROVED_FOR_IMPLEMENTATION` through an
+  explicit `ACCEPT_PLAN_AS_IS` transition on the operator's own authority
+  (HUMAN/SYSTEM + WORKFLOW_OWNER, recorded in the immutable audit) — never a fabricated
+  reviewer approval, and agents can never fire it.
+- **Everything from implementation on is unchanged**: code review ↔ correction,
+  verification, final audit, merge gate, gated push. Each synthesized batch carries one
+  minimal verification command (`git status --porcelain`) because the merge gate requires
+  at least one accepted verification record; deeper verification stays where this mode puts
+  it — code review and the plan's own instructions.
+- **The mode is frozen at workflow start** (runner state), like the autonomous limits: a
+  config edit or dropped flag never flips a running workflow. `run-resume --plan-as-is` on
+  a workflow that started refined fails instead of switching.
+
+The default (`planAsIs: false`) is the refined behavior, unchanged.
+
 ### `pacing` — the immutable per-workflow review contract
 
 Frozen into each workflow's configuration snapshot at start; the coordinators enforce it.

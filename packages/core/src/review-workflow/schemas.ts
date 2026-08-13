@@ -970,6 +970,24 @@ export const transitionCommandSchema = z.discriminatedUnion('type', [
       evidence: planReviewApprovalEvidenceSchema,
     })
     .strict(),
+  // Plan-as-is: the OPERATOR supplied the plan verbatim and vouches for it. This is a
+  // distinct command rather than a synthetic APPROVE_PLAN because no review happened and
+  // the evidence must say so — fabricating reviewer evidence to reuse the reviewer's
+  // command would poison the exact audit trail the workflow exists to keep honest.
+  z
+    .object({
+      type: z.literal('ACCEPT_PLAN_AS_IS'),
+      evidence: z
+        .object({
+          acceptedPlanVersionId: idSchema,
+          currentPlanVersionId: idSchema,
+          acceptedPlanContentHash: contentHashSchema,
+          currentPlanContentHash: contentHashSchema,
+          rationale: z.string().min(1),
+        })
+        .strict(),
+    })
+    .strict(),
   z
     .object({
       type: z.literal('SUBMIT_REVISED_PLAN'),

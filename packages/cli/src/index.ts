@@ -477,6 +477,10 @@ reviewWorkflow
   .command('run')
   .description('Autonomously run a complete review-gated workflow from a Markdown plan')
   .requiredOption('--plan <file>', 'External Markdown plan file')
+  .option(
+    '--plan-as-is',
+    'Use the plan VERBATIM: no LLM refinement rewrite, no plan-review gate — batches come from the plan\'s own "## Batch N" headings and go straight to implement → code review',
+  )
   .option('--background', 'Run detached and return the workflow ID immediately')
   .option(
     '--timeout <seconds>',
@@ -561,9 +565,14 @@ reviewWorkflow
     'Per-invocation timeout in seconds (default: cliAdapter.timeout from .cowork.yml)',
     positiveInteger,
   )
+  .option(
+    '--plan-as-is',
+    'Assert the workflow runs in plan-as-is mode (the mode was frozen at start; a mismatch fails rather than switching)',
+  )
   .option('--background', 'Resume detached', false)
-  .action((workflowId: string, options: { timeout: number; background?: boolean }) =>
-    reviewWorkflowRunResumeCommand(workflowId, options),
+  .action(
+    (workflowId: string, options: { timeout: number; background?: boolean; planAsIs?: boolean }) =>
+      reviewWorkflowRunResumeCommand(workflowId, options),
   );
 
 reviewWorkflow

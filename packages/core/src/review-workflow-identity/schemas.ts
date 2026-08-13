@@ -31,6 +31,11 @@ export const reviewWorkflowGatePolicySnapshotSchema = z
     codeReviewRequired: z.literal(true),
     verificationRequired: z.literal(true),
     humanMergeRequired: z.literal(true),
+    // Plan-as-is does NOT relax planReviewRequired above: the literal stays true because the
+    // per-batch plan-review GATE machinery is unchanged — in plan-as-is mode the batch never
+    // enters PLAN_REVIEW at all; it is approved by the explicit operator-authority
+    // ACCEPT_PLAN_AS_IS transition instead. This field records the mode in the snapshot.
+    planAsIs: z.boolean(),
     blockingSeverities: z.array(z.enum(FINDING_SEVERITIES)).min(1),
     requireAllFindingResponses: z.boolean(),
     requireAcceptedAttestations: z.boolean(),

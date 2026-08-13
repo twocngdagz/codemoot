@@ -7,7 +7,7 @@ import {
   REVIEW_WORKFLOW_RUNNER_STATE_DDL,
 } from './review-workflow-schema.js';
 
-const SCHEMA_VERSION = '22';
+const SCHEMA_VERSION = '23';
 
 const MIGRATIONS = [
   // Sessions
@@ -431,6 +431,17 @@ export function runMigrations(db: Database.Database): void {
         // Column already exists
       }
     }
+    // v23: plan-as-is mode is frozen into runner state at workflow start, exactly like the
+    // limits — a config edit or a dropped CLI flag must never flip a running workflow from
+    // "the plan is authoritative" back to "an agent reviews the plan" mid-flight.
+    try {
+      db.exec(
+        'ALTER TABLE review_workflow_runner_state ADD COLUMN plan_as_is INTEGER NOT NULL DEFAULT 0',
+      );
+    } catch {
+      // Column already exists
+    }
+
     // v21: the transcript records WHICH MODEL produced each response. A live run swapped
     // implementer (claude-opus-5 → claude-fable-5) and reviewer (claude-fable-5 →
     // gpt-5.6-sol) mid-run, and nothing in the audit showed either seam.

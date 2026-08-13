@@ -202,6 +202,37 @@ describe('review-workflow identity configuration snapshots', () => {
     ).toEqual(['HUMAN']);
   });
 
+  it('records plan-as-is in the snapshot and round-trips it through the schema', () => {
+    const config = reviewGatedConfig();
+    const withMode = {
+      ...config,
+      reviewGated: { ...(config.reviewGated ?? {}), planAsIs: true },
+    } as typeof config;
+    const result = createReviewWorkflowConfigurationSnapshot(withMode, {
+      workflowId: 'workflow-1',
+      implementerAssignmentId: 'assignment-implementer',
+      reviewerAssignmentId: 'assignment-reviewer',
+      assignedAt: NOW,
+    });
+    expect(result.gates.planAsIs).toBe(true);
+    expect(reviewWorkflowConfigurationSnapshotSchema.safeParse(result).success).toBe(true);
+    // Default: refined mode, recorded as false.
+    expect(snapshot().gates.planAsIs).toBe(false);
+  });
+
+  it('excludes plan-as-is from the assignment hash — the mode never invalidates roles', () => {
+    // Same reason operatorMode is excluded: the mode says nothing about which model holds
+    // which role, and including it would shift every existing workflow's hash.
+    const config = reviewGatedConfig();
+    const withMode = {
+      ...config,
+      reviewGated: { ...(config.reviewGated ?? {}), planAsIs: true },
+    } as typeof config;
+    expect(hashReviewWorkflowConfiguration(withMode)).toBe(
+      hashReviewWorkflowConfiguration(config),
+    );
+  });
+
   it('hashes equivalent configuration independently of object key order', () => {
     const config = reviewGatedConfig();
     const reordered = {

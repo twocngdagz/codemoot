@@ -136,6 +136,8 @@ export interface ReviewGatedConfig {
   pacing: ReviewGatedPacingConfig;
   autonomous: ReviewGatedAutonomousConfig;
   operatorMode?: 'untrusted_fleet' | 'trusted_local';
+  /** Use the supplied plan verbatim: no refinement rewrite, no plan-review gate. */
+  planAsIs?: boolean;
 }
 
 export interface ProjectConfig {
