@@ -231,6 +231,86 @@ describe('ReviewWorkflowCommandStore', () => {
     expect(event?.payload.acceptedCommitSha).toBe('a'.repeat(40));
   });
 
+  it('DIAGNOSIS: a released command re-claimed under a command-stable identity collides with its own archive', () => {
+    // The live outage, reproduced at the store layer. Release ARCHIVES a failed command by
+    // renaming it (`:superseded:n`) — its side-effect row keeps the bound identity as
+    // evidence. The globally-unique index on side_effect_identity then rejects any retry
+    // that re-derives the SAME identity from the (stable) command id. This is why every
+    // side-effect identity must be per-attempt: the store's behaviour here is CORRECT —
+    // the archive is evidence and the index is the tamper guard — the defect was callers
+    // deriving identities that cannot survive their own retry.
+    const stableIdentity = 'command-review:code-review-invocation';
+    commandStore.reserve(makeRequest('command-review'), 'AGENT_INVOCATION');
+    commandStore.claimSideEffect('command-review', stableIdentity);
+    commandStore.recordOutcome({
+      commandId: 'command-review',
+      status: 'FAILED_FINAL',
+      errorCode: 'REVIEW_ARTIFACT_REJECTED',
+      resultHash: 'hash-rejected',
+      result: { rejected: true },
+    });
+    expect(commandStore.releaseFailedFinalReservation('command-review', 'fix_again retry')).toBe(
+      true,
+    );
+    // The archived side-effect row retains the identity — auditable, untouched.
+    const archived = db
+      .prepare(
+        `SELECT command_id, side_effect_identity, state
+         FROM review_workflow_command_side_effects WHERE side_effect_identity = ?`,
+      )
+      .all(stableIdentity) as { command_id: string; side_effect_identity: string }[];
+    expect(archived).toHaveLength(1);
+    expect(archived[0]?.command_id).toContain(':superseded:');
+    // The retry re-reserves the freed command id, then re-derives the SAME identity:
+    // the global unique index fires — this is the live "UNIQUE constraint failed".
+    commandStore.reserve(makeRequest('command-review'), 'AGENT_INVOCATION');
+    expect(() => commandStore.claimSideEffect('command-review', stableIdentity)).toThrow(
+      /UNIQUE constraint failed: review_workflow_command_side_effects.side_effect_identity/,
+    );
+    // AC2 (the fixed pattern): a PER-ATTEMPT identity claims cleanly, and BOTH attempts'
+    // side-effect records persist side by side, each attributable.
+    commandStore.claimSideEffect('command-review', `${stableIdentity}:attempt_retry`);
+    const rows = db
+      .prepare(
+        `SELECT command_id, side_effect_identity FROM review_workflow_command_side_effects
+         WHERE side_effect_identity LIKE 'command-review:code-review-invocation%'
+         ORDER BY side_effect_identity`,
+      )
+      .all() as { command_id: string; side_effect_identity: string }[];
+    expect(rows).toHaveLength(2);
+    expect(rows.map((row) => row.side_effect_identity)).toEqual([
+      stableIdentity,
+      `${stableIdentity}:attempt_retry`,
+    ]);
+    expect(rows.filter((row) => row.command_id.includes(':superseded:'))).toHaveLength(1);
+  });
+
+  it('AC3: a genuine replay — same command, same identity — short-circuits without re-invoking', () => {
+    commandStore.reserve(makeRequest('command-replay'), 'AGENT_INVOCATION');
+    const first = commandStore.claimSideEffect('command-replay', 'invocation-one');
+    expect(first.shouldInvoke).toBe(true);
+    const replay = commandStore.claimSideEffect('command-replay', 'invocation-one');
+    expect(replay.shouldInvoke).toBe(false);
+  });
+
+  it('AC4: a conflicting claim — same command, different identity — still throws IDEMPOTENCY_CONFLICT', () => {
+    commandStore.reserve(makeRequest('command-conflicting'), 'AGENT_INVOCATION');
+    commandStore.claimSideEffect('command-conflicting', 'invocation-one');
+    expectPersistenceCode(
+      () => commandStore.claimSideEffect('command-conflicting', 'invocation-two'),
+      'IDEMPOTENCY_CONFLICT',
+    );
+  });
+
+  it('AC5: the unique index still rejects two live rows sharing one identity', () => {
+    commandStore.reserve(makeRequest('command-one'), 'AGENT_INVOCATION');
+    commandStore.reserve(makeRequest('command-two'), 'AGENT_INVOCATION');
+    commandStore.claimSideEffect('command-one', 'shared-identity');
+    expect(() => commandStore.claimSideEffect('command-two', 'shared-identity')).toThrow(
+      /UNIQUE constraint failed/,
+    );
+  });
+
   it('reserves a command and replays the identical request', () => {
     const request = makeRequest('command-1');
 

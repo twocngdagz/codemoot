@@ -159,8 +159,15 @@ then could not be recovered:
   including failures wrapped by the session-continuity layer. `workflow logs` shows how far
   the agent actually got; a NULL transcript on a failure is a bug, not a policy.
 - **`fix_again` always has a lane.** A retry is a genuinely new execution and records its
-  own requester actor-execution (attempt-suffixed ID); both attempts sit side by side in
-  the audit. Immutability is unchanged — the same ID with different content still fails.
+  own requester actor-execution AND its own side-effect identity (both attempt-suffixed);
+  the failed attempt's records — including the archived command's bound side-effect
+  identity — stay intact and auditable beside the retry's. Immutability and the
+  globally-unique side-effect index are unchanged: the same ID or identity with different
+  content still fails. (Two members of this defect family shipped as outages — a
+  command-stable requester ID, then a command-stable side-effect identity — because a
+  released command's ARCHIVE keeps its identifiers as evidence, so anything re-derived
+  from the stable command id collides with its own history on retry. Every per-command
+  identifier that survives a release must be per-attempt.)
 - **A retry can stand on work its failed attempt already committed.** Implementation
   evidence is judged against the BATCH's progress (its established base SHA → HEAD, plus
   any uncommitted worktree changes), not this attempt's own before/after delta. A retry

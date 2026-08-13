@@ -1111,7 +1111,9 @@ async function performCodeReview(
     actorExecutionId: `${batch.batchId}:reviewer:${generateId('execution')}`,
     // The claimed side-effect identity IS the invocation ID (transition-actor binding), so
     // it is derived from the command ID to give code review a durable receipt identity.
-    invocationId: `${commandId}:code-review-invocation`,
+    // Per-attempt: release archives a failed command WITH its bound side-effect identity,
+    // so a command-stable id collides with its own archive on retry (the live outage).
+    invocationId: `${commandId}:code-review-invocation:${generateId('attempt')}`,
     sessionIdentityId: `${batch.batchId}:reviewer:${generateId('session')}`,
     transcriptId: `${batch.batchId}:code-review-${payload.round}:${generateId('transcript')}`,
     reviewRoundId: reviewWorkflowImplementation.deriveCodeReviewRoundId(
@@ -3159,7 +3161,7 @@ async function performAutonomousImplementation(
     // nothing is synthesized. The capture validates schema, commit target, and exact
     // per-finding coverage, and the bounded final review still judges every claim.
     const dispositionCommandId = `${stored.batchId}:dispositions:${correction.pass}:invoke`;
-    const dispositionInvocationId = `${dispositionCommandId}:invocation`;
+    const dispositionInvocationId = `${dispositionCommandId}:invocation:${generateId('attempt')}`;
     const dispositionRequester: reviewWorkflow.ActorExecutionIdentity = {
       actorExecutionId: `${dispositionCommandId}:requester:${generateId('attempt')}`,
       actorType: 'AGENT',
@@ -3255,7 +3257,7 @@ async function performAutonomousVerification(
   // Reviewer-judged acceptance: a dedicated reviewer assessment invocation (resumed
   // reviewer session) carries VERIFICATION_ATTESTOR authority and independently attests.
   const assessCommandId = `${commandId}:assess`;
-  const invocationId = `${assessCommandId}:invocation`;
+  const invocationId = `${assessCommandId}:invocation:${generateId('attempt')}`;
   const requester: reviewWorkflow.ActorExecutionIdentity = {
     actorExecutionId: `${assessCommandId}:requester:${generateId('attempt')}`,
     actorType: 'AGENT',
