@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import type { ReviewWorkflowCommandStore } from '../memory/review-workflow-command-store.js';
+import { generateId } from '../utils/id.js';
 import { parseImplementationResult } from '../review-workflow-contracts/parser.js';
 import type { ReviewWorkflowContractService } from '../review-workflow-contracts/service.js';
 import type {
@@ -988,6 +989,14 @@ export class ReviewWorkflowImplementationService {
    * The durable pre-invocation requester: records who asked for the command before any side
    * effect ran. Its assurance is honestly CONFIG_ONLY; the richer process-attested execution
    * is persisted after the invocation and named for kernel re-derivation.
+   *
+   * The ID is unique PER ATTEMPT, not per command: a retry (fix_again after a failed
+   * invocation) is a genuinely new execution with new timestamps and a new invocation, and
+   * a command-stable ID made the immutable-entity store reject that honest retry as
+   * tampering — same ID, different hash — which permanently walled off the one recovery
+   * the operator was offered. Both attempts now persist side by side; the receipt's
+   * request_json names which requester asked for which reservation, and insertImmutable
+   * stays exactly as strict for a genuine same-ID conflict.
    */
   private preInvocationRequester(input: {
     readonly commandId: string;
@@ -997,7 +1006,7 @@ export class ReviewWorkflowImplementationService {
     readonly authorities: readonly ActorExecutionIdentity['authoritiesExercised'][number][];
   }): ActorExecutionIdentity {
     return {
-      actorExecutionId: `${input.commandId}:requester`,
+      actorExecutionId: `${input.commandId}:requester:${generateId('attempt')}`,
       actorType: 'AGENT',
       assignmentId: input.assignmentId,
       invocationIdentityId: input.invocationId,

@@ -156,6 +156,14 @@ export function parseCursorCliStream(stdout: string): ParsedCursorCliOutput {
 
     if (message.data.type === 'result') {
       if (result !== undefined) {
+        // Deliberately still strict, unlike the Claude parser: Claude's repeated init AND
+        // repeated result are both observed artefacts of ITS session refresh/compaction
+        // boundary (28-min and ~60-min live calls). No Cursor run has ever emitted two
+        // results, and Cursor is a separate CLI implementation — relaxing an unobserved
+        // failure mode would trade a real corruption signal for a hypothetical. If a live
+        // Cursor call ever dies here after doing its work, apply the Claude parser's
+        // last-result-wins treatment (claude-cli-protocol.ts) — the corruption check that
+        // matters is the unannounced-session one below, not repetition.
         throw new CursorCliProtocolError('Cursor CLI emitted more than one result message');
       }
       const parsedResult = cursorResultMessageSchema.safeParse(value);

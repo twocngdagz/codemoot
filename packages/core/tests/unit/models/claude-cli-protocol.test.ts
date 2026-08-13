@@ -26,6 +26,7 @@ describe('parseClaudeCliStream', () => {
       reportedModel: 'claude-sonnet-4-6',
       permissionMode: 'acceptEdits',
       authenticationSource: 'subscription',
+      resultMessageCount: 1,
       usage: {
         inputTokens: 115,
         outputTokens: 20,
@@ -33,6 +34,43 @@ describe('parseClaudeCliStream', () => {
         costUsd: 0.0125,
       },
     });
+  });
+
+  it('tolerates a REPEATED result — the last one wins, exactly like repeated init', () => {
+    // A live ~60-minute implementer call (CLI 2.1.229) emitted two result messages on the
+    // same session refresh/compaction boundary that repeats init, and the old
+    // single-result rule threw the whole call away AFTER the work was committed. The last
+    // result is authoritative (final text, usage, stop reason); the count is surfaced so
+    // the boundary is visible.
+    const lines = fixture('success.jsonl').trimEnd().split('\n');
+    const finalResult = lines.at(-1) ?? '';
+    const supersededResult = finalResult.replace('Fixture response', 'SUPERSEDED EARLY RESULT');
+    const repeated = [...lines.slice(0, -1), supersededResult, finalResult].join('\n');
+    const parsed = parseClaudeCliStream(repeated);
+    expect(parsed.text).toBe('Fixture response'); // the LAST result's text, not the first
+    expect(parsed.sessionId).toBe('550e8400-e29b-41d4-a716-446655440000');
+    expect(parsed.resultMessageCount).toBe(2);
+  });
+
+  it('still rejects a repeated result whose session NO init announced — corruption stays fatal', () => {
+    const lines = fixture('success.jsonl').trimEnd().split('\n');
+    const finalResult = lines.at(-1) ?? '';
+    const foreignResult = finalResult.replace(
+      '550e8400-e29b-41d4-a716-446655440000',
+      'never-announced-session',
+    );
+    // The foreign result is SUPERSEDED by a valid final one — it must still be fatal:
+    // an unannounced session anywhere in the stream is the real corruption signal.
+    const corrupted = [...lines.slice(0, -1), foreignResult, finalResult].join('\n');
+    expect(() => parseClaudeCliStream(corrupted)).toThrow('matches none of the announced');
+  });
+
+  it('still rejects a malformed repeated result — every result must parse', () => {
+    const lines = fixture('success.jsonl').trimEnd().split('\n');
+    const finalResult = lines.at(-1) ?? '';
+    const malformedResult = finalResult.replace('"is_error":false,', '');
+    const stream = [...lines.slice(0, -1), malformedResult, finalResult].join('\n');
+    expect(() => parseClaudeCliStream(stream)).toThrow('Invalid Claude CLI result message');
   });
 
   it('rejects a structured error result instead of treating process exit zero as success', () => {

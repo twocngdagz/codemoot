@@ -17,7 +17,6 @@ import type {
   InvocationIdentity,
   SessionIdentity,
 } from '../review-workflow/types.js';
-import { ModelError } from '../utils/errors.js';
 import type { ResolvedRoleAdapter } from './role-manager.js';
 
 export const ROLE_INVOCATION_ERROR_CODES = [
@@ -63,6 +62,14 @@ export function isSessionContinuityError(error: unknown): error is RoleInvocatio
 }
 
 export class RoleInvocationError extends Error {
+  /**
+   * Whatever the CLI emitted before the invocation failed. A wrapped adapter error (the
+   * resume-failure path wraps a ModelError) must carry this forward, or the failure audit
+   * writes NULL and a 60-minute call's entire transcript is discarded exactly when it is
+   * needed — that happened, live.
+   */
+  partialOutput?: { readonly stdout: string; readonly stderr: string };
+
   constructor(
     readonly code: RoleInvocationErrorCode,
     message: string,
@@ -70,6 +77,26 @@ export class RoleInvocationError extends Error {
     super(message);
     this.name = 'RoleInvocationError';
   }
+}
+
+/**
+ * Whatever output an error carries, whoever threw it. ModelError and RoleInvocationError
+ * both use the `partialOutput` field; shape-checked so an unrelated property never leaks
+ * into the audit as CLI output.
+ */
+function extractPartialOutput(
+  error: unknown,
+): { readonly stdout: string; readonly stderr: string } | undefined {
+  const candidate = (error as { partialOutput?: { stdout?: unknown; stderr?: unknown } })
+    ?.partialOutput;
+  if (
+    candidate !== undefined &&
+    typeof candidate.stdout === 'string' &&
+    typeof candidate.stderr === 'string'
+  ) {
+    return { stdout: candidate.stdout, stderr: candidate.stderr };
+  }
+  return undefined;
 }
 
 /** Complete-capture boundary for adapter stderr; exceeding it fails the invocation. */
@@ -320,9 +347,12 @@ export class RoleInvocationService {
   ): string | undefined {
     const finished = new Date();
     const message = error instanceof Error ? error.message : String(error);
-    // A killed subprocess (idle/absolute timeout) still produced work: persist whatever it
-    // emitted so the audit shows how far the agent actually got.
-    const partial = error instanceof ModelError ? error.partialOutput : undefined;
+    // A killed subprocess (idle/absolute timeout) OR a post-completion protocol rejection
+    // still produced work: persist whatever it emitted so the audit shows how far the
+    // agent actually got. Duck-typed rather than instanceof ModelError, because wrappers
+    // (SESSION_RESUME_FAILED wraps the adapter's error) carry the same evidence under the
+    // same field — an instanceof check silently dropped a 60-minute transcript here.
+    const partial = extractPartialOutput(error);
     const { text: redactedPrompt, redactions: promptRedactions } = redactSecrets(input.prompt);
     const { text: redactedStderr, redactions: stderrRedactions } = redactSecrets(
       stderr.length > 0 ? stderr : (partial?.stderr ?? ''),
@@ -414,7 +444,11 @@ export class RoleInvocationService {
             });
     } catch (error) {
       if (binding !== null && previousSession !== undefined) {
-        throw this.continuityFailure(
+        // The wrapper must not discard the adapter's evidence: the underlying ModelError
+        // carries whatever the CLI emitted (a protocol rejection happens AFTER the process
+        // ran to completion), and the failure audit persists it from here.
+        const evidence = extractPartialOutput(error);
+        const failure = this.continuityFailure(
           input,
           binding,
           'SESSION_RESUME_FAILED',
@@ -424,6 +458,8 @@ export class RoleInvocationService {
           previousSession.vendorSessionId,
           undefined,
         );
+        if (evidence !== undefined) failure.partialOutput = evidence;
+        throw failure;
       }
       throw error;
     }

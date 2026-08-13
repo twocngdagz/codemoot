@@ -50,6 +50,13 @@ export interface ParsedClaudeCliOutput {
   readonly permissionMode: string;
   readonly authenticationSource?: string;
   readonly usage?: TokenUsage;
+  /**
+   * How many `result` messages the stream carried. 1 for an ordinary call; >1 when the CLI
+   * crossed a session refresh/compaction boundary mid-call (the last result won). Surfaced
+   * so the boundary is visible programmatically; the persisted raw stream carries the
+   * messages themselves.
+   */
+  readonly resultMessageCount: number;
 }
 
 export class ClaudeCliProtocolError extends Error {
@@ -62,7 +69,7 @@ export class ClaudeCliProtocolError extends Error {
 export function parseClaudeCliStream(stdout: string): ParsedClaudeCliOutput {
   let init: z.infer<typeof claudeInitMessageSchema> | undefined;
   const initSessionIds = new Set<string>();
-  let result: z.infer<typeof claudeResultMessageSchema> | undefined;
+  const results: z.infer<typeof claudeResultMessageSchema>[] = [];
 
   for (const [index, line] of stdout.split('\n').entries()) {
     const trimmed = line.trim();
@@ -100,22 +107,27 @@ export function parseClaudeCliStream(stdout: string): ParsedClaudeCliOutput {
     }
 
     if (message.data.type === 'result') {
-      if (result !== undefined) {
-        throw new ClaudeCliProtocolError('Claude CLI emitted more than one result message');
-      }
+      // Long sessions REPEAT result exactly as they repeat init: a ~60-minute implementer
+      // call (CLI 2.1.229) emitted two on what appears to be the same refresh/compaction
+      // boundary, and the old single-result rule killed the call after the work was
+      // committed. The strictness existed to catch a corrupted stream, not a long one —
+      // corruption is still caught below, as any result no init ever announced. The LAST
+      // result wins: it carries the final text, usage, and stop reason; earlier ones are
+      // superseded. Every result must still parse; a malformed one is still fatal.
       const parsedResult = claudeResultMessageSchema.safeParse(value);
       if (!parsedResult.success) {
         throw new ClaudeCliProtocolError(
           `Invalid Claude CLI result message: ${formatIssues(parsedResult.error)}`,
         );
       }
-      result = parsedResult.data;
+      results.push(parsedResult.data);
     }
   }
 
   if (init === undefined) {
     throw new ClaudeCliProtocolError('Claude CLI output is missing its system/init message');
   }
+  const result = results.at(-1);
   if (result === undefined) {
     throw new ClaudeCliProtocolError('Claude CLI output is missing its final result message');
   }
@@ -124,10 +136,15 @@ export function parseClaudeCliStream(stdout: string): ParsedClaudeCliOutput {
       `Unsupported Claude CLI version ${init.claude_code_version}; expected ${SUPPORTED_CLAUDE_CLI_VERSION_RANGE}`,
     );
   }
-  if (!initSessionIds.has(result.session_id)) {
-    throw new ClaudeCliProtocolError(
-      'Claude CLI result session ID matches none of the announced init sessions',
-    );
+  // EVERY result — superseded or winning — must belong to an announced session. Checked
+  // against the full init set after the loop because a refresh boundary may announce the
+  // session after an earlier result was already emitted.
+  for (const candidate of results) {
+    if (!initSessionIds.has(candidate.session_id)) {
+      throw new ClaudeCliProtocolError(
+        'Claude CLI result session ID matches none of the announced init sessions',
+      );
+    }
   }
   if (result.subtype !== 'success' || result.is_error || result.result === undefined) {
     throw new ClaudeCliProtocolError(`Claude CLI reported unsuccessful result ${result.subtype}`);
@@ -138,6 +155,7 @@ export function parseClaudeCliStream(stdout: string): ParsedClaudeCliOutput {
     text: result.result,
     sessionId: result.session_id,
     durationMs: result.duration_ms,
+    resultMessageCount: results.length,
     cliVersion: init.claude_code_version,
     workingDirectory: init.cwd,
     reportedModel: init.model,
