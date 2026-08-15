@@ -15,6 +15,67 @@ codemoot relay run --plan documentation/plan.md --background
 inherited and stdout/stderr in `.cowork/relay/<run-id>.log`; omit it to watch in the
 foreground.
 
+## Every command and argument
+
+The relay is command-line only — there is no MCP tool that starts, resumes, pauses or reads
+a relay run, and no `.cowork.yml` key configures the loop itself (only `models` and `roles`,
+see [Configuration](#configuration)). Nothing below is required except `--plan`; every
+default is stated.
+
+### `codemoot relay run`
+
+| Argument | Required | Default | What it does |
+| --- | --- | --- | --- |
+| `--plan <file>` | **yes** | — | The Markdown plan. Resolved relative to the current directory and stored as an absolute path in the run, so later resumes find it regardless of where you stand. Both models read it off disk themselves; it is never transmitted or rewritten. |
+| `--id <run-id>` | no | generated | Pin the run ID instead of taking a generated one. Useful when a script needs to know the ID before the run exists. |
+| `--max-cycles <n>` | no | `3` | How many FIX rounds one batch may consume before the loop stops and asks you. Not a deadline — there is no wall-clock or token cap. |
+| `--batches <n>` | no | parsed from the plan | Override the batch total. **Read the warning below before using it.** |
+| `--start-batch <n>` | no | `1` | Begin at this batch instead of the first. Batches before it are never opened. |
+| `--review-from <batch>` | no | off | From this batch on, open at the **reviewer**: the work is already implemented and committed, so review it as it stands. No implementer summary is fabricated. FIX loops, the findings floor and the cycle cap run unchanged. Recorded in the run, so a resume needs no re-flagging. |
+| `--background` | no | foreground | Detach the worker; the full parent environment is inherited and output goes to `.cowork/relay/<run-id>.log`. |
+
+**About `--batches`.** The batch total is normally the **highest** `Batch N` number appearing
+in any Markdown heading of the plan — not the count of headings — falling back to 1 when the
+plan has none. `--batches` replaces that number outright. It does not select, limit or skip
+anything: a value above what the plan contains makes the loop open batches the plan never
+describes, and a value below it silently ends the run early. Two things it is **not**:
+
+- It is not the workflow's `--max-batches`, which stops a *workflow* after N fully-complete
+  batches. Same-looking name, different command, different meaning.
+- It is not a way to run one batch. Use `--start-batch` for where to begin, and `relay pause
+  <run-id> --after-batch` for where to stop.
+
+### `codemoot relay resume <run-id>`
+
+| Argument | Required | Default | What it does |
+| --- | --- | --- | --- |
+| `<run-id>` | **yes** | — | The run to continue. |
+| `--decision <choice>` | only at a cycle-cap pause | — | `continue` (one more review cycle), `accept` (the implementer applies the last feedback as final, then the batch advances), or `proceed` (advance as-is). Rejected as invalid at any other kind of pause. |
+| `--background` | no | foreground | As on `run`. |
+
+### `codemoot relay pause <run-id>`
+
+| Argument | Required | Default | What it does |
+| --- | --- | --- | --- |
+| `<run-id>` | **yes** | — | The run to stop. |
+| `--after-batch` | no | stop at the next call boundary | Stop exactly when the current batch is accepted instead. Intent only — the loop honours it at a boundary no external poll can reliably hit. |
+
+### `codemoot relay status <run-id>` / `codemoot relay log <run-id>`
+
+| Argument | Required | Default | What it does |
+| --- | --- | --- | --- |
+| `<run-id>` | **yes** | — | The run to read. |
+| `--full` (`log` only) | no | truncated | Print complete prompts and responses instead of excerpts. |
+
+### There is no `--plan-as-is` here, and none is needed
+
+`--plan-as-is` belongs to `codemoot workflow run`, where a refinement phase would otherwise
+rewrite your plan into generated batch plans and put them through a plan-review gate; the
+flag turns that off. **The relay has no such phase to turn off.** Your plan is used exactly
+as written, always: the relay never transmits, restructures, summarises or re-authors it, and
+its own `Batch N` headings are the decomposition. Passing `--plan-as-is` to `relay run` is an
+error — the flag does not exist on this command.
+
 ## The loop
 
 1. The implementer is told: *do Batch N per the plan*. It works, commits locally, stops on
