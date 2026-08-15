@@ -745,6 +745,138 @@ describe('ReviewWorkflowCodeReviewService', () => {
     expect(result.errorCode).toBe('REVIEWER_MODIFIED_WORKTREE');
   });
 
+  it('AC1: a review reserved but never started is continued by the resumed attempt', async () => {
+    // THE LIVE CASE. The reviewer's command ID is deterministic, so the resumed run derives
+    // the ID its own interrupted attempt already reserved. Attempt 1 stops INSIDE the
+    // reserve-before-invoke window — the receipt is durable, the side effect is still
+    // NOT_STARTED, and no agent was called. Live, the claim itself threw (a unique-index
+    // violation); here the claim is made to throw once. What matters is the state it leaves.
+    await reachImplementationComplete(1, 'implemented\n');
+    const commandId = `${BATCH_ID}:code-review-1`;
+    const realClaim = commandStore.claimSideEffect.bind(commandStore);
+    let claimAttempts = 0;
+    (
+      commandStore as { claimSideEffect: ReviewWorkflowCommandStore['claimSideEffect'] }
+    ).claimSideEffect = (id, identity) => {
+      claimAttempts += 1;
+      if (claimAttempts === 1) throw new Error('Simulated persistence failure inside the claim');
+      return realClaim(id, identity);
+    };
+    const reviewInput = {
+      workflowId: snapshot.workflowId,
+      batchId: BATCH_ID,
+      configuration: snapshot,
+      resolution: reviewerResolution,
+      commandId,
+      sessionIdentityId: 'session-reviewer',
+      reviewRoundId: deriveCodeReviewRoundId(BATCH_ID, 1),
+    } as const;
+    const invocationsBefore = roleInvoker.invocationsPerformed;
+    await expect(
+      codeReviewService.review({
+        ...reviewInput,
+        actorExecutionId: 'actor-review-attempt-1',
+        invocationId: 'invocation-review-attempt-1',
+        transcriptId: 'review-transcript-attempt-1',
+        buildPrompt: () => 'Review the complete batch.',
+      }),
+    ).rejects.toThrow(/Simulated persistence failure inside the claim/);
+    const orphan = commandStore.get(commandId);
+    expect(orphan?.receipt.status).toBe('RESERVED');
+    expect(orphan?.sideEffect?.state).toBe('NOT_STARTED');
+    expect(orphan?.receipt.sideEffectIdentity).toBeUndefined();
+    expect(roleInvoker.invocationsPerformed).toBe(invocationsBefore); // the reviewer never ran
+
+    // The resumed attempt — a new, honestly-attested requester on the SAME command ID.
+    roleInvoker.enqueue({
+      fromPrompt: (prompt) => {
+        const parsed = JSON.parse(prompt) as {
+          target: { reviewedCommitSha: string; reviewRangeEvidenceId: string; patchHash: string };
+        };
+        return reviewTranscript({ ...parsed.target, verdict: 'APPROVED', findings: [] });
+      },
+    });
+    const resumed = await codeReviewService.review({
+      ...reviewInput,
+      actorExecutionId: 'actor-review-attempt-2',
+      invocationId: 'invocation-review-attempt-2',
+      transcriptId: 'review-transcript-attempt-2',
+      buildPrompt: (evidence) => JSON.stringify({ target: evidence.target }),
+    });
+    expect(resumed.status).toBe('VERIFYING');
+    expect(roleInvoker.invocationsPerformed).toBe(invocationsBefore + 1); // reviewer ran once
+
+    // The live command is the resumed attempt's, completed; the abandoned reservation is
+    // archived beside it rather than destroyed.
+    const completed = commandStore.get(commandId);
+    expect(completed?.receipt.status).toBe('SUCCEEDED');
+    // The live receipt belongs to the RESUMED attempt: its requester, expected version and
+    // evidence describe the world the review actually ran against, not the abandoned one.
+    expect(completed?.request.requester.actorExecutionId).not.toBe(
+      orphan?.request.requester.actorExecutionId,
+    );
+    const archived = db
+      .prepare(
+        `SELECT command_id, status FROM review_workflow_command_receipts
+         WHERE command_id LIKE ?`,
+      )
+      .all(`${commandId}:superseded:%`) as { command_id: string; status: string }[];
+    expect(archived).toHaveLength(1);
+    expect(archived[0]?.status).toBe('RESERVED');
+  });
+
+  it('AC4: a reservation for a different operation under the same ID still rejects', async () => {
+    await reachImplementationComplete(1, 'implemented\n');
+    const commandId = `${BATCH_ID}:code-review-1`;
+    const batch = store.workflowStore.getBatch(BATCH_ID);
+    if (batch === null) throw new Error('The batch fixture is missing');
+    // Clean and unstarted — but reserved for a different command entirely.
+    commandStore.reserve(
+      {
+        commandId,
+        workflowId: snapshot.workflowId,
+        batchId: BATCH_ID,
+        expectedAggregateVersion: batch.aggregateVersion,
+        canonicalRequestHash: 'hash-foreign',
+        requester: {
+          actorExecutionId: 'actor-foreign',
+          actorType: 'HUMAN',
+          authoritiesExercised: ['WORKFLOW_OWNER'],
+          identityAssurance: 'CLI_ASSERTED',
+          observedEvidence: [],
+          startedAt: NOW,
+        },
+        authorityExercised: 'WORKFLOW_OWNER',
+        command: { type: 'BLOCK_BATCH', reason: 'Waiting for external evidence.' },
+      },
+      'AGENT_INVOCATION',
+    );
+    const invocationsBefore = roleInvoker.invocationsPerformed;
+    await expect(
+      codeReviewService.review({
+        workflowId: snapshot.workflowId,
+        batchId: BATCH_ID,
+        configuration: snapshot,
+        resolution: reviewerResolution,
+        commandId,
+        actorExecutionId: 'actor-review-collision',
+        invocationId: 'invocation-review-collision',
+        sessionIdentityId: 'session-reviewer',
+        transcriptId: 'review-transcript-collision',
+        reviewRoundId: deriveCodeReviewRoundId(BATCH_ID, 1),
+        buildPrompt: () => 'Review the complete batch.',
+      }),
+    ).rejects.toMatchObject({ code: 'COMMAND_ALREADY_RESERVED' });
+    expect(roleInvoker.invocationsPerformed).toBe(invocationsBefore);
+    // The foreign reservation is untouched — nothing was superseded.
+    expect(commandStore.get(commandId)?.request.command.type).toBe('BLOCK_BATCH');
+    expect(
+      db.prepare('SELECT COUNT(*) AS count FROM review_workflow_superseded_commands').get() as {
+        count: number;
+      },
+    ).toEqual({ count: 0 });
+  });
+
   it('reserves and claims the invocation durably before the reviewer runs', async () => {
     await reachImplementationComplete(1, 'implemented\n');
     const commandId = `${BATCH_ID}:code-review-crash`;

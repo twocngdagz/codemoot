@@ -178,6 +178,19 @@ then could not be recovered:
   rejects, a claim naming files the batch never touched still rejects, an agent attempt
   ending with a dirty worktree still rejects, and another batch's commits (before this
   batch's base) never count.
+- **A reservation does not block its own resume.** Reserve-before-invoke makes the receipt
+  durable BEFORE the external call, so a stop inside that window leaves a reservation that
+  did nothing: receipt `RESERVED`, side effect `NOT_STARTED`, no bound identity. Because the
+  command IDs are deterministic, the resumed run derives the ID its own interrupted attempt
+  holds. Such a reservation is now SUPERSEDED (archived under `:superseded:n`, never
+  destroyed) and re-reserved with the current attempt's request — its expected aggregate
+  version, target commit and evidence describe the world the work actually runs against,
+  not the abandoned one. The distinction is read from the reservation's own state, never by
+  relaxing a constraint: a command that started or completed its side effect still replays
+  or conflicts and is never re-run, and a reservation for a DIFFERENT operation under a
+  colliding ID is still refused. (This is the same family as the identifiers above, one
+  layer out: an interrupted attempt's leftovers must never be mistaken for work that
+  happened.)
 
 ## Monitoring
 `workflow watch` streams durable heartbeats (each carrying worker, batch, phase, current

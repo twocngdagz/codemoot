@@ -191,3 +191,127 @@ describe('releaseFailedFinalReservation', () => {
     expect(commands.reserve(request('run-1')).replayed).toBe(false);
   });
 });
+
+// Reserve-before-invoke opens a second window the sweep above cannot reach. A run stopped
+// BETWEEN reserving and starting leaves a receipt that is RESERVED, not FAILED_FINAL — so
+// `releaseRetryableReservations` skips it forever, while the deterministic command ID means
+// the next attempt derives the same ID and collides with the corpse of its own predecessor.
+describe('releaseUnstartedReservation', () => {
+  let dir: string;
+  let db: ReturnType<typeof openDatabase>;
+  let commands: ReviewWorkflowCommandStore;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'codemoot-unstarted-'));
+    db = openDatabase(join(dir, 'test.db'));
+    const store = new ReviewWorkflowStore(db);
+    store.createWorkflow({
+      workflowId: WORKFLOW_ID,
+      status: 'ACTIVE',
+      generalPlanVersionId: 'general-plan-1',
+      implementerAssignmentId: 'assignment-implementer',
+      reviewerAssignmentId: 'assignment-reviewer',
+      configurationHash: 'configuration-hash',
+      createdAt: '2026-08-02T00:00:00.000Z',
+      updatedAt: '2026-08-02T00:00:00.000Z',
+    });
+    commands = new ReviewWorkflowCommandStore(db);
+  });
+
+  afterEach(() => {
+    db.close();
+    if (existsSync(dir)) rmSync(dir, { recursive: true, force: true });
+  });
+
+  /** Exactly the live shape: receipt RESERVED, side effect NOT_STARTED, identity NULL. */
+  function reserveWithoutStarting(suffix: string): void {
+    commands.reserve(request(suffix), 'AGENT_INVOCATION');
+  }
+
+  it('reproduces the block: the sweep for failed commands cannot reach it', () => {
+    reserveWithoutStarting('run-9');
+    expect(commands.releaseRetryableReservations(WORKFLOW_ID, BATCH_ID, 'retry')).toEqual([]);
+    expect(() => commands.releaseFailedFinalReservation(COMMAND_ID, 'retry')).toThrow(
+      /not FAILED_FINAL/,
+    );
+    expect(() => commands.reserve(request('run-10'), 'AGENT_INVOCATION')).toThrow(
+      /already reserved for a different/,
+    );
+  });
+
+  it('AC1: frees the ID, and the resumed attempt reserves and starts its own side effect', () => {
+    reserveWithoutStarting('run-9');
+    expect(commands.releaseUnstartedReservation(COMMAND_ID, 'resumed attempt')).toBe(true);
+    expect(commands.reserve(request('run-10'), 'AGENT_INVOCATION').replayed).toBe(false);
+    expect(commands.claimSideEffect(COMMAND_ID, 'invocation-run-10').shouldInvoke).toBe(true);
+  });
+
+  it('preserves the abandoned reservation rather than destroying it', () => {
+    reserveWithoutStarting('run-9');
+    commands.releaseUnstartedReservation(COMMAND_ID, 'Unstarted reservation superseded');
+    const archived = db
+      .prepare('SELECT command_id, reason, receipt_json FROM review_workflow_superseded_commands')
+      .all() as { command_id: string; reason: string; receipt_json: string }[];
+    expect(archived).toHaveLength(1);
+    expect(archived[0]?.reason).toBe('Unstarted reservation superseded');
+    // The archived receipt keeps the abandoned attempt's requester on the record.
+    expect(JSON.parse(String(archived[0]?.receipt_json)).request.requester.actorExecutionId).toBe(
+      actor('run-9').actorExecutionId,
+    );
+    // Its side-effect row followed the receipt to the superseded ID; nothing was deleted.
+    const sideEffects = db
+      .prepare('SELECT command_id, state FROM review_workflow_command_side_effects')
+      .all() as { command_id: string; state: string }[];
+    expect(sideEffects).toHaveLength(1);
+    expect(sideEffects[0]?.command_id).toMatch(/:superseded:\d+$/);
+    expect(sideEffects[0]?.state).toBe('NOT_STARTED');
+  });
+
+  it('AC3: refuses a reservation whose side effect already started', () => {
+    reserveWithoutStarting('run-9');
+    commands.claimSideEffect(COMMAND_ID, 'invocation-run-9');
+    expect(() => commands.releaseUnstartedReservation(COMMAND_ID, 'retry')).toThrow(
+      /not RESERVED, and is not an unstarted reservation/,
+    );
+  });
+
+  it('AC3: refuses a reservation bound to an identity even if the side effect row lags', () => {
+    // Belt and braces: the claim binds the receipt and moves the side effect in one
+    // transaction, so a bound identity alone proves the external call may have been made.
+    reserveWithoutStarting('run-9');
+    db.prepare(
+      'UPDATE review_workflow_command_receipts SET side_effect_identity = ? WHERE command_id = ?',
+    ).run('invocation-run-9', COMMAND_ID);
+    expect(() => commands.releaseUnstartedReservation(COMMAND_ID, 'retry')).toThrow(
+      /bound to side-effect identity/,
+    );
+  });
+
+  it('AC3: refuses a terminally failed reservation — that is the other release', () => {
+    reserveWithoutStarting('run-9');
+    commands.recordOutcome({
+      commandId: COMMAND_ID,
+      status: 'FAILED_FINAL',
+      errorCode: 'STOPPED',
+      resultHash: 'result-hash',
+      result: { code: 'STOPPED' },
+    });
+    expect(() => commands.releaseUnstartedReservation(COMMAND_ID, 'retry')).toThrow(
+      /is FAILED_FINAL, not RESERVED/,
+    );
+  });
+
+  it('AC3: refuses a reservation that recorded durable state', () => {
+    reserveWithoutStarting('run-9');
+    db.prepare(
+      'UPDATE review_workflow_command_receipts SET resulting_aggregate_version = 1 WHERE command_id = ?',
+    ).run(COMMAND_ID);
+    expect(() => commands.releaseUnstartedReservation(COMMAND_ID, 'retry')).toThrow(
+      /recorded durable state/,
+    );
+  });
+
+  it('reports nothing to release when the command never existed', () => {
+    expect(commands.releaseUnstartedReservation(COMMAND_ID, 'retry')).toBe(false);
+  });
+});

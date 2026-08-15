@@ -1,6 +1,5 @@
 import { createHash } from 'node:crypto';
 import type { ReviewWorkflowCommandStore } from '../memory/review-workflow-command-store.js';
-import { generateId } from '../utils/id.js';
 import { parseImplementationResult } from '../review-workflow-contracts/parser.js';
 import type { ReviewWorkflowContractService } from '../review-workflow-contracts/service.js';
 import type {
@@ -30,6 +29,8 @@ import type {
   RoleInvocationInput,
   RoleInvocationService,
 } from '../roles/role-invocation.js';
+import { generateId } from '../utils/id.js';
+import { type ReservationExpectation, planReservation } from './reservation.js';
 import type { ReviewWorkflowImplementationStore } from './store.js';
 import {
   type CompleteImplementationInput,
@@ -70,7 +71,12 @@ export class ReviewWorkflowImplementationService {
     const context = this.requireContext(input.workflowId, input.batchId, input.configuration);
     this.requireImplementerResolution(input.resolution, input.configuration);
     this.requireState(context.batch, 'APPROVED_FOR_IMPLEMENTATION');
-    this.requireCommandAvailable(input.commandId);
+    this.requireCommandReservable(input.commandId, {
+      workflowId: input.workflowId,
+      batchId: input.batchId,
+      commandType: 'START_IMPLEMENTATION',
+      sideEffectKind: 'AGENT_INVOCATION',
+    });
     const before = this.repository.readWorktree();
     this.requireCleanImplementationBase(context.batch, before);
 
@@ -160,7 +166,12 @@ export class ReviewWorkflowImplementationService {
     if (context.batch.persistedState === 'NEEDS_REVISION') {
       this.requireCorrectionPassAvailable(context.batch, context.configuration);
     }
-    this.requireCommandAvailable(input.commandId);
+    this.requireCommandReservable(input.commandId, {
+      workflowId: input.workflowId,
+      batchId: input.batchId,
+      commandType: 'RESUME_IMPLEMENTATION',
+      sideEffectKind: 'AGENT_INVOCATION',
+    });
     const before = this.repository.readWorktree();
     const sessionForEvidence = input.previousSessionIdentityId ?? input.sessionIdentityId;
     const command: TransitionCommand = {
@@ -238,7 +249,12 @@ export class ReviewWorkflowImplementationService {
     const context = this.requireContext(input.workflowId, input.batchId, input.configuration);
     this.requireImplementerResolution(input.resolution, input.configuration);
     this.requireState(context.batch, 'IMPLEMENTING');
-    this.requireCommandAvailable(input.commandId);
+    this.requireCommandReservable(input.commandId, {
+      workflowId: input.workflowId,
+      batchId: input.batchId,
+      commandType: 'RESUME_IMPLEMENTATION',
+      sideEffectKind: 'AGENT_INVOCATION',
+    });
     this.validateAttemptNumber(context.batch, input.attemptNumber);
     if (
       this.successfulAttemptCount(input.batchId) >=
@@ -694,13 +710,46 @@ export class ReviewWorkflowImplementationService {
     }
   }
 
-  private requireCommandAvailable(commandId: string): void {
-    if (this.commandStore.get(commandId) !== null) {
+  /**
+   * Fail-fast precondition: refuse a taken command ID before paying for the worktree reads
+   * and the prompt. A reservation that never started is NOT taken — it is superseded at
+   * reserve time by `reserveInvocationCommand`, which re-asks the same question there.
+   */
+  private requireCommandReservable(commandId: string, expected: ReservationExpectation): void {
+    const plan = planReservation(this.commandStore.get(commandId), expected);
+    if (plan.action === 'BLOCK') {
       throw new ReviewWorkflowImplementationError(
         'COMMAND_ALREADY_RESERVED',
-        `Command ${commandId} has already reserved its external side effect`,
+        `Command ${commandId} has already reserved its external side effect: ${plan.reason}`,
       );
     }
+  }
+
+  /**
+   * Reserves the invocation command, superseding an unstarted reservation left by an
+   * interrupted attempt so a resumed run can continue work it had only reserved.
+   */
+  private reserveInvocationCommand(
+    request: StateChangingCommandRequest,
+    sideEffectKind: 'AGENT_INVOCATION',
+  ): void {
+    const expected: ReservationExpectation = {
+      workflowId: request.workflowId,
+      batchId: request.batchId,
+      commandType: request.command.type,
+      sideEffectKind,
+    };
+    const plan = planReservation(this.commandStore.get(request.commandId), expected);
+    if (plan.action === 'BLOCK') {
+      throw new ReviewWorkflowImplementationError(
+        'COMMAND_ALREADY_RESERVED',
+        `Command ${request.commandId} has already reserved its external side effect: ${plan.reason}`,
+      );
+    }
+    if (plan.action === 'SUPERSEDE_THEN_RESERVE') {
+      this.commandStore.releaseUnstartedReservation(request.commandId, plan.reason);
+    }
+    this.commandStore.reserve(request, sideEffectKind);
   }
 
   private requireImplementerResolution(
@@ -1055,7 +1104,7 @@ export class ReviewWorkflowImplementationService {
     invocationId: string,
     invoke: () => Promise<PreparedRoleInvocation>,
   ): Promise<PreparedRoleInvocation> {
-    this.commandStore.reserve(request, 'AGENT_INVOCATION');
+    this.reserveInvocationCommand(request, 'AGENT_INVOCATION');
     this.commandStore.claimSideEffect(request.commandId, invocationId);
     let prepared: PreparedRoleInvocation;
     try {
