@@ -33,6 +33,7 @@ import {
   parseCursorCliStream,
 } from './cursor-cli-protocol.js';
 import type { ParsedCursorCliOutput } from './cursor-cli-protocol.js';
+import { DEFAULT_LIVENESS_PROBE, type LivenessProbeConfig } from './process-liveness.js';
 
 const RAW_OUTPUT_MULTIPLIER = 4;
 const MIN_RAW_CAPTURE_BYTES = 32 * 1024 * 1024;
@@ -128,6 +129,7 @@ export class CursorCliAdapter implements CliBridge {
   private readonly projectDir: string;
   private readonly defaultTimeout: number;
   private readonly defaultIdleTimeout: number;
+  private readonly liveness: LivenessProbeConfig;
   private readonly envAllowlist: readonly string[];
 
   constructor(config: {
@@ -137,6 +139,7 @@ export class CursorCliAdapter implements CliBridge {
     projectDir?: string;
     timeout?: number;
     idleTimeout?: number;
+    liveness?: LivenessProbeConfig;
     envAllowlist?: readonly string[];
   }) {
     this.command = config.command ?? defaultCursorCommand();
@@ -145,6 +148,7 @@ export class CursorCliAdapter implements CliBridge {
     this.projectDir = resolve(config.projectDir ?? process.cwd());
     this.defaultTimeout = config.timeout ?? DEFAULT_TIMEOUT_MS;
     this.defaultIdleTimeout = config.idleTimeout ?? DEFAULT_IDLE_TIMEOUT_MS;
+    this.liveness = config.liveness ?? DEFAULT_LIVENESS_PROBE;
     this.envAllowlist = config.envAllowlist ?? [];
   }
 
@@ -202,6 +206,7 @@ export class CursorCliAdapter implements CliBridge {
         model: this.model,
         timeout: options?.timeout ?? this.defaultTimeout,
         idleTimeout: options?.idleTimeout ?? this.defaultIdleTimeout,
+        liveness: this.liveness,
         maxCaptureBytes: Math.max(
           MIN_RAW_CAPTURE_BYTES,
           MAX_OUTPUT_BYTES * RAW_OUTPUT_MULTIPLIER,

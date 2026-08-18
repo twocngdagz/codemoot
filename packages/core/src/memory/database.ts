@@ -7,7 +7,7 @@ import {
   REVIEW_WORKFLOW_RUNNER_STATE_DDL,
 } from './review-workflow-schema.js';
 
-const SCHEMA_VERSION = '24';
+const SCHEMA_VERSION = '25';
 
 const MIGRATIONS = [
   // Sessions
@@ -449,6 +449,18 @@ export function runMigrations(db: Database.Database): void {
       db.exec('ALTER TABLE review_workflow_runner_state ADD COLUMN max_batches INTEGER');
     } catch {
       // Column already exists
+    }
+
+    // v25: the last failure is a COLUMN, not something a reader has to reconstruct by
+    // scanning the event log. Several worker deaths left a run STOPPED with nothing saying
+    // why, and noticing them needed an external babysitter watching for silence. `relay
+    // status` reads these two fields, so a stalled run explains itself.
+    for (const column of ['last_failure TEXT', 'last_failure_at TEXT']) {
+      try {
+        db.exec(`ALTER TABLE relay_runs ADD COLUMN ${column}`);
+      } catch {
+        // Column already exists
+      }
     }
 
     // v21: the transcript records WHICH MODEL produced each response. A live run swapped

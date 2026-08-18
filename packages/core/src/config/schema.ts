@@ -26,6 +26,24 @@ export const cliAdapterConfigSchema = z.object({
    * `--effort`, large prompts) can think silently for minutes, so this must be raisable.
    */
   idleTimeout: z.number().positive().optional(),
+  /**
+   * How stream silence is judged at the idle deadline. Silence means two opposite things —
+   * an agent running a long local test suite, and a CLI whose HTTP stream has wedged — so
+   * before enforcing the deadline the OS is asked whether the child's process tree has
+   * actually burned CPU. Defaults probe; `enabled: false` restores "the deadline is the
+   * verdict".
+   */
+  liveness: z
+    .object({
+      enabled: z.boolean().default(true),
+      /** Fraction of ONE core the child tree must use while silent to count as working. */
+      minCpuRatio: z.number().min(0).max(64).default(0.01),
+      /** Seconds each granted extension lasts — also the measurement window. */
+      probeInterval: z.number().positive().default(60),
+      /** Ceiling on extensions per call; the absolute `timeout` still applies. */
+      maxExtensions: z.number().int().min(0).max(1000).default(30),
+    })
+    .optional(),
   versionConstraint: z.string().min(1).optional(),
   outputFile: z.string().optional(),
   maxOutputBytes: z.number().int().positive().optional(),
@@ -269,6 +287,35 @@ const outputConfigSchema = z.object({
 
 const executionModeSchema = z.enum(['autonomous', 'interactive', 'dashboard']);
 
+/**
+ * The relay's own knobs. Every default is the behaviour that survives a wedged CLI, because
+ * an operator should not have to have already been burned to be protected.
+ */
+const relayConfigSchema = z.object({
+  /**
+   * Interrupted attempts on one step before the next attempt starts a FRESH CLI session
+   * instead of resuming the stored one. A resumed session accumulates one reconcile note per
+   * interruption, and a live run watched that conversation wedge permanently — eight hours,
+   * ~8 seconds of CPU — while a fresh conversation completed the same step in 18 minutes.
+   * 0 disables the mechanism and always resumes, which is the pre-hardening behaviour.
+   */
+  freshSessionAfterInterrupts: z.number().int().min(0).max(20).default(1),
+  /** The raw per-call adapter stream, kept on disk so a freeze can be read afterwards. */
+  callStream: z
+    .object({
+      enabled: z.boolean().default(true),
+      /** Bytes kept per call; the tail is dropped once the cap is reached. */
+      maxBytesPerCall: z
+        .number()
+        .int()
+        .positive()
+        .default(20 * 1024 * 1024),
+      /** How many per-call files to keep per run; the oldest are removed. */
+      keepCalls: z.number().int().positive().max(10_000).default(200),
+    })
+    .default({}),
+});
+
 const advancedConfigSchema = z.object({
   retryAttempts: z.number().int().positive().max(10).default(3),
   stream: z.boolean().default(true),
@@ -293,6 +340,7 @@ export const projectConfigSchema = z
     memory: memoryConfigSchema.default({}),
     budget: budgetConfigSchema.default({}),
     output: outputConfigSchema.default({}),
+    relay: relayConfigSchema.default({}),
     advanced: advancedConfigSchema.default({}),
   })
   .superRefine((data, ctx) => {

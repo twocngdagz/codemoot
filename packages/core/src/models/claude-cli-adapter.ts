@@ -20,6 +20,13 @@ import {
   killProcessTree,
 } from './cli-adapter.js';
 import { collectCliRuntimeEvidence } from './cli-runtime-evidence.js';
+import {
+  type CpuSampler,
+  DEFAULT_LIVENESS_PROBE,
+  type LivenessProbeConfig,
+  probeLocalActivity,
+  sampleProcessTreeCpuSeconds,
+} from './process-liveness.js';
 
 const RAW_OUTPUT_MULTIPLIER = 4;
 const DEFAULT_TIMEOUT_MS = 600_000;
@@ -169,6 +176,7 @@ export class ClaudeCliAdapter implements CliBridge {
   private readonly projectDir: string;
   private readonly defaultTimeout: number;
   private readonly defaultIdleTimeout: number;
+  private readonly liveness: LivenessProbeConfig;
   private readonly envAllowlist: readonly string[];
 
   constructor(config: {
@@ -178,6 +186,7 @@ export class ClaudeCliAdapter implements CliBridge {
     projectDir?: string;
     timeout?: number;
     idleTimeout?: number;
+    liveness?: LivenessProbeConfig;
     envAllowlist?: readonly string[];
   }) {
     this.command = config.command ?? defaultClaudeCommand();
@@ -186,6 +195,7 @@ export class ClaudeCliAdapter implements CliBridge {
     this.projectDir = resolve(config.projectDir ?? process.cwd());
     this.defaultTimeout = config.timeout ?? DEFAULT_TIMEOUT_MS;
     this.defaultIdleTimeout = config.idleTimeout ?? DEFAULT_IDLE_TIMEOUT_MS;
+    this.liveness = config.liveness ?? DEFAULT_LIVENESS_PROBE;
     this.envAllowlist = config.envAllowlist ?? [];
   }
 
@@ -231,6 +241,7 @@ export class ClaudeCliAdapter implements CliBridge {
       model: this.model,
       timeout: options?.timeout ?? this.defaultTimeout,
       idleTimeout: options?.idleTimeout ?? this.defaultIdleTimeout,
+      liveness: this.liveness,
       // The raw-capture cap answers a different question from the result-truncation
       // limit: it must hold the FULL stream-json transcript, which with
       // --include-partial-messages runs 1.5-2 MB for a single plan refinement. A floor
@@ -362,6 +373,14 @@ export async function runStreamingCliProcess(input: {
   label?: string;
   /** Prompt on stdin (Claude) or already passed as an argument (Cursor). */
   promptViaStdin?: boolean;
+  /**
+   * How silence is judged. Omitted means the default probe: at the idle deadline, ask the
+   * OS whether the child's process tree has actually burned CPU, and only kill when it has
+   * not. `{ enabled: false }` restores the pre-probe behaviour — the deadline is the verdict.
+   */
+  liveness?: LivenessProbeConfig;
+  /** Test seam: read CPU time from here instead of `ps`. */
+  cpuSampler?: CpuSampler;
   options?: ClaudeCallOptions;
 }): Promise<ProcessResult> {
   const label = input.label ?? 'Claude CLI';
@@ -379,6 +398,7 @@ export async function runStreamingCliProcess(input: {
     let stdoutBytes = 0;
     let processId: number | undefined;
     let idleTimer: NodeJS.Timeout | undefined;
+    let baselineTimer: NodeJS.Timeout | undefined;
     let heartbeatTimer: NodeJS.Timeout | undefined;
 
     const child = spawn(input.command, [...input.args], {
@@ -393,6 +413,7 @@ export async function runStreamingCliProcess(input: {
     const cleanup = (): void => {
       clearTimeout(absoluteTimer);
       if (idleTimer !== undefined) clearTimeout(idleTimer);
+      if (baselineTimer !== undefined) clearTimeout(baselineTimer);
       if (heartbeatTimer !== undefined) clearInterval(heartbeatTimer);
       input.options?.signal?.removeEventListener('abort', onAbort);
     };
@@ -407,19 +428,82 @@ export async function runStreamingCliProcess(input: {
     };
     const elapsedDescription = (): string =>
       `elapsed ${Date.now() - startedAtDate.getTime()}ms, last activity ${Date.now() - lastActivityAt}ms ago`;
+    // Silence alone is not a verdict. A healthy agent running a local test suite is silent
+    // for minutes; a wedged CLI is silent forever. At the deadline the OS is asked which one
+    // this is — CPU burned by the child's process tree since the last look — and the call
+    // survives only while it is provably working. See process-liveness.ts.
+    const liveness = input.liveness ?? DEFAULT_LIVENESS_PROBE;
+    let cpuBaseline: number | undefined;
+    let cpuBaselineAt = Date.now();
+    let extensionsGranted = 0;
+    const armIdleTimer = (delayMs: number): void => {
+      if (idleTimer !== undefined) clearTimeout(idleTimer);
+      idleTimer = setTimeout(onIdleDeadline, delayMs);
+    };
+    // The baseline is taken HALF WAY through the silence, not at expiry: sampling on every
+    // chunk would mean a `ps` per chunk, and sampling only at expiry would mean the first
+    // deadline has nothing to compare against and a wedged call outlives its own timeout.
+    // Output resets this along with the deadline, so a talkative call never samples at all.
+    const armBaselineSampler = (delayMs: number): void => {
+      if (baselineTimer !== undefined) clearTimeout(baselineTimer);
+      baselineTimer = setTimeout(
+        () => {
+          if (settled || child.pid === undefined) return;
+          const sampler = input.cpuSampler ?? sampleProcessTreeCpuSeconds;
+          const sample = sampler(child.pid);
+          if (sample !== null) {
+            cpuBaseline = sample;
+            cpuBaselineAt = Date.now();
+          }
+        },
+        Math.max(1, Math.floor(delayMs / 2)),
+      );
+    };
+    const onIdleDeadline = (): void => {
+      if (settled) return;
+      const verdict = probeLocalActivity({
+        pid: child.pid,
+        previousCpuSeconds: cpuBaseline,
+        windowMs: Date.now() - cpuBaselineAt,
+        extensionsGranted,
+        config: liveness,
+        ...(input.cpuSampler === undefined ? {} : { sampler: input.cpuSampler }),
+      });
+      if (verdict.cpuSeconds !== undefined) {
+        cpuBaseline = verdict.cpuSeconds;
+        cpuBaselineAt = Date.now();
+      }
+      if (verdict.decision === 'EXTEND') {
+        extensionsGranted += 1;
+        invokeCallback(() =>
+          input.options?.onIdleExtended?.({
+            reason: verdict.detail,
+            extension: extensionsGranted,
+            silentMs: Date.now() - lastActivityAt,
+          }),
+        );
+        armIdleTimer(liveness.probeIntervalMs);
+        armBaselineSampler(liveness.probeIntervalMs);
+        return;
+      }
+      killProcessTree(child.pid);
+      fail(
+        new ModelError(
+          `${label} idle timeout (no output for ${input.idleTimeout}ms, ${elapsedDescription()}; ${verdict.detail})`,
+          input.provider,
+          input.model,
+        ),
+      );
+    };
     const resetIdleTimer = (): void => {
       lastActivityAt = Date.now();
-      if (idleTimer !== undefined) clearTimeout(idleTimer);
-      idleTimer = setTimeout(() => {
-        killProcessTree(child.pid);
-        fail(
-          new ModelError(
-            `${label} idle timeout (no output for ${input.idleTimeout}ms, ${elapsedDescription()})`,
-            input.provider,
-            input.model,
-          ),
-        );
-      }, input.idleTimeout);
+      // Output means the previous silence is over: the next deadline starts from scratch,
+      // with no inherited baseline and a fresh extension allowance.
+      cpuBaseline = undefined;
+      cpuBaselineAt = Date.now();
+      extensionsGranted = 0;
+      armIdleTimer(input.idleTimeout);
+      if (liveness.enabled) armBaselineSampler(input.idleTimeout);
     };
     const onAbort = (): void => {
       killProcessTree(child.pid);

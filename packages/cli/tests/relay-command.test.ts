@@ -4,7 +4,15 @@
 // the event log alone is enough to resume from any interruption, with no ceremony.
 
 import { execFileSync, spawn } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -20,6 +28,8 @@ import {
 import { getDbPath } from '../src/utils.js';
 
 const FAKE = fileURLToPath(new URL('./fixtures/fake-claude-relay.mjs', import.meta.url));
+// The BUILT cli, for the one test that needs a worker in its own process to kill.
+const CLI_ENTRY = fileURLToPath(new URL('../dist/index.js', import.meta.url));
 
 // Every ADVANCING verdict in these fixtures carries a findings body above the floor —
 // a verdict without findings is now refused, because a live run once advanced an
@@ -96,11 +106,18 @@ describe('codemoot relay (real command, two scripted models)', () => {
   let cwdSpy: ReturnType<typeof vi.spyOn>;
   let logSpy: ReturnType<typeof vi.spyOn>;
 
-  function writeConfig(): void {
+  /**
+   * `retryAttempts: 1` — ONE attempt, no retry — is what every test below was written
+   * against, and it keeps each of them asserting the thing it was written to guard: an
+   * empty reply, a failed resume or an adapter crash surfaces as itself instead of being
+   * absorbed by the retry loop. The retry loop has its own tests, which raise this.
+   */
+  function writeConfig(retryAttempts = 1): void {
     writeFileSync(
       join(projectDir, '.cowork.yml'),
       JSON.stringify({
         configVersion: 3,
+        advanced: { retryAttempts },
         // Deliberately NOT review-gated: the relay needs models and roles, nothing else.
         models: {
           implementer: {
@@ -1006,5 +1023,203 @@ describe('codemoot relay (real command, two scripted models)', () => {
     db.close();
     expect(models.find((m) => m.role === 'IMPLEMENTER')?.model).toBe('claude-opus-5');
     expect(models.find((m) => m.role === 'REVIEWER')?.model).toBe('claude-fable-5');
+  });
+
+  // ── Hardening against a wedged CLI (the usi-l9 post-mortem, 14 hours on 2026-08-17/18) ──
+  //
+  // `cursor-agent` wedges mid-call: the process lives, its HTTP stream is dead, and it emits
+  // nothing ever again. That is a documented upstream bug, so the relay has to stay correct
+  // and diagnosable when it happens rather than assume it will not.
+
+  it('AC1: an interrupted step retries, and a repeatedly-stalled session is RETIRED', async () => {
+    // The live shape: ten consecutive interrupted implementer attempts on one step, every
+    // one re-sent into the SAME cursor session with another reconcile note stacked on top,
+    // until the conversation stopped answering at all — an eight-hour hang. Clearing the
+    // stored session ended it; the fresh conversation finished the step in 18 minutes.
+    // Batch 1 must succeed first, because a session can only poison itself once it exists.
+    writeConfig(2);
+    writeFileSync(implFile, JSON.stringify(['Did batch 1.', '__CRASH__', 'Fixed it.']));
+    writeFileSync(
+      revFile,
+      JSON.stringify(['needs work\nVERDICT: FIX', `${FINDINGS}VERDICT: COMPLETE`]),
+    );
+
+    await relayRunCommand({ plan: 'plan.md', id: 'relay-retire', maxCycles: 3 });
+
+    const log = events('relay-retire');
+    // The interrupted fix attempt was retried in place — no human, no second command.
+    expect(log.filter((e) => e.role === 'IMPLEMENTER' && e.kind === 'PROMPT')).toHaveLength(3);
+    // ...and the retry says, in the transcript, that it abandoned the stalled conversation.
+    const retirement = log.find(
+      (e) => e.role === 'RELAY' && e.kind === 'NOTE' && e.content.includes('FRESH session'),
+    );
+    expect(retirement?.content).toContain('IMPLEMENTER session');
+    expect(retirement?.content).toContain('was interrupted 1 time(s)');
+
+    // The proof that matters: the retry did NOT resume the session that just stalled.
+    const calls = readFileSync(`${implFile}.prompts.jsonl`, 'utf8')
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line) as { resumedSessionId: string | null });
+    expect(calls).toHaveLength(3);
+    expect(calls[1]?.resumedSessionId).not.toBeNull(); // the fix call resumed, as always
+    expect(calls[2]?.resumedSessionId).toBeNull(); // the retry started over
+  });
+
+  it('AC1: freshSessionAfterInterrupts: 0 keeps resuming — the mechanism is opt-out', async () => {
+    // The knob has to be able to be off, or "it is now always fresh" is a claim nobody can
+    // check. Same interruption, threshold disabled: the retry resumes exactly as before.
+    writeConfig(2);
+    const config = JSON.parse(readFileSync(join(projectDir, '.cowork.yml'), 'utf8')) as Record<
+      string,
+      unknown
+    >;
+    writeFileSync(
+      join(projectDir, '.cowork.yml'),
+      JSON.stringify({ ...config, relay: { freshSessionAfterInterrupts: 0 } }),
+    );
+    writeFileSync(implFile, JSON.stringify(['Did batch 1.', '__CRASH__', 'Fixed it.']));
+    writeFileSync(
+      revFile,
+      JSON.stringify(['needs work\nVERDICT: FIX', `${FINDINGS}VERDICT: COMPLETE`]),
+    );
+
+    await relayRunCommand({ plan: 'plan.md', id: 'relay-keep-session', maxCycles: 3 });
+
+    expect(events('relay-keep-session').some((e) => e.content.includes('FRESH session'))).toBe(
+      false,
+    );
+    const calls = readFileSync(`${implFile}.prompts.jsonl`, 'utf8')
+      .trim()
+      .split('\n')
+      .map((line) => JSON.parse(line) as { resumedSessionId: string | null });
+    expect(calls[2]?.resumedSessionId).not.toBeNull();
+  });
+
+  it('AC2: a failed call is RETRIED in place, and every attempt is on the record', async () => {
+    // Before: one failure ended the worker and the run waited for a person to notice.
+    writeConfig(3);
+    writeFileSync(implFile, JSON.stringify(['__CRASH__', 'Did batch 1 after two tries.']));
+    writeFileSync(revFile, JSON.stringify([`${FINDINGS}VERDICT: COMPLETE`]));
+
+    await relayRunCommand({ plan: 'plan.md', id: 'relay-retry' });
+    expect(printedStatus().status).toBe('COMPLETE');
+
+    const retryNote = events('relay-retry').find(
+      (e) => e.role === 'RELAY' && e.kind === 'NOTE' && e.content.includes('Retrying in'),
+    );
+    expect(retryNote?.content).toContain('Call failed');
+    expect(retryNote?.content).toContain('attempt(s) left');
+  });
+
+  it('AC2: exhausted retries stop the run, and relay status says WHY', async () => {
+    writeConfig(2);
+    writeFileSync(implFile, JSON.stringify(['__CRASH__', '__CRASH__', '__CRASH__']));
+    writeFileSync(revFile, JSON.stringify([`${FINDINGS}VERDICT: COMPLETE`]));
+
+    await relayRunCommand({ plan: 'plan.md', id: 'relay-exhausted' });
+
+    const printed = printedStatus() as unknown as {
+      status: string;
+      lastFailure: { reason: string; at: string } | null;
+    };
+    expect(printed.status).toBe('STOPPED');
+    // A stalled run explains itself — no event-log archaeology, no babysitter.
+    expect(printed.lastFailure?.reason).toContain('exited with code 1');
+    expect(printed.lastFailure?.at).not.toBe('');
+  });
+
+  it('AC2: a worker that dies mid-run leaves the reason behind, and resume continues', async () => {
+    // Several live worker deaths left status STOPPED with NO event row and no log line: the
+    // only signal was silence. Here the worker is killed outright while a call is in flight.
+    writeConfig(1);
+    const ready = join(projectDir, 'call-started');
+    writeFileSync(
+      implFile,
+      JSON.stringify(['__DELAY:10000:Did batch 1.', 'Did batch 1 after the restart.']),
+    );
+    writeFileSync(revFile, JSON.stringify([`${FINDINGS}VERDICT: COMPLETE`]));
+    writeFileSync(join(projectDir, 'plan.md'), PLAN);
+
+    const worker = spawn(
+      process.execPath,
+      [CLI_ENTRY, 'relay', 'run', '--plan', 'plan.md', '--id', 'relay-killed'],
+      { cwd: projectDir, stdio: 'ignore' },
+    );
+    try {
+      // Wait until the implementer call is genuinely in flight.
+      const deadline = Date.now() + 15_000;
+      for (;;) {
+        if (Date.now() > deadline) throw new Error('the worker never issued its first prompt');
+        if (events('relay-killed').some((e) => e.kind === 'PROMPT')) break;
+        await new Promise((resolveWait) => setTimeout(resolveWait, 100));
+      }
+      worker.kill('SIGTERM');
+      await new Promise((resolveExit) => worker.on('exit', resolveExit));
+    } finally {
+      if (worker.exitCode === null) worker.kill('SIGKILL');
+    }
+    void ready;
+
+    const db = openDatabase(getDbPath());
+    const row = db
+      .prepare('SELECT status, last_failure FROM relay_runs WHERE run_id = ?')
+      .get('relay-killed') as { status: string; last_failure: string | null };
+    db.close();
+    // The death is ON THE RECORD, whatever else happened.
+    expect(row.last_failure).not.toBeNull();
+    expect(String(row.last_failure)).toMatch(/SIGTERM|exited without settling/);
+
+    // And the run continues without a human reconstructing anything.
+    await relayResumeCommand('relay-killed', {});
+    expect(printedStatus().status).toBe('COMPLETE');
+  }, 60_000);
+
+  it('AC3: every call tees its raw stream to a capped file that failures point at', async () => {
+    // The stream used to feed the idle timer and then vanish, so a freeze could only be
+    // diagnosed with process and socket forensics on a machine that had moved on.
+    writeConfig(1);
+    writeFileSync(implFile, JSON.stringify(['Did batch 1.']));
+    writeFileSync(revFile, JSON.stringify([`${FINDINGS}VERDICT: COMPLETE`]));
+
+    await relayRunCommand({ plan: 'plan.md', id: 'relay-stream' });
+
+    const callsDir = join(projectDir, '.cowork', 'relay', 'relay-stream', 'calls');
+    const files = readdirSync(callsDir).sort();
+    expect(files.length).toBeGreaterThanOrEqual(2);
+    expect(files.some((name) => name.endsWith('-implementer.jsonl'))).toBe(true);
+    expect(files.some((name) => name.endsWith('-reviewer.jsonl'))).toBe(true);
+    // What a wedge diagnosis actually reads: the last thing the model emitted.
+    const implementerFile = files.find((name) => name.endsWith('-implementer.jsonl')) as string;
+    const raw = readFileSync(join(callsDir, implementerFile), 'utf8');
+    expect(raw).toContain('"type":"result"');
+    expect(raw).toContain('Did batch 1.');
+  });
+
+  it('AC3: the cap holds, and a failure names the file to read', async () => {
+    writeConfig(1);
+    const config = JSON.parse(readFileSync(join(projectDir, '.cowork.yml'), 'utf8')) as Record<
+      string,
+      unknown
+    >;
+    writeFileSync(
+      join(projectDir, '.cowork.yml'),
+      JSON.stringify({ ...config, relay: { callStream: { maxBytesPerCall: 256 } } }),
+    );
+    writeFileSync(implFile, JSON.stringify(['__CRASH__']));
+    writeFileSync(revFile, JSON.stringify([`${FINDINGS}VERDICT: COMPLETE`]));
+
+    await relayRunCommand({ plan: 'plan.md', id: 'relay-capped' });
+
+    const callsDir = join(projectDir, '.cowork', 'relay', 'relay-capped', 'calls');
+    for (const name of readdirSync(callsDir)) {
+      // The cap plus one short marker line — a diagnostic that fills a disk is a defect.
+      expect(statSync(join(callsDir, name)).size).toBeLessThan(256 + 200);
+    }
+    const failure = events('relay-capped').find(
+      (e) => e.role === 'RELAY' && e.kind === 'NOTE' && e.content.includes('Call failed'),
+    );
+    expect(failure?.content).toContain('Raw adapter stream:');
+    expect(failure?.content).toContain('relay-capped/calls/');
   });
 });

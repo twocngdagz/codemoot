@@ -18,9 +18,9 @@ foreground.
 ## Every command and argument
 
 The relay is command-line only — there is no MCP tool that starts, resumes, pauses or reads
-a relay run, and no `.cowork.yml` key configures the loop itself (only `models` and `roles`,
-see [Configuration](#configuration)). Nothing below is required except `--plan`; every
-default is stated.
+a relay run. The loop's shape lives entirely in these arguments; `.cowork.yml` supplies the
+models, the roles and the wedge-handling defaults (see [Configuration](#configuration)).
+Nothing below is required except `--plan`; every default is stated.
 
 ### `codemoot relay run`
 
@@ -131,6 +131,92 @@ the findings floor and the cycle cap apply unchanged. The range is recorded in t
 a resume needs no re-flagging. It composes with `--start-batch`: the example starts at
 batch 9 and reviews 9 and 10 without ever touching 1–8.
 
+## When the CLI wedges
+
+`cursor-agent` freezes mid-call: the process stays alive, its HTTP stream is dead, and it
+emits nothing ever again. That is an upstream bug, publicly documented, so the relay treats
+it as weather rather than an accident. One live run paid the full price for it — fourteen
+hours, ten consecutive interrupted attempts on one step, an eight-hour overnight hang, and
+several worker deaths that left no trace at all. Four things changed.
+
+### Silence is examined, not merely waited out
+
+The idle deadline used to be the whole verdict, and silence means two opposite things: an
+agent running a long local test suite is quiet for minutes, and a wedged CLI is quiet
+forever. Raising `idleTimeout` to protect the first turned the second into multi-hour hangs;
+lowering it killed real work.
+
+So at the deadline the operating system is asked which one this is: **has the child's
+process tree actually burned CPU since the last look?** A working agent — or any tool it
+spawned — burns measurable CPU; a wedged process waiting on a dead socket burns none (the
+live one sat on ~8 seconds over eight hours). If it is working, the call gets another
+interval and the transcript records that its silence was examined. If it is not, the kill
+that `idleTimeout` ordered proceeds.
+
+The probe fails closed in every ambiguous case — probe disabled, no child pid, an unreadable
+process tree, extensions exhausted — because a probe that cannot see the process must never
+be the reason a wedged call survives. `cliAdapter.timeout` remains the absolute ceiling and
+is never extended.
+
+```yaml
+models:
+  implementer:
+    cliAdapter:
+      idleTimeout: 900      # stream silence tolerated before the child is EXAMINED
+      liveness:
+        enabled: true       # false ⇒ the deadline is the verdict, as before
+        minCpuRatio: 0.01   # fraction of one core that counts as working
+        probeInterval: 60   # seconds per granted extension (also the measurement window)
+        maxExtensions: 30   # ceiling per call; `timeout` still applies
+```
+
+### A stalled conversation is not resumed forever
+
+An interrupted call is re-sent with the reconcile preface — into the **same** CLI session, so
+each retry stacked another apology onto an ever-longer conversation. After several of those
+the live session stopped answering at all; clearing the stored session id ended the hang, and
+the fresh conversation finished the same step in eighteen minutes.
+
+After `relay.freshSessionAfterInterrupts` interrupted attempts on one step (default **1**),
+the next attempt starts a **fresh** session and the transcript says so. Nothing is lost: the
+reconcile preface already tells the model to inspect the working tree, and committed work is
+on the branch either way. Set it to `0` to always resume, as before.
+
+### A failed call is retried, and every death is on the record
+
+A call failure used to end the worker. Recovery then depended on a human noticing silence —
+and several worker deaths wrote nothing at all: no event, no log line, a run sitting at
+STOPPED with no reason in it.
+
+Now the worker retries the step in place with bounded backoff, up to `advanced.retryAttempts`
+(default 3), recording every attempt; when the attempts run out it stops exactly as it did
+before. Every other way the worker can end — SIGINT, SIGTERM, an uncaught exception, an
+unhandled rejection, or simply exiting while the run still says ACTIVE — writes its reason
+first. `relay status` reports the newest one as `lastFailure`, so a stalled run explains
+itself:
+
+```json
+{ "status": "STOPPED", "lastFailure": { "reason": "Cursor CLI idle timeout …", "at": "…" } }
+```
+
+Only SIGKILL can still leave nothing behind; a run left ACTIVE with a dead lease is the
+signature of one.
+
+### The raw stream is kept, so a freeze can be read
+
+The adapter's stream-json output fed the idle timer and was then discarded, so diagnosing the
+freezes needed process and socket forensics on a machine that had already moved on. Every
+call now tees its raw stdout and stderr to
+
+```
+.cowork/relay/<run-id>/calls/<seq>-<role>.jsonl
+```
+
+and failure notes name the file. A wedge is diagnosed by reading its last line: a tool call
+means the child died waiting on a command; mid-sentence text means the stream itself died.
+Capped per call and pruned per run (`relay.callStream.maxBytesPerCall`, `keepCalls`) — a
+diagnostic that fills a disk is a defect. `relay.callStream.enabled: false` turns it off.
+
 ## Liveness, not deadlines
 
 A model that is producing output is left alone however long it takes. Health is the
@@ -218,4 +304,18 @@ models:
 roles:
   implementer: { model: implementer }
   reviewer: { model: reviewer }
+```
+
+Everything the relay itself takes is optional, and every default is the behaviour that
+survives a wedged CLI:
+
+```yaml
+relay:
+  freshSessionAfterInterrupts: 1   # 0 ⇒ always resume the stored session
+  callStream:
+    enabled: true
+    maxBytesPerCall: 20971520      # 20MB
+    keepCalls: 200                 # per-run file retention
+advanced:
+  retryAttempts: 3                 # in-place retries per failed call; 1 ⇒ stop on first failure
 ```

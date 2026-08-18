@@ -18,6 +18,12 @@ import type {
 } from './bridge.js';
 import { describeProcessFailure } from './claude-cli-adapter.js';
 import { type CliRuntimeEvidence, collectCliRuntimeEvidence } from './cli-runtime-evidence.js';
+import {
+  DEFAULT_LIVENESS_PROBE,
+  type LivenessProbeConfig,
+  probeLocalActivity,
+  sampleProcessTreeCpuSeconds,
+} from './process-liveness.js';
 
 const MAX_OUTPUT_BYTES = 512 * 1024; // 512KB
 const TRUNCATION_MARKER = '\n[TRUNCATED: output exceeded 512KB]';
@@ -58,6 +64,16 @@ export interface ProgressCallbacks {
   onProgress?: (chunk: string) => void;
   /** Called when the subprocess closes — flush any buffered state. */
   onClose?: () => void;
+  /**
+   * Called when an idle deadline was NOT enforced because the child's process tree was
+   * provably burning CPU. The call continues; this is how a caller records that silence was
+   * examined rather than merely waited out.
+   */
+  onIdleExtended?: (detail: {
+    readonly reason: string;
+    readonly extension: number;
+    readonly silentMs: number;
+  }) => void;
 }
 
 export interface CliCallOptions extends ProgressCallbacks {
@@ -126,6 +142,7 @@ export class CliAdapter implements CliBridge {
   private projectDir: string | undefined;
   private readonly runtimeEvidence?: CliRuntimeEvidence;
   private readonly defaultIdleTimeout: number;
+  private readonly liveness: LivenessProbeConfig;
   readonly capabilities: BridgeCapabilities;
 
   get name(): string {
@@ -145,6 +162,7 @@ export class CliAdapter implements CliBridge {
     runtimeEvidence?: CliRuntimeEvidence;
     /** Milliseconds of allowed silence, from `cliAdapter.idleTimeout` (seconds) in config. */
     idleTimeout?: number;
+    liveness?: LivenessProbeConfig;
   }) {
     this.command = config.command;
     this.baseArgs = config.args;
@@ -154,6 +172,7 @@ export class CliAdapter implements CliBridge {
     this.projectDir = config.projectDir;
     this.runtimeEvidence = config.runtimeEvidence;
     this.defaultIdleTimeout = config.idleTimeout ?? DEFAULT_CODEX_IDLE_TIMEOUT_MS;
+    this.liveness = config.liveness ?? DEFAULT_LIVENESS_PROBE;
     this.capabilities = {
       ...CODEX_CAPABILITIES,
       maxContextTokens: MODEL_CONTEXT_WINDOWS[config.model] ?? DEFAULT_CONTEXT_WINDOW,
@@ -519,31 +538,81 @@ export class CliAdapter implements CliBridge {
       }, timeout);
 
       // Idle timeout — resets on every stdout/stderr chunk. Detects stalled processes.
+      // Silence is not proof of death: the same deadline that catches a wedged CLI also
+      // catches an agent running a long local test suite, so the OS is asked whether the
+      // child tree burned CPU before the kill stands. See process-liveness.ts.
       const idleMs = options?.idleTimeout ?? DEFAULT_CODEX_IDLE_TIMEOUT_MS;
-      let idleTimer = setTimeout(() => {
+      const liveness = this.liveness;
+      let cpuBaseline: number | undefined;
+      let cpuBaselineAt = Date.now();
+      let extensionsGranted = 0;
+      let baselineTimer: NodeJS.Timeout | undefined;
+      // Sampled half way through the silence: a `ps` per chunk would be wasteful, and a
+      // sample taken only at expiry would leave the first deadline nothing to judge.
+      const armBaselineSampler = (delayMs: number): void => {
+        if (!liveness.enabled) return;
+        if (baselineTimer !== undefined) clearTimeout(baselineTimer);
+        baselineTimer = setTimeout(
+          () => {
+            if (settled || child.pid === undefined) return;
+            const sample = sampleProcessTreeCpuSeconds(child.pid);
+            if (sample !== null) {
+              cpuBaseline = sample;
+              cpuBaselineAt = Date.now();
+            }
+          },
+          Math.max(1, Math.floor(delayMs / 2)),
+        );
+      };
+      const onIdleDeadline = (): void => {
+        if (settled) return;
+        const verdict = probeLocalActivity({
+          pid: child.pid,
+          previousCpuSeconds: cpuBaseline,
+          windowMs: Date.now() - cpuBaselineAt,
+          extensionsGranted,
+          config: liveness,
+        });
+        if (verdict.cpuSeconds !== undefined) {
+          cpuBaseline = verdict.cpuSeconds;
+          cpuBaselineAt = Date.now();
+        }
+        if (verdict.decision === 'EXTEND') {
+          extensionsGranted += 1;
+          try {
+            options?.onIdleExtended?.({
+              reason: verdict.detail,
+              extension: extensionsGranted,
+              silentMs: Date.now() - lastActivityAt,
+            });
+          } catch {
+            /* callback error isolation */
+          }
+          idleTimer = setTimeout(onIdleDeadline, liveness.probeIntervalMs);
+          armBaselineSampler(liveness.probeIntervalMs);
+          return;
+        }
         killProcessTree(child.pid);
         fail(
           new ModelError(
-            `CLI subprocess idle timeout (no output for ${idleMs}ms, total ${elapsedMsg()})`,
+            `CLI subprocess idle timeout (no output for ${idleMs}ms, total ${elapsedMsg()}; ${verdict.detail})`,
             this.provider,
             this.modelId,
           ),
         );
-      }, idleMs);
+      };
+      let idleTimer = setTimeout(onIdleDeadline, idleMs);
+      armBaselineSampler(idleMs);
 
       const resetIdleTimer = () => {
         lastActivityAt = Date.now();
+        // Output ends the previous silence: no inherited CPU baseline, extensions restored.
+        cpuBaseline = undefined;
+        cpuBaselineAt = Date.now();
+        extensionsGranted = 0;
         clearTimeout(idleTimer);
-        idleTimer = setTimeout(() => {
-          killProcessTree(child.pid);
-          fail(
-            new ModelError(
-              `CLI subprocess idle timeout (no output for ${idleMs}ms, total ${elapsedMsg()})`,
-              this.provider,
-              this.modelId,
-            ),
-          );
-        }, idleMs);
+        idleTimer = setTimeout(onIdleDeadline, idleMs);
+        armBaselineSampler(idleMs);
       };
 
       child.stdout.on('data', (data: Buffer) => {
