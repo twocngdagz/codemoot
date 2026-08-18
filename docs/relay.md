@@ -200,7 +200,13 @@ itself:
 ```
 
 Only SIGKILL can still leave nothing behind; a run left ACTIVE with a dead lease is the
-signature of one.
+signature of one. `--background` is a launcher, not a worker: it hands the run to the child
+and takes none of this with it, so an exiting launcher never files a death for a run its own
+child is working.
+
+An interrupted call is re-sent with the reconcile note added **once**, however many times the
+step has been interrupted — a prompt that is one-third apology teaches the model the wrong
+thing about the task.
 
 ### The raw stream is kept, so a freeze can be read
 
