@@ -166,6 +166,15 @@ const INTERRUPTION_PREFACE =
   'contain partial or uncommitted work from it. Reconcile whatever you find with the task ' +
   'below and continue.\n\n';
 
+/** Removes any reconcile prefaces a previous re-send already added. */
+export function stripInterruptionPrefaces(prompt: string): string {
+  let remaining = prompt;
+  while (remaining.startsWith(INTERRUPTION_PREFACE)) {
+    remaining = remaining.slice(INTERRUPTION_PREFACE.length);
+  }
+  return remaining;
+}
+
 function implementerBatchPrompt(run: RelayRun, preface = ''): string {
   return `${preface}You are the IMPLEMENTER in a two-model loop. The execution plan is the file at ${run.planPath} — read it from disk yourself.
 
@@ -843,7 +852,15 @@ async function step(context: RelayContext, run: RelayRun): Promise<boolean> {
     const role = last.role === 'REVIEWER' ? 'REVIEWER' : 'IMPLEMENTER';
     retireSessionAfterInterrupts(context, run, role);
     process.stderr.write(`[relay] re-sending interrupted ${role.toLowerCase()} prompt\n`);
-    await callRole(context, run, role, `${INTERRUPTION_PREFACE}${last.content}`);
+    // ONE preface, however many interruptions. Re-prefixing a prompt that already carries
+    // the note stacked a fresh copy per attempt — a live prompt reached three — teaching the
+    // model that this step is mostly apology.
+    await callRole(
+      context,
+      run,
+      role,
+      `${INTERRUPTION_PREFACE}${stripInterruptionPrefaces(last.content)}`,
+    );
     return true;
   }
 
@@ -1105,18 +1122,25 @@ function buildContext(
   const onSigterm = (): void => onSignal('SIGTERM');
   const onFatal = (error: unknown): void => {
     const reason = `worker died: ${error instanceof Error ? (error.stack ?? error.message) : String(error)}`;
-    if (activeRunId !== null) {
-      recordFailure(db, activeRunId, reason);
-      const current = getRun(db, activeRunId);
-      if (current !== null && current.status === 'ACTIVE') {
-        current.status = 'STOPPED';
-        appendEvent(db, current, {
-          role: 'RELAY',
-          kind: 'NOTE',
-          content: failureNote(reason, activeRunId, null),
-        });
-        updateRun(db, current);
+    // Wrapped whole: this handler runs when things are ALREADY going wrong, often with the
+    // database closed under it. A recorder that throws turns a diagnosable stop into an
+    // unreadable stack trace — which is the failure it exists to prevent.
+    try {
+      if (activeRunId !== null) {
+        recordFailure(db, activeRunId, reason);
+        const current = getRun(db, activeRunId);
+        if (current !== null && current.status === 'ACTIVE') {
+          current.status = 'STOPPED';
+          appendEvent(db, current, {
+            role: 'RELAY',
+            kind: 'NOTE',
+            content: failureNote(reason, activeRunId, null),
+          });
+          updateRun(db, current);
+        }
       }
+    } catch {
+      // The stderr line below is the last-resort record.
     }
     process.stderr.write(`\n[relay] ${reason}\n`);
     process.exitCode = 1;
@@ -1126,12 +1150,15 @@ function buildContext(
   // be written from an exit handler.
   const onExit = (): void => {
     if (activeRunId === null) return;
-    const current = getRun(db, activeRunId);
-    if (current === null || current.status !== 'ACTIVE') return;
-    const reason = 'worker exited without settling the run (process death, not a decision)';
-    recordFailure(db, activeRunId, reason);
-    current.status = 'STOPPED';
+    // Every read is inside the guard too: `withDatabase` closes the connection on its way
+    // out, so an exit handler that assumes an open database crashes the very exit it is
+    // trying to describe.
     try {
+      const current = getRun(db, activeRunId);
+      if (current === null || current.status !== 'ACTIVE') return;
+      const reason = 'worker exited without settling the run (process death, not a decision)';
+      recordFailure(db, activeRunId, reason);
+      current.status = 'STOPPED';
       appendEvent(db, current, {
         role: 'RELAY',
         kind: 'NOTE',
@@ -1139,7 +1166,7 @@ function buildContext(
       });
       updateRun(db, current);
     } catch {
-      // The last_failure column above is the durable part; the event is a courtesy.
+      // Nothing further is safe to attempt at this point in the process lifetime.
     }
   };
   process.on('SIGINT', onSigint);
@@ -1317,6 +1344,12 @@ export async function relayResumeCommand(
       );
     }
     if (options.background === true) {
+      // The parent is a LAUNCHER, not a worker: it hands the run to the child and leaves.
+      // Its context registered worker-lifecycle handlers (the ones that record why a worker
+      // died), and those must go with it — an exiting parent that still holds them fires
+      // "the worker exited without settling the run" against a run its own child is
+      // actively working, and does so on a database `withDatabase` has already closed.
+      context.dispose();
       // Validated above, claimed by the CHILD: the lease belongs to the process that
       // actually works the run, so the parent must not take it and hand off.
       const worker = spawnDetachedRelay(run.projectDir, runId, [

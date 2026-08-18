@@ -1222,4 +1222,64 @@ describe('codemoot relay (real command, two scripted models)', () => {
     expect(failure?.content).toContain('Raw adapter stream:');
     expect(failure?.content).toContain('relay-capped/calls/');
   });
+
+  it('a --background launcher leaves no worker handlers behind — it is not the worker', async () => {
+    // Live regression: `relay resume --background` built a worker context, spawned the child
+    // and returned. Its exit handler then ran against a database withDatabase had already
+    // closed — the launcher died with an unreadable stack — and had the connection still
+    // been open it would have marked its own child's ACTIVE run STOPPED.
+    writeConfig(1);
+    // The run must be RESUMABLE, or `resume` returns before it ever builds a context and
+    // the test proves nothing. (It did exactly that on the first attempt.)
+    writeFileSync(implFile, JSON.stringify(['Did batch 1.', 'Did batch 1 again.']));
+    writeFileSync(
+      revFile,
+      JSON.stringify(['no verdict here at all', `${FINDINGS}VERDICT: COMPLETE`]),
+    );
+    await relayRunCommand({ plan: 'plan.md', id: 'relay-launcher' });
+    expect(printedStatus().status).toBe('PAUSED_UNCLEAR_VERDICT');
+
+    const before = process.listenerCount('exit');
+    const realEntry = process.argv[1];
+    process.argv[1] = fileURLToPath(new URL('./fixtures/noop-entry.mjs', import.meta.url));
+    try {
+      await relayResumeCommand('relay-launcher', { background: true });
+    } finally {
+      process.argv[1] = realEntry;
+    }
+    // Nothing of the worker's lifecycle stayed registered in the launcher.
+    expect(process.listenerCount('exit')).toBe(before);
+  });
+
+  // Two crashes plus the retry backoff (2s, then 4s) make this deliberately slow.
+  it(
+    'the reconcile preface is added once, however many interruptions',
+    { timeout: 60_000 },
+    async () => {
+      // A live prompt carried three stacked copies: each re-send prefixed a prompt that
+      // already began with the note.
+      writeConfig(3);
+      writeFileSync(
+        implFile,
+        JSON.stringify(['Did batch 1.', '__CRASH__', '__CRASH__', 'Fixed it.']),
+      );
+      writeFileSync(
+        revFile,
+        JSON.stringify(['needs work\nVERDICT: FIX', `${FINDINGS}VERDICT: COMPLETE`]),
+      );
+
+      await relayRunCommand({ plan: 'plan.md', id: 'relay-preface', maxCycles: 3 });
+
+      for (const event of events('relay-preface')) {
+        if (event.kind !== 'PROMPT') continue;
+        const copies = event.content.split('NOTE: a previous attempt at this step').length - 1;
+        expect(copies).toBeLessThanOrEqual(1);
+      }
+      // ...and the re-sent prompt still carries the note exactly once.
+      const resent = events('relay-preface').filter(
+        (e) => e.kind === 'PROMPT' && e.content.startsWith('NOTE: a previous attempt'),
+      );
+      expect(resent.length).toBeGreaterThanOrEqual(1);
+    },
+  );
 });
