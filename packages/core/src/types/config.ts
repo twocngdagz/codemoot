@@ -14,6 +14,14 @@ export interface CliAdapterConfig {
   timeout: number;
   /** Seconds of NO output before the CLI is killed (deep reasoning needs headroom). */
   idleTimeout?: number;
+  /** How stream silence is judged at the idle deadline; see process-liveness.ts. */
+  liveness?: {
+    enabled: boolean;
+    minCpuRatio: number;
+    /** Seconds. */
+    probeInterval: number;
+    maxExtensions: number;
+  };
   versionConstraint?: string;
   outputFile?: string;
   maxOutputBytes?: number;
@@ -155,6 +163,11 @@ export interface ProjectConfig {
   memory: MemoryConfig;
   budget: BudgetConfig;
   output: OutputConfig;
+  /** Relay-only knobs; see docs/relay.md. Optional so older configs still type-check. */
+  relay?: {
+    freshSessionAfterInterrupts: number;
+    callStream: { enabled: boolean; maxBytesPerCall: number; keepCalls: number };
+  };
   advanced: {
     retryAttempts: number;
     stream: boolean;

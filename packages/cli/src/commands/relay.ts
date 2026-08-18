@@ -26,7 +26,15 @@
 // reconcile the working tree itself.
 
 import { spawn } from 'node:child_process';
-import { closeSync, mkdirSync, openSync, readFileSync } from 'node:fs';
+import {
+  closeSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  writeSync,
+} from 'node:fs';
 import { resolve } from 'node:path';
 import {
   ModelRegistry,
@@ -340,6 +348,40 @@ function lastEventOf(
   };
 }
 
+/**
+ * How many attempts at THIS step were interrupted — prompts of this role in this batch and
+ * cycle with no answer after them.
+ *
+ * The log is the state here as everywhere else: an attempt that produced a RESPONSE ends the
+ * streak, so the count is always "consecutive failures on the step being retried right now",
+ * not a lifetime tally.
+ */
+function interruptedAttempts(db: RelayDb, run: RelayRun, role: RelayRole): number {
+  const lastAnswer = db
+    .prepare(
+      `SELECT event_id FROM relay_events
+       WHERE run_id = ? AND role = ? AND kind = 'RESPONSE' AND batch = ? AND cycle = ?
+       ORDER BY event_id DESC LIMIT 1`,
+    )
+    .get(run.runId, role, run.batch, run.cycle) as { event_id: number } | undefined;
+  const row = db
+    .prepare(
+      `SELECT COUNT(*) AS n FROM relay_events
+       WHERE run_id = ? AND role = ? AND kind = 'PROMPT' AND batch = ? AND cycle = ?
+         AND event_id > ?`,
+    )
+    .get(run.runId, role, run.batch, run.cycle, lastAnswer?.event_id ?? 0) as { n: number };
+  return Number(row.n);
+}
+
+/** The id the next appended event will take — a stable, monotonic per-call sequence. */
+function nextEventId(db: RelayDb): number {
+  const row = db.prepare('SELECT COALESCE(MAX(event_id), 0) AS n FROM relay_events').get() as {
+    n: number;
+  };
+  return Number(row.n) + 1;
+}
+
 function lastEvent(db: RelayDb, runId: string): RelayEvent | null {
   const row = db
     .prepare(
@@ -443,6 +485,12 @@ function releaseRelayWorker(db: RelayDb, runId: string): void {
 interface RelayContext {
   db: RelayDb;
   registry: ModelRegistry;
+  /** `relay.*` from .cowork.yml, resolved once at worker start. */
+  settings: RelaySettings;
+  /** Where the in-flight call's raw stream is being written; named by failure notes. */
+  lastCallStream: string | null;
+  /** Bounded in-place retries per stop, from `advanced.retryAttempts`. */
+  retryAttempts: number;
   roleAliases: { IMPLEMENTER: string; REVIEWER: string };
   roleKinds: { IMPLEMENTER: string; REVIEWER: string };
   timeouts: { IMPLEMENTER: number | undefined; REVIEWER: number | undefined };
@@ -450,6 +498,20 @@ interface RelayContext {
   stopRequested: () => boolean;
   dispose: () => void;
 }
+
+interface RelaySettings {
+  readonly freshSessionAfterInterrupts: number;
+  readonly callStream: {
+    readonly enabled: boolean;
+    readonly maxBytesPerCall: number;
+    readonly keepCalls: number;
+  };
+}
+
+const DEFAULT_RELAY_SETTINGS: RelaySettings = {
+  freshSessionAfterInterrupts: 1,
+  callStream: { enabled: true, maxBytesPerCall: 20 * 1024 * 1024, keepCalls: 200 },
+};
 
 function clearRoleSession(context: RelayContext, run: RelayRun, role: RelayRole): void {
   if (role === 'IMPLEMENTER') {
@@ -460,6 +522,126 @@ function clearRoleSession(context: RelayContext, run: RelayRun, role: RelayRole)
     run.reviewerSessionKind = null;
   }
   updateRun(context.db, run);
+}
+
+/**
+ * Stops a retry from resuming a conversation that has already failed the same step.
+ *
+ * Each interrupted attempt re-sends into the SAME CLI session with another reconcile note
+ * prepended, so the conversation grows by one apology per failure. A live run did that ten
+ * times on one step and the session stopped answering at all: an eight-hour overnight hang
+ * with the child on ~8 seconds of CPU. Clearing the stored session id ended it — the very
+ * next attempt, a fresh conversation, finished the same step in eighteen minutes.
+ *
+ * Nothing is lost by starting fresh: the reconcile preface already tells the model its
+ * previous attempt may have been interrupted and to inspect the working tree, and committed
+ * work is on the branch either way. `relay.freshSessionAfterInterrupts: 0` restores the old
+ * always-resume behaviour.
+ */
+function retireSessionAfterInterrupts(context: RelayContext, run: RelayRun, role: RelayRole): void {
+  const threshold = context.settings.freshSessionAfterInterrupts;
+  if (threshold <= 0) return;
+  const sessionId = role === 'IMPLEMENTER' ? run.implementerSession : run.reviewerSession;
+  if (sessionId === null) return;
+  const failures = interruptedAttempts(context.db, run, role);
+  if (failures < threshold) return;
+  clearRoleSession(context, run, role);
+  appendEvent(context.db, run, {
+    role: 'RELAY',
+    kind: 'NOTE',
+    content: `${role} session ${sessionId} was interrupted ${failures} time(s) on batch ${run.batch} cycle ${run.cycle}; retrying with a FRESH session rather than resuming a conversation that keeps stalling`,
+  });
+}
+
+/**
+ * The raw adapter stream of ONE call, tee'd to disk as it arrives.
+ *
+ * `relay_events` keeps the finished PROMPT and RESPONSE; everything in between — the tool
+ * calls, the partial text, the last thing the model did before it went quiet — was consumed
+ * by the idle timer and thrown away. Diagnosing the freezes therefore needed process and
+ * socket forensics on a machine that had already moved on. Now a wedge is read off the end
+ * of a file: a tool call as the last line means it died waiting on a command; mid-sentence
+ * text means the stream itself died.
+ *
+ * Capped per call and pruned per run, because a diagnostic that fills a disk is a defect.
+ */
+interface CallStream {
+  readonly path: string;
+  write(chunk: string): void;
+  close(): void;
+}
+
+function openCallStream(
+  context: RelayContext,
+  run: RelayRun,
+  role: RelayRole,
+  sequence: number,
+): CallStream | null {
+  if (!context.settings.callStream.enabled) return null;
+  const directory = resolve(run.projectDir, '.cowork', 'relay', run.runId, 'calls');
+  const path = resolve(
+    directory,
+    `${String(sequence).padStart(6, '0')}-${role.toLowerCase()}.jsonl`,
+  );
+  let handle: number;
+  try {
+    mkdirSync(directory, { recursive: true });
+    pruneCallStreams(directory, context.settings.callStream.keepCalls);
+    handle = openSync(path, 'a');
+  } catch {
+    // Diagnostics are never allowed to stop the work they are diagnosing.
+    return null;
+  }
+  let written = 0;
+  let capped = false;
+  let closed = false;
+  return {
+    path,
+    write: (chunk: string): void => {
+      if (closed || capped) return;
+      try {
+        const remaining = context.settings.callStream.maxBytesPerCall - written;
+        if (remaining <= 0) return;
+        const buffer = Buffer.from(chunk);
+        if (buffer.byteLength > remaining) {
+          capped = true;
+          writeSync(handle, buffer.subarray(0, remaining));
+          writeSync(
+            handle,
+            `\n[relay] stream capped at ${context.settings.callStream.maxBytesPerCall} bytes\n`,
+          );
+          return;
+        }
+        written += buffer.byteLength;
+        writeSync(handle, buffer);
+      } catch {
+        capped = true;
+      }
+    },
+    close: (): void => {
+      if (closed) return;
+      closed = true;
+      try {
+        closeSync(handle);
+      } catch {
+        // Nothing useful remains to do with a handle that will not close.
+      }
+    },
+  };
+}
+
+/** Keeps the newest `keep` per-call files; a long run must not grow without bound. */
+function pruneCallStreams(directory: string, keep: number): void {
+  try {
+    const files = readdirSync(directory)
+      .filter((name) => name.endsWith('.jsonl'))
+      .sort();
+    for (const name of files.slice(0, Math.max(0, files.length - keep + 1))) {
+      rmSync(resolve(directory, name), { force: true });
+    }
+  } catch {
+    // A directory that cannot be pruned is not a reason to skip the recording.
+  }
 }
 
 async function callRole(
@@ -487,6 +669,8 @@ async function callRole(
     sessionId = null;
   }
   appendEvent(context.db, run, { role, kind: 'PROMPT', content: prompt });
+  const stream = openCallStream(context, run, role, nextEventId(context.db));
+  context.lastCallStream = stream?.path ?? null;
   const options = {
     ...(context.timeouts[role] === undefined ? {} : { timeout: context.timeouts[role] }),
     env: context.guardEnv,
@@ -494,6 +678,23 @@ async function callRole(
     // both hides a killed call and forks the role's memory — the model that answers no
     // longer remembers the conversation the transcript says it is part of.
     strictResume: true,
+    onProgress: (chunk: string) => stream?.write(chunk),
+    onStderr: (chunk: string) => stream?.write(chunk),
+    // Silence that was EXAMINED and found to be work. Noted in the transcript the first
+    // time and then sparsely, so a long quiet stretch is visible without burying the log.
+    onIdleExtended: (detail: { reason: string; extension: number; silentMs: number }) => {
+      stream?.write(`\n[relay] idle but locally active: ${detail.reason}\n`);
+      process.stderr.write(
+        `[relay] ${role.toLowerCase()} quiet ${Math.round(detail.silentMs / 1000)}s but locally active (${detail.reason})\n`,
+      );
+      if (detail.extension === 1 || detail.extension % 10 === 0) {
+        appendEvent(context.db, run, {
+          role: 'RELAY',
+          kind: 'NOTE',
+          content: `${role} produced no output for ${Math.round(detail.silentMs / 1000)}s; the idle deadline was NOT enforced because ${detail.reason} (extension ${detail.extension})`,
+        });
+      }
+    },
   };
   const startedAt = Date.now();
   let call: Awaited<ReturnType<typeof adapter.send>>;
@@ -516,6 +717,8 @@ async function callRole(
       });
     }
     throw error;
+  } finally {
+    stream?.close();
   }
   // An empty response is NOT a response. A hand-killed codex once surfaced as a clean call
   // with zero-length text, and the transcript gained a turn that never happened. Refuse it
@@ -559,7 +762,11 @@ async function callRole(
  * stands; only the opening move differs, and a FIX from that review enters the ordinary
  * fixPrompt → re-review loop.
  */
-async function openBatch(context: RelayContext, run: RelayRun, afterAccept: boolean): Promise<void> {
+async function openBatch(
+  context: RelayContext,
+  run: RelayRun,
+  afterAccept: boolean,
+): Promise<void> {
   if (run.reviewFrom !== null && run.batch >= run.reviewFrom) {
     process.stderr.write(
       `[relay] batch ${run.batch}/${run.totalBatches} → reviewer (review-only: already implemented)\n`,
@@ -588,6 +795,35 @@ function pause(
 }
 
 /**
+ * Records WHY a run stopped, durably, in the row `relay status` reads.
+ *
+ * A stop used to be visible only as an event among hundreds, and several worker deaths left
+ * no event at all — a run sat STOPPED with nothing saying why, and finding out took a person
+ * noticing silence. Everything that ends a worker now comes through here first, so the
+ * question "what happened?" is answered by the summary the operator already looks at.
+ */
+function recordFailure(db: RelayDb, runId: string, reason: string): void {
+  try {
+    db.prepare('UPDATE relay_runs SET last_failure = ?, last_failure_at = ? WHERE run_id = ?').run(
+      reason.slice(0, 2_000),
+      new Date().toISOString(),
+      runId,
+    );
+  } catch {
+    // Recording the reason must never be the thing that kills the worker.
+  }
+}
+
+/** The failure note every stop shares: the reason, and the file holding the raw stream. */
+function failureNote(reason: string, runId: string, streamPath: string | null): string {
+  return (
+    `Call failed: ${reason}.` +
+    `${streamPath === null ? '' : ` Raw adapter stream: ${streamPath}.`}` +
+    ` Resume with: codemoot relay resume ${runId}`
+  );
+}
+
+/**
  * One step: look at the last logged exchange, do the single thing it implies, return
  * whether the loop should keep going. The log IS the state — nothing else records where
  * the process is, so resume is "run the same loop again" with no ceremony.
@@ -605,6 +841,7 @@ async function step(context: RelayContext, run: RelayRun): Promise<boolean> {
   // preface and let the model reconcile whatever half-finished state it left behind.
   if (last.kind === 'PROMPT') {
     const role = last.role === 'REVIEWER' ? 'REVIEWER' : 'IMPLEMENTER';
+    retireSessionAfterInterrupts(context, run, role);
     process.stderr.write(`[relay] re-sending interrupted ${role.toLowerCase()} prompt\n`);
     await callRole(context, run, role, `${INTERRUPTION_PREFACE}${last.content}`);
     return true;
@@ -731,21 +968,77 @@ function advanceBatch(context: RelayContext, run: RelayRun): boolean {
   return true;
 }
 
+/**
+ * Retries a failed call in place instead of ending the worker.
+ *
+ * A call failure used to stop the run, which was honest but left the work parked until a
+ * human noticed — and the failures that mattered most were transient by nature: a wedged CLI
+ * that a fresh child does not reproduce. Every attempt is still recorded, the backoff is
+ * bounded by `advanced.retryAttempts`, and a run that exhausts it stops exactly as it did
+ * before. Retrying is what a person would do; doing it automatically only removes the wait.
+ */
 async function runLoop(context: RelayContext, run: RelayRun): Promise<void> {
+  let attemptsLeft = context.retryAttempts;
+  for (;;) {
+    const outcome = await runLoopOnce(context, run);
+    if (outcome.settled) return;
+    attemptsLeft -= 1;
+    if (attemptsLeft <= 0 || context.stopRequested()) {
+      pause(
+        context,
+        run,
+        'STOPPED',
+        failureNote(
+          `${outcome.reason} (retries exhausted after ${context.retryAttempts} attempts)`,
+          run.runId,
+          context.lastCallStream,
+        ),
+      );
+      recordFailure(context.db, run.runId, outcome.reason);
+      return;
+    }
+    const backoffMs = Math.min(30_000, 2_000 * 2 ** (context.retryAttempts - attemptsLeft - 1));
+    appendEvent(context.db, run, {
+      role: 'RELAY',
+      kind: 'NOTE',
+      content: failureNote(
+        `${outcome.reason}. Retrying in ${Math.round(backoffMs / 1000)}s (${attemptsLeft} attempt(s) left)`,
+        run.runId,
+        context.lastCallStream,
+      ),
+    });
+    recordFailure(context.db, run.runId, outcome.reason);
+    process.stderr.write(
+      `[relay] call failed: ${outcome.reason} — retrying in ${Math.round(backoffMs / 1000)}s\n`,
+    );
+    await new Promise((resolveSleep) => setTimeout(resolveSleep, backoffMs));
+    // The log is the state: a fresh pass re-derives the step, including the
+    // interrupted-prompt path that re-sends with the reconcile preface.
+    const reloaded = getRun(context.db, run.runId);
+    if (reloaded === null) return;
+    Object.assign(run, reloaded);
+  }
+}
+
+/** One pass of the loop. `settled` means the run reached a state a retry cannot improve. */
+async function runLoopOnce(
+  context: RelayContext,
+  run: RelayRun,
+): Promise<{ settled: true } | { settled: false; reason: string }> {
   run.status = 'ACTIVE';
   updateRun(context.db, run);
   try {
     for (;;) {
       if (context.stopRequested()) {
         pause(context, run, 'STOPPED', 'Stopped by operator between calls.');
-        return;
+        return { settled: true };
       }
       // Durable operator intent — the signal-free pause. Honoured here, between calls,
       // which is the only boundary a poll can never reliably land on from outside.
       if (readPauseIntent(context.db, run.runId) === 'NEXT_BOUNDARY') {
         writePauseIntent(context.db, run.runId, null);
         pause(context, run, 'STOPPED', 'Operator pause honoured at the call boundary.');
-        return;
+        return { settled: true };
       }
       // The opening prompt for a NEW batch is issued here rather than inside step() so an
       // advance and its first prompt are two separate log entries around one call. This is
@@ -756,17 +1049,12 @@ async function runLoop(context: RelayContext, run: RelayRun): Promise<void> {
         continue;
       }
       const keepGoing = await step(context, run);
-      if (!keepGoing) return;
+      if (!keepGoing) return { settled: true };
     }
   } catch (error) {
-    // A failed or killed call is recorded and the run stops cleanly; resume re-derives
-    // everything from the log, including the interrupted-prompt case.
-    pause(
-      context,
-      run,
-      'STOPPED',
-      `Call failed: ${error instanceof Error ? error.message : String(error)}. Resume with: codemoot relay resume ${run.runId}`,
-    );
+    // A failed or killed call is recorded and handed back to the retry loop; resume
+    // re-derives everything from the log, including the interrupted-prompt case.
+    return { settled: false, reason: error instanceof Error ? error.message : String(error) };
   }
 }
 
@@ -774,7 +1062,11 @@ async function runLoop(context: RelayContext, run: RelayRun): Promise<void> {
 // Wiring
 // ---------------------------------------------------------------------------
 
-function buildContext(db: RelayDb, projectDir: string): RelayContext {
+function buildContext(
+  db: RelayDb,
+  projectDir: string,
+  activeRunId: string | null = null,
+): RelayContext {
   const config = loadConfig({ projectDir });
   const implementerAlias = config.roles.implementer?.model;
   const reviewerAlias = config.roles.reviewer?.model;
@@ -800,14 +1092,78 @@ function buildContext(db: RelayDb, projectDir: string): RelayContext {
     stopRequested = true;
     process.stderr.write('\n[relay] finishing the current call, then stopping…\n');
   };
-  process.on('SIGINT', requestStop);
-  process.on('SIGTERM', requestStop);
+  // Every way this worker can die, except SIGKILL, leaves a reason behind. Several live
+  // deaths left a run STOPPED with no event, no log line and nothing to read: the only way
+  // to notice was a person watching for silence, and the only way to diagnose was guessing.
+  // The signal handlers record BEFORE the graceful stop because a signal may be followed by
+  // a hard kill that never reaches the loop's next boundary.
+  const onSignal = (signal: NodeJS.Signals): void => {
+    recordFailure(db, activeRunId ?? '', `worker received ${signal}`);
+    requestStop();
+  };
+  const onSigint = (): void => onSignal('SIGINT');
+  const onSigterm = (): void => onSignal('SIGTERM');
+  const onFatal = (error: unknown): void => {
+    const reason = `worker died: ${error instanceof Error ? (error.stack ?? error.message) : String(error)}`;
+    if (activeRunId !== null) {
+      recordFailure(db, activeRunId, reason);
+      const current = getRun(db, activeRunId);
+      if (current !== null && current.status === 'ACTIVE') {
+        current.status = 'STOPPED';
+        appendEvent(db, current, {
+          role: 'RELAY',
+          kind: 'NOTE',
+          content: failureNote(reason, activeRunId, null),
+        });
+        updateRun(db, current);
+      }
+    }
+    process.stderr.write(`\n[relay] ${reason}\n`);
+    process.exitCode = 1;
+  };
+  // A worker that exits while its run still says ACTIVE died without settling — the silent
+  // stop this whole path exists to end. better-sqlite3 is synchronous, so the row can still
+  // be written from an exit handler.
+  const onExit = (): void => {
+    if (activeRunId === null) return;
+    const current = getRun(db, activeRunId);
+    if (current === null || current.status !== 'ACTIVE') return;
+    const reason = 'worker exited without settling the run (process death, not a decision)';
+    recordFailure(db, activeRunId, reason);
+    current.status = 'STOPPED';
+    try {
+      appendEvent(db, current, {
+        role: 'RELAY',
+        kind: 'NOTE',
+        content: failureNote(reason, activeRunId, null),
+      });
+      updateRun(db, current);
+    } catch {
+      // The last_failure column above is the durable part; the event is a courtesy.
+    }
+  };
+  process.on('SIGINT', onSigint);
+  process.on('SIGTERM', onSigterm);
+  process.on('uncaughtException', onFatal);
+  process.on('unhandledRejection', onFatal);
+  process.on('exit', onExit);
   return {
     dispose: () => {
-      process.removeListener('SIGINT', requestStop);
-      process.removeListener('SIGTERM', requestStop);
+      process.removeListener('SIGINT', onSigint);
+      process.removeListener('SIGTERM', onSigterm);
+      process.removeListener('uncaughtException', onFatal);
+      process.removeListener('unhandledRejection', onFatal);
+      process.removeListener('exit', onExit);
     },
     db,
+    lastCallStream: null,
+    retryAttempts: config.advanced?.retryAttempts ?? 3,
+    settings: {
+      freshSessionAfterInterrupts:
+        config.relay?.freshSessionAfterInterrupts ??
+        DEFAULT_RELAY_SETTINGS.freshSessionAfterInterrupts,
+      callStream: config.relay?.callStream ?? DEFAULT_RELAY_SETTINGS.callStream,
+    },
     registry: ModelRegistry.fromConfig(config, projectDir),
     roleAliases: { IMPLEMENTER: implementerAlias, REVIEWER: reviewerAlias },
     roleKinds: {
@@ -915,7 +1271,7 @@ export async function relayRunCommand(options: {
       );
       return;
     }
-    const context = buildContext(db, projectDir);
+    const context = buildContext(db, projectDir, runId);
     const run = getRun(db, runId);
     if (run === null) throw new Error('run row vanished');
     claimRelayWorker(db, runId);
@@ -945,7 +1301,7 @@ export async function relayResumeCommand(
       return;
     }
     claimRelayWorker(db, runId);
-    const context = buildContext(db, run.projectDir);
+    const context = buildContext(db, run.projectDir, runId);
 
     // Every call below runs inside ONE error boundary. runLoop guards its own calls — that
     // is why the two PATH failures cost $0 and two minutes — but these direct decision and
@@ -1062,8 +1418,7 @@ export async function relayResumeCommand(
             appendEvent(db, run, {
               role: 'RELAY',
               kind: 'NOTE',
-              content:
-                'No routable verdict in the stored reply; re-sending the full review prompt',
+              content: 'No routable verdict in the stored reply; re-sending the full review prompt',
             });
             await callRole(context, run, 'REVIEWER', originalPrompt.content);
           }
@@ -1078,12 +1433,9 @@ export async function relayResumeCommand(
       // Decision-state mutations (cycle grants, pending advances) were persisted BEFORE the
       // failed call, so recording the failure and stopping loses nothing: resume re-derives
       // from the log, and an unanswered prompt takes the interrupted-call path.
-      pause(
-        context,
-        run,
-        'STOPPED',
-        `Call failed: ${error instanceof Error ? error.message : String(error)}. Resume with: codemoot relay resume ${runId}`,
-      );
+      const reason = error instanceof Error ? error.message : String(error);
+      pause(context, run, 'STOPPED', failureNote(reason, runId, context.lastCallStream));
+      recordFailure(db, runId, reason);
     } finally {
       releaseRelayWorker(db, runId);
       context.dispose();
@@ -1216,6 +1568,15 @@ export async function relayLogCommand(
   });
 }
 
+/** The durable stop reason, or null on a run that has never failed. */
+function readLastFailure(db: RelayDb, runId: string): { reason: string; at: string } | null {
+  const row = db
+    .prepare('SELECT last_failure, last_failure_at FROM relay_runs WHERE run_id = ?')
+    .get(runId) as { last_failure: string | null; last_failure_at: string | null } | undefined;
+  if (row?.last_failure == null) return null;
+  return { reason: String(row.last_failure), at: String(row.last_failure_at ?? '') };
+}
+
 function printRelayStatus(db: RelayDb, runId: string): void {
   const run = getRun(db, runId);
   if (run === null) throw new Error(`Relay run ${runId} does not exist`);
@@ -1236,6 +1597,9 @@ function printRelayStatus(db: RelayDb, runId: string): void {
         maxCycles: run.maxCycles,
         ...(run.reviewFrom === null ? {} : { reviewFrom: run.reviewFrom }),
         pauseIntent: readPauseIntent(db, runId),
+        // Why a stalled run stalled, read straight off the row. Before this, a stopped run
+        // that died mid-call said nothing at all and the operator had to go looking.
+        lastFailure: readLastFailure(db, runId),
         calls: totals.calls,
         inputTokens: totals.input,
         outputTokens: totals.output,

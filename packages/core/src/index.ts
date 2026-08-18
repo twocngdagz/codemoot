@@ -244,6 +244,9 @@ export {
   createModelAdapter,
   probeCliCommand,
   resolveModelAdapterKind,
+  DEFAULT_LIVENESS_PROBE,
+  probeLocalActivity,
+  sampleProcessTreeCpuSeconds,
 } from './models/index.js';
 export type {
   BridgeAdapterKind,

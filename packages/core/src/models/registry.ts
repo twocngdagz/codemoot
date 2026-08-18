@@ -7,6 +7,7 @@ import { ClaudeCliAdapter } from './claude-cli-adapter.js';
 import { CliAdapter } from './cli-adapter.js';
 import { type CliProbeResult, probeCliCommand } from './cli-runtime-evidence.js';
 import { CursorCliAdapter } from './cursor-cli-adapter.js';
+import type { LivenessProbeConfig } from './process-liveness.js';
 
 /** All registered models implement the common CLI bridge contract. */
 export type ModelAdapter = CliBridge;
@@ -133,6 +134,25 @@ export class ModelRegistry {
   }
 }
 
+/**
+ * Config seconds → adapter milliseconds for the liveness probe. Omitted means the adapter's
+ * own default (probe on), so an untouched `.cowork.yml` is protected without being edited.
+ */
+function livenessOf(
+  adapterConfig: ModelConfig['cliAdapter'],
+): { liveness: LivenessProbeConfig } | Record<string, never> {
+  const configured = adapterConfig?.liveness;
+  if (configured === undefined) return {};
+  return {
+    liveness: {
+      enabled: configured.enabled,
+      minCpuRatio: configured.minCpuRatio,
+      probeIntervalMs: configured.probeInterval * 1000,
+      maxExtensions: configured.maxExtensions,
+    },
+  };
+}
+
 /** Compatibility factory for callers that explicitly require the legacy Codex adapter. */
 function createCliAdapter(config: ModelConfig, projectDir?: string): CliAdapter {
   const adapterConfig = config.cliAdapter ?? getDefaultCliConfig(projectDir);
@@ -150,6 +170,7 @@ function createCliAdapter(config: ModelConfig, projectDir?: string): CliAdapter 
     ...('idleTimeout' in adapterConfig && typeof adapterConfig.idleTimeout === 'number'
       ? { idleTimeout: adapterConfig.idleTimeout * 1000 }
       : {}),
+    ...livenessOf(config.cliAdapter),
   });
 }
 
@@ -166,6 +187,7 @@ function createModelAdapter(config: ModelConfig, projectDir?: string): ModelAdap
       ...(adapterConfig?.idleTimeout === undefined
         ? {}
         : { idleTimeout: adapterConfig.idleTimeout * 1000 }),
+      ...livenessOf(adapterConfig),
       envAllowlist: adapterConfig?.envAllowlist,
     });
   }
@@ -180,6 +202,7 @@ function createModelAdapter(config: ModelConfig, projectDir?: string): ModelAdap
       ...(adapterConfig?.idleTimeout === undefined
         ? {}
         : { idleTimeout: adapterConfig.idleTimeout * 1000 }),
+      ...livenessOf(adapterConfig),
       envAllowlist: adapterConfig?.envAllowlist,
     });
   }

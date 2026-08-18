@@ -75,3 +75,10 @@ export type {
 export { callBridge } from './bridge.js';
 export { probeCliCommand } from './cli-runtime-evidence.js';
 export type { CliProbeResult, CliRuntimeEvidence } from './cli-runtime-evidence.js';
+export {
+  DEFAULT_LIVENESS_PROBE,
+  parseCpuTime,
+  probeLocalActivity,
+  sampleProcessTreeCpuSeconds,
+} from './process-liveness.js';
+export type { CpuSampler, LivenessProbeConfig, LivenessVerdict } from './process-liveness.js';
